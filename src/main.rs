@@ -7,6 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue},
     response::IntoResponse,
 };
+use tokio::io::AsyncReadExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +33,26 @@ async fn main() -> Result<()> {
 // Instead try to make the single-flow-file use case more usable.
 //
 
+// Proposed solution:
+// The request returns 200 unless it immediately fails parsing, due to things like wrong encoding.
+// Otherwise, we return one flow file per incoming flow file. Status and potential return message
+// per flow file should be conveyed in the attributes of the returned file.
+//
+// Requirements:
+//
+// 1. Make it easy to just alter the attributes of a flow file and return it, either with or
+//    without the body.
+// 2. Somehow allow you to _modify_ the returned flowfile.
+//
+//
+// For the latter part there are several use cases:
+//
+// 1. Alter the body in a streaming fashion.
+// 2. Buffer the entire contents in memory.
+// 3. Buffer the entire contents to a "spooled file"
+//    This could be a fallback for the memory version, with a capped memory amount.
+// 4. Produce arbitrary output.
+
 #[tracing::instrument(ret, skip_all)]
 async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
     // let (mut w, body) = nifioxide::axum::make_response_stream(64 * 1024);
@@ -50,13 +71,16 @@ async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
             tracing::debug!("attrib: {key}: {value}");
         }
 
-        match tokio::io::copy(ff.body(), &mut tokio::io::sink()).await {
-            Ok(_n) => Some(Ok::<_, tokio::io::Error>(axum::body::Bytes::new())),
+        let mut buf = [0u8; 128];
+        let n = match ff.body().read(&mut buf).await {
+            Ok(n) => n,
             Err(err) => {
                 tracing::error!("error from reading ff body: {err}");
-                None
+                return None;
             }
-        }
+        };
+        tracing::debug!("read {n} bytes from file body");
+        Some(Ok::<_, tokio::io::Error>(axum::body::Bytes::new()))
     });
 
     let body = Body::from_stream(s);

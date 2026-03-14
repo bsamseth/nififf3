@@ -63,7 +63,10 @@ impl Drop for FlowFile {
         if let Some(tx) = self.tx.take()
             && let Some(contents) = self.contents.take()
         {
-            let _ = tx.send(contents);
+            tracing::trace!("dropping flowfile with size {}", self.len());
+            if tx.send(contents).is_err() {
+                tracing::error!("failed to send stream back to iterator");
+            }
         }
     }
 }
@@ -80,17 +83,6 @@ impl<S: Into<FlowFileIterator>> IntoFlowFiles for S {
         self.into()
     }
 }
-
-/// Boxed byte stream type
-type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
-type ByteStreamReader = StreamReader<BoxedByteStream, Bytes>;
-type FlowFileParseResult = Result<
-    (
-        Option<FlowFile>,
-        tokio::sync::oneshot::Receiver<FlowFileContentReader>,
-    ),
-    (FlowFileParsingError, ByteStreamReader),
->;
 
 impl From<BodyDataStream> for FlowFileIterator {
     fn from(body: BodyDataStream) -> Self {
@@ -123,8 +115,20 @@ pub enum FlowFileParsingError {
     Io(#[from] tokio::io::Error),
 }
 
+/// Boxed byte stream type
+type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
+type ByteStreamReader = StreamReader<BoxedByteStream, Bytes>;
+type FlowFileParseResult = Result<
+    (
+        Option<FlowFile>,
+        tokio::sync::oneshot::Receiver<FlowFileContentReader>,
+    ),
+    (FlowFileParsingError, ByteStreamReader),
+>;
+
 /// Parser capable of yielding successive [`FlowFile`]s from a stream of bytes.
 pub struct FlowFileIterator {
+    /// The state of the iterator, [`None`] only when the iterator is done.
     state: Option<FlowFileIteratorState>,
 }
 pub enum FlowFileIteratorState {
@@ -141,55 +145,68 @@ impl Stream for FlowFileIterator {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
         let mut this = self.as_mut();
         loop {
+            tracing::trace!("ff iterator state: {:?}", this.state);
+
             let Some(state) = this.state.take() else {
-                return std::task::Poll::Ready(None);
+                return Poll::Ready(None);
             };
 
             match state {
-                FlowFileIteratorState::OnLoan(mut receiver) => {
-                    // The reader is still on loan to a particular flow file and we must wait until it
-                    // gives the reader back to us.
-                    match std::task::ready!(receiver.poll_unpin(cx)) {
-                        Ok(reader) => {
-                            let reader = reader;
-                            if reader.inner.limit() > 0 {
-                                let drain_fut = Box::pin(reader.drain());
-                                this.state = Some(FlowFileIteratorState::NeedsToDrain(drain_fut));
-                            } else {
-                                this.state =
-                                    Some(FlowFileIteratorState::Owned(reader.inner.into_inner()));
-                            }
-                        }
-                        Err(err) => {
-                            return std::task::Poll::Ready(Some(Err(err.into())));
+                FlowFileIteratorState::OnLoan(mut receiver) => match receiver.poll_unpin(cx) {
+                    Poll::Ready(Ok(reader)) => {
+                        if reader.inner.limit() > 0 {
+                            let drain_fut = Box::pin(reader.drain());
+                            this.state = Some(FlowFileIteratorState::NeedsToDrain(drain_fut));
+                        } else {
+                            this.state =
+                                Some(FlowFileIteratorState::Owned(reader.inner.into_inner()));
                         }
                     }
-                }
-                FlowFileIteratorState::NeedsToDrain(mut reader) => {
-                    let reader = std::task::ready!(reader.poll_unpin(cx))?;
-                    this.state = Some(FlowFileIteratorState::Owned(reader));
-                }
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Some(Err(err.into())));
+                    }
+                    Poll::Pending => {
+                        this.state = Some(FlowFileIteratorState::OnLoan(receiver));
+                        return Poll::Pending;
+                    }
+                },
+                FlowFileIteratorState::NeedsToDrain(mut reader) => match reader.poll_unpin(cx) {
+                    Poll::Ready(Ok(reader)) => {
+                        this.state = Some(FlowFileIteratorState::Owned(reader));
+                    }
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Some(Err(err.into())));
+                    }
+                    Poll::Pending => {
+                        this.state = Some(FlowFileIteratorState::NeedsToDrain(reader));
+                        return Poll::Pending;
+                    }
+                },
                 FlowFileIteratorState::Owned(reader) => {
                     let reader = Box::pin(parse_flow_file_from_reader(reader));
                     this.state = Some(FlowFileIteratorState::Parsing(reader));
                 }
-                FlowFileIteratorState::Parsing(mut parse_fut) => {
-                    match std::task::ready!(parse_fut.poll_unpin(cx)) {
-                        Ok((None, _)) => {
-                            return std::task::Poll::Ready(None);
-                        }
-                        Ok((Some(flow_file), receiver)) => {
-                            this.state = Some(FlowFileIteratorState::OnLoan(receiver));
-                            return std::task::Poll::Ready(Some(Ok(flow_file)));
-                        }
-                        Err((parsing_err, reader)) => {
-                            this.state = Some(FlowFileIteratorState::Owned(reader));
-                            return std::task::Poll::Ready(Some(Err(parsing_err)));
-                        }
+                FlowFileIteratorState::Parsing(mut parse_fut) => match parse_fut.poll_unpin(cx) {
+                    Poll::Ready(Ok((None, _))) => {
+                        return Poll::Ready(None);
                     }
-                }
+                    Poll::Ready(Ok((Some(flow_file), receiver))) => {
+                        this.state = Some(FlowFileIteratorState::OnLoan(receiver));
+                        return Poll::Ready(Some(Ok(flow_file)));
+                    }
+                    Poll::Ready(Err((parsing_err, reader))) => {
+                        this.state = Some(FlowFileIteratorState::Owned(reader));
+                        return Poll::Ready(Some(Err(parsing_err)));
+                    }
+                    Poll::Pending => {
+                        this.state = Some(FlowFileIteratorState::Parsing(parse_fut));
+                        return Poll::Pending;
+                    }
+                },
             }
         }
     }
@@ -324,4 +341,15 @@ async fn read_string<R: AsyncReadExt + Unpin>(r: &mut R) -> tokio::io::Result<St
     let mut string = String::with_capacity(n);
     r.take(n as u64).read_to_string(&mut string).await?;
     Ok(string)
+}
+
+impl std::fmt::Debug for FlowFileIteratorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(_) => f.debug_tuple("Owned").finish_non_exhaustive(),
+            Self::Parsing(_) => f.debug_tuple("Parsing").finish_non_exhaustive(),
+            Self::OnLoan(_) => f.debug_tuple("OnLoan").finish_non_exhaustive(),
+            Self::NeedsToDrain(_) => f.debug_tuple("NeedsToDrain").finish_non_exhaustive(),
+        }
+    }
 }
