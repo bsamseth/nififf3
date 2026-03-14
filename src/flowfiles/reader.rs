@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io, pin::Pin};
 
 use axum::body::BodyDataStream;
-use futures::TryStreamExt;
+use futures::{FutureExt, Stream, TryStreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::{bytes::Bytes, io::StreamReader};
@@ -10,13 +10,14 @@ use tokio_util::{bytes::Bytes, io::StreamReader};
 ///
 /// The attributes from the flow file are available directly in memory,
 /// while the body is streamed.
-pub struct FlowFile<'a> {
+pub struct FlowFile {
     size: u64,
     attributes: HashMap<String, String>,
-    contents: FlowFileContentReader<'a>,
+    contents: Option<FlowFileContentReader>,
+    tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
-impl<'a> FlowFile<'a> {
+impl FlowFile {
     /// The length of the body of the flow file.
     ///
     /// Note that this is not how many bytes may be left in the [`Self::body()`] reader,
@@ -51,8 +52,19 @@ impl<'a> FlowFile<'a> {
     /// This contains the actual file content, and is expected to yield [`Self::len()`]
     /// bytes in total. It is guaranteed to produce no more bytes than this, but a
     /// truncated file would give EOF early.
-    pub fn body(&'a mut self) -> &'a mut FlowFileContentReader<'a> {
-        &mut self.contents
+    #[expect(clippy::missing_panics_doc, reason = "never panics, or else bug")]
+    pub fn body(&mut self) -> &mut FlowFileContentReader {
+        self.contents.as_mut().expect("body should be present")
+    }
+}
+
+impl Drop for FlowFile {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take()
+            && let Some(contents) = self.contents.take()
+        {
+            let _ = tx.send(contents);
+        }
     }
 }
 
@@ -71,24 +83,23 @@ impl<S: Into<FlowFileIterator>> IntoFlowFiles for S {
 
 /// Boxed byte stream type
 type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
-
-/// Parser capable of yielding successive [`FlowFile`]s from a stream of bytes.
-pub struct FlowFileIterator {
-    reader: StreamReader<BoxedByteStream, Bytes>,
-    bytes_till_next_or_eof: u64,
-}
+type ByteStreamReader = StreamReader<BoxedByteStream, Bytes>;
+type FlowFileParseResult = Result<
+    (
+        Option<FlowFile>,
+        tokio::sync::oneshot::Receiver<FlowFileContentReader>,
+    ),
+    (FlowFileParsingError, ByteStreamReader),
+>;
 
 impl From<BodyDataStream> for FlowFileIterator {
     fn from(body: BodyDataStream) -> Self {
         let stream: BoxedByteStream = Box::pin(body.map_err(io::Error::other));
         let reader = StreamReader::new(stream);
-        Self {
-            reader,
-            bytes_till_next_or_eof: 0,
-        }
+        let state = Some(FlowFileIteratorState::Owned(reader));
+        Self { state }
     }
 }
-
 /// Errors that can occur during parsing of [`FlowFile`]s.
 #[derive(Debug, Error)]
 pub enum FlowFileParsingError {
@@ -103,108 +114,200 @@ pub enum FlowFileParsingError {
         context: &'static str,
         io_error: tokio::io::Error,
     },
+    /// Internal receive error while waiting to receive the stream reader back from a flow file reader.
+    #[error("broken internal flow file parsing channel: {0}")]
+    BrokenChannel(#[from] tokio::sync::oneshot::error::RecvError),
+
+    /// Generic I/O error.
+    #[error("IO error while processing flowfile: {0}")]
+    Io(#[from] tokio::io::Error),
 }
 
-impl FlowFileIterator {
-    /// Get the next file. Returns `None` if the stream is finished.
-    ///
-    /// # Errors
-    /// IO errors will propagate up. Otherwise this can return an error if the flowfile
-    /// is malformed.
-    pub async fn next_file(&mut self) -> Result<Option<FlowFile<'_>>, FlowFileParsingError> {
-        // If the last flow file wasn't fully consumed, ensure we skip the remaining length of the
-        // previous file before moving on.
-        if self.bytes_till_next_or_eof > 0 {
-            tokio::io::copy(
-                &mut (&mut self.reader).take(self.bytes_till_next_or_eof),
-                &mut tokio::io::sink(),
-            )
-            .await
-            .map_err(|io| FlowFileParsingError::Malformed {
-                context: "Error while skipping till next flow file header",
-                io_error: io,
-            })?;
-        }
+/// Parser capable of yielding successive [`FlowFile`]s from a stream of bytes.
+pub struct FlowFileIterator {
+    state: Option<FlowFileIteratorState>,
+}
+pub enum FlowFileIteratorState {
+    Owned(ByteStreamReader),
+    Parsing(Pin<Box<dyn Future<Output = FlowFileParseResult> + Send>>),
+    OnLoan(tokio::sync::oneshot::Receiver<FlowFileContentReader>),
+    NeedsToDrain(Pin<Box<dyn Future<Output = Result<ByteStreamReader, tokio::io::Error>> + Send>>),
+}
 
-        let mut buf = [0u8; 7];
-        if let Err(err) = self.reader.read_exact(&mut buf).await {
-            if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Ok(None);
-            }
-            return Err(FlowFileParsingError::Malformed {
-                context: "Could not read 7 bytes to check for flow file magic bytes",
-                io_error: err,
-            });
-        }
-        if &buf != b"NiFiFF3" {
-            return Err(FlowFileParsingError::BadMagicBytes(buf));
-        }
-        let n_attributes = read_field_length(&mut self.reader).await.map_err(|io| {
-            FlowFileParsingError::Malformed {
-                context: "Reading number of attributes in flowfile",
-                io_error: io,
-            }
-        })? as usize;
-        let mut attributes = HashMap::with_capacity(n_attributes);
-        for _ in 0..n_attributes {
-            let key = read_string(&mut self.reader).await.map_err(|io| {
-                FlowFileParsingError::Malformed {
-                    context: "Reading key from attribute",
-                    io_error: io,
+impl Stream for FlowFileIterator {
+    type Item = Result<FlowFile, FlowFileParsingError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut this = self.as_mut();
+        loop {
+            let Some(state) = this.state.take() else {
+                return std::task::Poll::Ready(None);
+            };
+
+            match state {
+                FlowFileIteratorState::OnLoan(mut receiver) => {
+                    // The reader is still on loan to a particular flow file and we must wait until it
+                    // gives the reader back to us.
+                    match std::task::ready!(receiver.poll_unpin(cx)) {
+                        Ok(reader) => {
+                            let reader = reader;
+                            if reader.inner.limit() > 0 {
+                                let drain_fut = Box::pin(reader.drain());
+                                this.state = Some(FlowFileIteratorState::NeedsToDrain(drain_fut));
+                            } else {
+                                this.state =
+                                    Some(FlowFileIteratorState::Owned(reader.inner.into_inner()));
+                            }
+                        }
+                        Err(err) => {
+                            return std::task::Poll::Ready(Some(Err(err.into())));
+                        }
+                    }
                 }
-            })?;
-            let value = read_string(&mut self.reader).await.map_err(|io| {
-                FlowFileParsingError::Malformed {
-                    context: "Reading value from attribute",
-                    io_error: io,
+                FlowFileIteratorState::NeedsToDrain(mut reader) => {
+                    let reader = std::task::ready!(reader.poll_unpin(cx))?;
+                    this.state = Some(FlowFileIteratorState::Owned(reader));
                 }
-            })?;
-            attributes.insert(key, value);
+                FlowFileIteratorState::Owned(reader) => {
+                    let reader = Box::pin(parse_flow_file_from_reader(reader));
+                    this.state = Some(FlowFileIteratorState::Parsing(reader));
+                }
+                FlowFileIteratorState::Parsing(mut parse_fut) => {
+                    match std::task::ready!(parse_fut.poll_unpin(cx)) {
+                        Ok((None, _)) => {
+                            return std::task::Poll::Ready(None);
+                        }
+                        Ok((Some(flow_file), receiver)) => {
+                            this.state = Some(FlowFileIteratorState::OnLoan(receiver));
+                            return std::task::Poll::Ready(Some(Ok(flow_file)));
+                        }
+                        Err((parsing_err, reader)) => {
+                            this.state = Some(FlowFileIteratorState::Owned(reader));
+                            return std::task::Poll::Ready(Some(Err(parsing_err)));
+                        }
+                    }
+                }
+            }
         }
-
-        let size = self
-            .reader
-            .read_u64()
-            .await
-            .map_err(|io| FlowFileParsingError::Malformed {
-                context: "Reading content length as u64",
-                io_error: io,
-            })?;
-
-        self.bytes_till_next_or_eof = size;
-
-        let file_reader = FlowFileContentReader {
-            inner: (&mut self.reader).take(size),
-            remaining: &mut self.bytes_till_next_or_eof,
-        };
-
-        Ok(Some(FlowFile {
-            size,
-            attributes,
-            contents: file_reader,
-        }))
     }
 }
 
-/// Async reader for a single file
-pub struct FlowFileContentReader<'a> {
-    inner: tokio::io::Take<&'a mut StreamReader<BoxedByteStream, Bytes>>,
-    remaining: &'a mut u64,
+/// Parse a NiFi Flow File v3 from a reader.
+///
+/// # Errors
+/// IO errors will propagate up. Otherwise this can return an error if the flowfile is malformed.
+pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFileParseResult {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut buf = [0u8; 7];
+    if let Err(err) = reader.read_exact(&mut buf).await {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            let _ = tx.send(FlowFileContentReader {
+                inner: reader.take(0),
+            });
+            return Ok((None, rx));
+        }
+        return Err((
+            FlowFileParsingError::Malformed {
+                context: "Could not read 7 bytes to check for flow file magic bytes",
+                io_error: err,
+            },
+            reader,
+        ));
+    }
+    if &buf != b"NiFiFF3" {
+        return Err((FlowFileParsingError::BadMagicBytes(buf), reader));
+    }
+    let n_attributes = match read_field_length(&mut reader).await {
+        Ok(n) => n as usize,
+        Err(io) => {
+            return Err((
+                FlowFileParsingError::Malformed {
+                    context: "Reading number of attributes in flowfile",
+                    io_error: io,
+                },
+                reader,
+            ));
+        }
+    };
+    let mut attributes = HashMap::with_capacity(n_attributes);
+    for _ in 0..n_attributes {
+        let key = match read_string(&mut reader).await {
+            Ok(key) => key,
+            Err(io) => {
+                return Err((
+                    FlowFileParsingError::Malformed {
+                        context: "Reading key from attribute",
+                        io_error: io,
+                    },
+                    reader,
+                ));
+            }
+        };
+        let value = match read_string(&mut reader).await {
+            Ok(value) => value,
+            Err(io) => {
+                return Err((
+                    FlowFileParsingError::Malformed {
+                        context: "Reading value from attribute",
+                        io_error: io,
+                    },
+                    reader,
+                ));
+            }
+        };
+        attributes.insert(key, value);
+    }
+
+    let size = match reader.read_u64().await {
+        Ok(size) => size,
+        Err(io) => {
+            return Err((
+                FlowFileParsingError::Malformed {
+                    context: "Reading content length as u64",
+                    io_error: io,
+                },
+                reader,
+            ));
+        }
+    };
+
+    let file_reader = FlowFileContentReader {
+        inner: reader.take(size),
+    };
+
+    Ok((
+        Some(FlowFile {
+            size,
+            attributes,
+            contents: Some(file_reader),
+            tx: Some(tx),
+        }),
+        rx,
+    ))
 }
 
-impl AsyncRead for FlowFileContentReader<'_> {
+/// Async reader for a single file
+pub struct FlowFileContentReader {
+    inner: tokio::io::Take<ByteStreamReader>,
+}
+
+impl FlowFileContentReader {
+    async fn drain(mut self) -> tokio::io::Result<ByteStreamReader> {
+        tokio::io::copy(&mut self, &mut tokio::io::sink()).await?;
+        Ok(self.inner.into_inner())
+    }
+}
+
+impl AsyncRead for FlowFileContentReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        let before = buf.remaining();
-        let poll_result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if poll_result.is_ready() {
-            let consumed = before - buf.remaining();
-            *self.remaining = self.remaining.saturating_sub(consumed as u64);
-        }
-        poll_result
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 

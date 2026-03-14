@@ -1,11 +1,12 @@
+use futures::StreamExt;
 use nifioxide::FlowFileIterator;
 
 use anyhow::{Context, Result};
 use axum::{
+    body::Body,
     http::{HeaderMap, HeaderName, HeaderValue},
     response::IntoResponse,
 };
-use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,33 +33,33 @@ async fn main() -> Result<()> {
 //
 
 #[tracing::instrument(ret, skip_all)]
-async fn process(mut flow_files: FlowFileIterator) -> impl IntoResponse {
-    let (mut w, body) = nifioxide::axum::make_response_stream(64 * 1024);
+async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
+    // let (mut w, body) = nifioxide::axum::make_response_stream(64 * 1024);
 
-    // This must be spawned separately because we need to start to stream out the response to make
-    // room for more writes to w. Otherwise we would dead lock waiting for reads to happen, as
-    // reads would happen after all writes are done. Spawning like this ensures progress.
-    // This is a footgun -> try to make this impossible to do with a helper?
-    tokio::spawn(async move {
-        loop {
-            match flow_files.next_file().await {
-                Ok(Some(ff)) => {
-                    tracing::debug!("flow file size: {}", ff.len());
-                    for (key, value) in ff.attributes() {
-                        tracing::debug!("attrib: {key}: {value}");
-                    }
+    let s = flow_files.filter_map(|ff| async move {
+        let mut ff = match ff {
+            Ok(ff) => ff,
+            Err(err) => {
+                tracing::error!("error from ff: {err}");
+                return None;
+            }
+        };
 
-                    // let body_stream = ff.body(); // impl AsyncRead
+        tracing::info!("Flow file with size: {}", ff.len());
+        for (key, value) in ff.attributes() {
+            tracing::debug!("attrib: {key}: {value}");
+        }
 
-                    // What to do about errors here?
-                    w.write_all(b"a file was parsed\n").await.unwrap();
-                }
-                Ok(None) => break,
-                // What do do abou this?!
-                Err(_err) => todo!(),
+        match tokio::io::copy(ff.body(), &mut tokio::io::sink()).await {
+            Ok(_n) => Some(Ok::<_, tokio::io::Error>(axum::body::Bytes::new())),
+            Err(err) => {
+                tracing::error!("error from reading ff body: {err}");
+                None
             }
         }
     });
+
+    let body = Body::from_stream(s);
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
@@ -66,5 +67,5 @@ async fn process(mut flow_files: FlowFileIterator) -> impl IntoResponse {
         HeaderValue::from_static("axum+nifioxide"),
     );
 
-    (response_headers, body).into_response()
+    (axum::http::StatusCode::OK, body).into_response()
 }

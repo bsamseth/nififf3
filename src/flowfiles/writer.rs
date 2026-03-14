@@ -17,11 +17,7 @@ impl<W: AsyncWrite + Unpin> FlowFileEncoder<W> {
     ///
     /// # Errors
     /// TODO
-    pub async fn write_flow_file<F, Fut>(
-        &mut self,
-        mut ff: FlowFile<'_>,
-        f: F,
-    ) -> anyhow::Result<()>
+    pub async fn write_flow_file<F, Fut>(&mut self, mut ff: FlowFile, f: F) -> anyhow::Result<()>
     where
         F: FnOnce(FlowFileBodyWriter<'_, W>, &mut FlowFileContentReader) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<()>>,
