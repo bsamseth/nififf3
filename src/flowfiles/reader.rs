@@ -1,17 +1,11 @@
-// #[expect(clippy::doc_markdown, reason = "NiFi is spelled with camelCase")]
-//! # nifioxide - Tools for working with NiFi files from Rust.
-//! bla bla
-//!
-//! bla foo
 use std::{collections::HashMap, io, pin::Pin};
 
 use axum::body::BodyDataStream;
-use futures::TryStreamExt;
+use futures::{Stream, TryStream, TryStreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::{bytes::Bytes, io::StreamReader};
 
-#[expect(clippy::doc_markdown, reason = "NiFi is spelled in camel case")]
 /// A NiFi Flow File V3 with a streamed body.
 ///
 /// The attributes from the flow file are available directly in memory,
@@ -22,7 +16,7 @@ pub struct FlowFile<'a> {
     contents: FlowFileContentReader<'a>,
 }
 
-impl FlowFile<'_> {
+impl<'a> FlowFile<'a> {
     /// The length of the body of the flow file.
     ///
     /// Note that this is not how many bytes may be left in the [`Self::body()`] reader,
@@ -46,12 +40,19 @@ impl FlowFile<'_> {
         &self.attributes
     }
 
+    /// All attributes contained in the flow file.
+    #[must_use]
+    pub fn attributes_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.attributes
+    }
+
     /// A reader of the (remaining) bytes of the body of the flow file.
     ///
     /// This contains the actual file content, and is expected to yield [`Self::len()`]
     /// bytes in total. It is guaranteed to produce no more bytes than this, but a
     /// truncated file would give EOF early.
-    pub fn body(&mut self) -> impl AsyncRead {
+    #[expect(mismatched_lifetime_syntaxes, reason = "Proposed fixes don't compile.")]
+    pub fn body(&'a mut self) -> &'a mut FlowFileContentReader {
         &mut self.contents
     }
 }
@@ -186,8 +187,19 @@ impl FlowFileIterator {
     }
 }
 
+impl Stream for FlowFileIterator {
+    type Item;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        todo!()
+    }
+}
+
 /// Async reader for a single file
-struct FlowFileContentReader<'a> {
+pub struct FlowFileContentReader<'a> {
     inner: tokio::io::Take<&'a mut StreamReader<BoxedByteStream, Bytes>>,
     remaining: &'a mut u64,
 }
