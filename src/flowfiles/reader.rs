@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io, pin::Pin};
 
 use axum::body::BodyDataStream;
-use futures::{Stream, TryStream, TryStreamExt};
+use futures::TryStreamExt;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::{bytes::Bytes, io::StreamReader};
@@ -51,8 +51,7 @@ impl<'a> FlowFile<'a> {
     /// This contains the actual file content, and is expected to yield [`Self::len()`]
     /// bytes in total. It is guaranteed to produce no more bytes than this, but a
     /// truncated file would give EOF early.
-    #[expect(mismatched_lifetime_syntaxes, reason = "Proposed fixes don't compile.")]
-    pub fn body(&'a mut self) -> &'a mut FlowFileContentReader {
+    pub fn body(&'a mut self) -> &'a mut FlowFileContentReader<'a> {
         &mut self.contents
     }
 }
@@ -73,7 +72,7 @@ impl<S: Into<FlowFileIterator>> IntoFlowFiles for S {
 /// Boxed byte stream type
 type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
-/// Parser capable of yielding seccessive [`FlowFile`]s from a stream of bytes.
+/// Parser capable of yielding successive [`FlowFile`]s from a stream of bytes.
 pub struct FlowFileIterator {
     reader: StreamReader<BoxedByteStream, Bytes>,
     bytes_till_next_or_eof: u64,
@@ -184,17 +183,6 @@ impl FlowFileIterator {
             attributes,
             contents: file_reader,
         }))
-    }
-}
-
-impl Stream for FlowFileIterator {
-    type Item;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        todo!()
     }
 }
 
