@@ -31,7 +31,13 @@ where
 
 impl IntoResponse for FlowFileParsingError {
     fn into_response(self) -> axum::response::Response {
-        (StatusCode::UNPROCESSABLE_ENTITY, format!("{self}")).into_response()
+        let status_code = match self {
+            FlowFileParsingError::BadMagicBytes(_)
+            | FlowFileParsingError::Malformed { .. }
+            | FlowFileParsingError::BrokenChannel(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            FlowFileParsingError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status_code, format!("{self}")).into_response()
     }
 }
 
