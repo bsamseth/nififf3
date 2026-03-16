@@ -1,8 +1,96 @@
-use std::{collections::HashMap, pin::Pin, task::Poll};
+use std::{
+    collections::HashMap, convert::Infallible, io::SeekFrom, marker::PhantomData, pin::Pin,
+    task::Poll,
+};
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
+    BufWriter,
+};
 
 use crate::{FlowFile, FlowFileContentReader};
+
+trait Storage: AsyncRead + AsyncSeek {
+    type Error;
+
+    fn size(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+}
+
+impl Storage for std::io::Cursor<Vec<u8>> {
+    type Error = Infallible;
+
+    fn size(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        std::future::ready(Ok(self.get_ref().len() as u64))
+    }
+}
+
+impl Storage for tokio::fs::File {
+    type Error = tokio::io::Error;
+
+    async fn size(&self) -> Result<u64, Self::Error> {
+        self.metadata().await.map(|m| m.len())
+    }
+}
+
+struct OutputFlowFile<R: AsyncRead + AsyncSeek> {
+    /// The full size of the flow file content, not including attributes.
+    size: u64,
+    /// All attributes stored in the flow file.
+    attributes: HashMap<String, String>,
+    /// The content of the flow file.
+    content: R,
+}
+
+struct OutputFlowFileWithoutContent(HashMap<String, String>);
+
+impl<R: AsyncRead + AsyncSeek> OutputFlowFile<R> {
+    pub fn empty() -> OutputFlowFileWithoutContent {
+        OutputFlowFileWithoutContent(HashMap::new())
+    }
+    pub fn with_attributes(attributes: HashMap<String, String>) -> OutputFlowFileWithoutContent {
+        OutputFlowFileWithoutContent(attributes)
+    }
+}
+impl OutputFlowFileWithoutContent {
+    pub fn get_attribute(&self, key: &str) -> Option<&String> {
+        self.0.get(key)
+    }
+    pub fn set_attribute(&mut self, key: String, value: String) -> Option<String> {
+        self.0.insert(key, value)
+    }
+    pub fn with_attribute(&mut self, key: String, value: String) -> &mut Self {
+        self.0.insert(key, value);
+        self
+    }
+
+    pub async fn with_content<S: Storage>(self, content: S) -> Result<OutputFlowFile<S>, S::Error> {
+        let size = content.size().await?;
+        Ok(OutputFlowFile {
+            size,
+            attributes: self.0,
+            content,
+        })
+    }
+}
+
+impl<S: AsyncRead + AsyncSeek> OutputFlowFile<S> {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn get_attribute(&self, key: &str) -> Option<&String> {
+        self.attributes.get(key)
+    }
+    pub fn set_attribute(&mut self, key: String, value: String) -> Option<String> {
+        self.attributes.insert(key, value)
+    }
+    pub fn with_attribute(&mut self, key: String, value: String) -> &mut Self {
+        self.attributes.insert(key, value);
+        self
+    }
+    pub fn content(&mut self) -> &mut S {
+        &mut self.content
+    }
+}
 
 pub struct FlowFileEncoder<W> {
     writer: W,
