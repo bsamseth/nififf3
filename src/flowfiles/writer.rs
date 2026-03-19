@@ -10,7 +10,7 @@ use tokio::io::{
 
 use crate::{FlowFile, FlowFileContentReader};
 
-trait Storage: AsyncRead + AsyncSeek {
+pub trait Storage: AsyncRead + AsyncSeek {
     type Error;
 
     fn size(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
@@ -32,7 +32,7 @@ impl Storage for tokio::fs::File {
     }
 }
 
-struct OutputFlowFile<R: AsyncRead + AsyncSeek> {
+pub struct OutputFlowFile<R: AsyncRead + AsyncSeek> {
     /// The full size of the flow file content, not including attributes.
     size: u64,
     /// All attributes stored in the flow file.

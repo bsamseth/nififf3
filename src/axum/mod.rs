@@ -1,5 +1,8 @@
 //! Glue between this crate and [`axum`].
 
+mod handler;
+mod middleware;
+
 use axum::{body::Body, http::StatusCode, response::IntoResponse};
 use tokio::io::AsyncWrite;
 use tokio_util::io::ReaderStream;
@@ -10,9 +13,17 @@ impl<S> axum::extract::FromRequest<S> for FlowFileIterator
 where
     S: Send + Sync,
 {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = <Self as TryFrom<axum::extract::Request>>::Error;
 
     async fn from_request(req: axum::extract::Request, _: &S) -> Result<Self, Self::Rejection> {
+        req.try_into()
+    }
+}
+
+impl TryFrom<axum::extract::Request> for FlowFileIterator {
+    type Error = (StatusCode, &'static str);
+
+    fn try_from(req: axum::extract::Request) -> Result<Self, Self::Error> {
         if req
             .headers()
             .get("Content-Type")

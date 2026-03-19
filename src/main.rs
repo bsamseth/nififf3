@@ -55,8 +55,6 @@ async fn main() -> Result<()> {
 
 #[tracing::instrument(ret, skip_all)]
 async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
-    // let (mut w, body) = nifioxide::axum::make_response_stream(64 * 1024);
-
     let s = flow_files.filter_map(|ff| async move {
         let mut ff = match ff {
             Ok(ff) => ff,
@@ -91,5 +89,5 @@ async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
         HeaderValue::from_static("axum+nifioxide"),
     );
 
-    (axum::http::StatusCode::OK, body).into_response()
+    (axum::http::StatusCode::OK, response_headers, body).into_response()
 }
