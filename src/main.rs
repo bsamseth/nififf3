@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use nifioxide::{FlowFileIterator, FlowFileParsingError, axum::StreamedFlowFileFuture};
 
 use anyhow::{Context, Result};
@@ -86,34 +86,23 @@ async fn process_single(
 }
 
 #[tracing::instrument(ret, skip_all)]
-async fn process_multiple(flow_files: FlowFileIterator) -> impl IntoResponse {
-    let s = flow_files.filter_map(|ff| async move {
-        let mut ff = match ff {
-            Ok(ff) => ff,
-            Err(err) => {
-                tracing::error!("error from ff: {err}");
-                return None;
+async fn process_multiple(
+    flow_files: FlowFileIterator,
+) -> Result<impl IntoResponse, FlowFileParsingError> {
+    flow_files
+        .then(|ff| async move {
+            let mut ff = ff?;
+            tracing::info!("Flow file with size: {}", ff.len());
+            for (key, value) in ff.attributes() {
+                tracing::debug!("attrib: {key}: {value}");
             }
-        };
-
-        tracing::info!("Flow file with size: {}", ff.len());
-        for (key, value) in ff.attributes() {
-            tracing::debug!("attrib: {key}: {value}");
-        }
-
-        let mut buf = [0u8; 128];
-        let n = match ff.body().read(&mut buf).await {
-            Ok(n) => n,
-            Err(err) => {
-                tracing::error!("error from reading ff body: {err}");
-                return None;
-            }
-        };
-        tracing::debug!("read {n} bytes from file body");
-        Some(Ok::<_, tokio::io::Error>(axum::body::Bytes::new()))
-    });
-
-    let body = Body::from_stream(s);
+            let mut buf = [0u8; 128];
+            let n = ff.body().read(&mut buf).await?;
+            tracing::debug!("read {n} bytes from file body");
+            Ok::<_, FlowFileParsingError>(())
+        })
+        .try_collect::<()>()
+        .await?;
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
@@ -121,5 +110,7 @@ async fn process_multiple(flow_files: FlowFileIterator) -> impl IntoResponse {
         HeaderValue::from_static("axum+nifioxide"),
     );
 
-    (axum::http::StatusCode::OK, response_headers, body)
+    // Note that this returns OK right away, before anything has been processed at all.
+    // This only really makes sense if errors are encoded in the body somehow.
+    Ok((axum::http::StatusCode::OK, response_headers))
 }
