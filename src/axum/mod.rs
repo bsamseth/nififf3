@@ -96,7 +96,7 @@ impl Future for StreamedFlowFileFuture {
         // This would fail because the iterator, and its receiver, would be dropped already and the
         // send would fail.
         if let Ok(ff) = ff.as_mut() {
-            ff.tx.take();
+            ff.disable_automatic_return();
         }
         std::task::Poll::Ready(ff)
     }

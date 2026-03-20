@@ -13,7 +13,7 @@ use tokio_util::{bytes::Bytes, io::StreamReader};
 pub struct StreamedFlowFile {
     header: FlowFileHeader,
     contents: Option<FlowFileContentReader>,
-    pub(crate) tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
+    tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
 pub struct FlowFileHeader {
@@ -60,6 +60,14 @@ impl StreamedFlowFile {
     #[expect(clippy::missing_panics_doc, reason = "never panics, or else bug")]
     pub fn body(&mut self) -> &mut FlowFileContentReader {
         self.contents.as_mut().expect("body should be present")
+    }
+
+    /// Prevent automatic return of content reader when this struct is dropped.
+    ///
+    /// Call this when the related [`FlowFileIterator`] will be dropped before this struct,
+    /// such as when extracting a single flow file from the iterator.
+    pub(crate) fn disable_automatic_return_of_internal_reader(&mut self) {
+        let _ = self.tx.take();
     }
 }
 
