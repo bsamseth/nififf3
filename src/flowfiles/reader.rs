@@ -16,6 +16,7 @@ pub struct StreamedFlowFile {
     tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
+#[derive(Debug, Clone)]
 pub struct FlowFileHeader {
     size: u64,
     attributes: HashMap<String, String>,
@@ -463,6 +464,253 @@ impl std::fmt::Debug for FlowFileIteratorState {
             Self::Parsing(_) => f.debug_tuple("Parsing").finish_non_exhaustive(),
             Self::OnLoan(_) => f.debug_tuple("OnLoan").finish_non_exhaustive(),
             Self::NeedsToDrain(_) => f.debug_tuple("NeedsToDrain").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamedFlowFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedFlowFile")
+            .field("header", &self.header)
+            .field("contents", &"<impl AsyncRead>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for FlowFileContentReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowFileContentReader")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use futures::StreamExt;
+    use tokio::io::AsyncReadExt;
+    use tokio_util::bytes::Bytes;
+
+    use super::*;
+
+    fn make_byte_stream(data: Vec<u8>) -> ByteStreamReader {
+        let stream: BoxedByteStream = Box::pin(futures::stream::iter(std::iter::once(Ok(
+            Bytes::from(data),
+        ))));
+        tokio_util::io::StreamReader::new(stream)
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    fn encode_flow_file(attributes: &[(&str, &str)], content: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend(b"NiFiFF3");
+
+        let n_attrs = attributes.len() as u16;
+        buf.extend_from_slice(&n_attrs.to_be_bytes());
+
+        for (key, value) in attributes {
+            let key_bytes = key.as_bytes();
+            let value_bytes = value.as_bytes();
+
+            buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(key_bytes);
+
+            buf.extend_from_slice(&(value_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(value_bytes);
+        }
+
+        buf.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        buf.extend_from_slice(content);
+
+        buf
+    }
+
+    #[test]
+    fn field_length_encoded_size_small() {
+        assert_eq!(field_length_encoded_size(0), 2);
+        assert_eq!(field_length_encoded_size(u32::from(u16::MAX - 1)), 2);
+    }
+
+    #[test]
+    fn field_length_encoded_size_large() {
+        assert_eq!(field_length_encoded_size(u16::MAX.into()), 6);
+        assert_eq!(field_length_encoded_size(u32::from(u16::MAX) + 1), 6);
+    }
+
+    #[tokio::test]
+    async fn parse_empty_flow_file() {
+        let data = encode_flow_file(&[], b"");
+        let reader = make_byte_stream(data);
+        let Ok((result, _rx, read_count)) = parse_flow_file_from_reader(reader).await else {
+            panic!("expected ok result");
+        };
+
+        let ff = result.unwrap();
+        assert_eq!(ff.len(), 0);
+        assert!(ff.is_empty());
+        assert!(ff.attributes().is_empty());
+        assert_eq!(read_count, 7 + 2 + 8); // magic + attr count + size
+    }
+
+    #[tokio::test]
+    async fn parse_flow_file_with_attributes() {
+        let data = encode_flow_file(
+            &[("filename", "test.txt"), ("mime.type", "text/plain")],
+            b"content",
+        );
+        let reader = make_byte_stream(data);
+        let Ok((result, _rx, _)) = parse_flow_file_from_reader(reader).await else {
+            panic!("expected ok result");
+        };
+
+        let ff = result.unwrap();
+        assert_eq!(ff.len(), 7); // "content" is 7 bytes
+        assert_eq!(ff.attributes().len(), 2);
+        assert_eq!(
+            ff.attributes().get("filename"),
+            Some(&"test.txt".to_string())
+        );
+        assert_eq!(
+            ff.attributes().get("mime.type"),
+            Some(&"text/plain".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_flow_file_with_content() {
+        let content = b"Hello, World!";
+        let data = encode_flow_file(&[], content);
+        let reader = make_byte_stream(data);
+        let Ok((result, _rx, _)) = parse_flow_file_from_reader(reader).await else {
+            panic!("expected ok result");
+        };
+
+        let mut ff = result.unwrap();
+        let mut buf = Vec::new();
+        ff.body().read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, content);
+    }
+
+    #[tokio::test]
+    async fn parse_bad_magic_bytes() {
+        let mut data = Vec::from(b"NOTVALID");
+        data.extend_from_slice(&[0u8; 100]);
+
+        let reader = make_byte_stream(data);
+        let result = parse_flow_file_from_reader(reader).await.unwrap_err();
+
+        match result.0 {
+            FlowFileParsingError::BadMagicBytes(bytes) => {
+                assert_eq!(&bytes, b"NOTVALI");
+            }
+            other => panic!("expected BadMagicBytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_truncated_magic_bytes() {
+        let reader = make_byte_stream(vec![0x00; 3]);
+        match parse_flow_file_from_reader(reader).await {
+            Ok((None, _rx, 0)) => (),
+            Ok((file, _, count)) => panic!("unexpected result, got: Ok(({file:?}, _, {count}))"),
+            Err((err, _)) => panic!("expected ok, got err: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_empty_eof_returns_none() {
+        let reader = make_byte_stream(vec![]);
+        let result = parse_flow_file_from_reader(reader).await;
+        let Ok((result, _rx, read_count)) = result else {
+            panic!("expected an ok result");
+        };
+
+        assert!(result.is_none());
+        assert_eq!(read_count, 0);
+    }
+
+    #[tokio::test]
+    async fn parse_truncated_attributes() {
+        let mut data = Vec::from(b"NiFiFF3".as_slice());
+        data.extend_from_slice(&2u16.to_be_bytes());
+
+        let reader = make_byte_stream(data);
+        let result = parse_flow_file_from_reader(reader).await.unwrap_err();
+
+        match result.0 {
+            FlowFileParsingError::Malformed { context, .. } => {
+                assert!(context.contains("attribute"));
+            }
+            _ => panic!("expected Malformed error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn iterator_empty_stream() {
+        let reader = make_byte_stream(vec![]);
+        let mut iter = FlowFileIterator::new(reader);
+
+        let next = iter.next().await;
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn iterator_with_content_length_zero_is_empty() {
+        let reader = make_byte_stream(vec![]);
+        let iter = FlowFileIterator::new_with_content_length(reader, 0);
+
+        assert!(iter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn iterator_single_flow_file() {
+        let data = encode_flow_file(&[("key", "value")], b"body");
+        let reader = make_byte_stream(data);
+        let mut iter = FlowFileIterator::new(reader);
+
+        {
+            let ff = iter.next().await.unwrap().unwrap();
+            assert_eq!(ff.attributes().get("key"), Some(&"value".to_string()));
+        }
+
+        let next = iter.next().await;
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn iterator_multiple_flow_files() {
+        let data1 = encode_flow_file(&[("num", "1")], b"first");
+        let data2 = encode_flow_file(&[("num", "2")], b"second");
+
+        let mut combined = data1;
+        combined.extend(data2);
+
+        let reader = make_byte_stream(combined);
+        let mut iter = FlowFileIterator::new(reader);
+
+        {
+            let ff1 = iter.next().await.unwrap().unwrap();
+            assert_eq!(ff1.attributes().get("num"), Some(&"1".to_string()));
+        }
+
+        {
+            let ff2 = iter.next().await.unwrap().unwrap();
+            assert_eq!(ff2.attributes().get("num"), Some(&"2".to_string()));
+        }
+
+        assert!(iter.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn iterator_content_length_mismatch() {
+        let data = encode_flow_file(&[], b"extra content after header");
+        let reader = make_byte_stream(data);
+        let mut iter = FlowFileIterator::new_with_content_length(reader, 9);
+
+        let result = iter.next().await;
+        match result {
+            Some(Err(FlowFileParsingError::ContentLengthLengthMismatch { .. })) => {}
+            other => panic!("expected ContentLengthLengthMismatch, got {other:?}"),
         }
     }
 }

@@ -96,7 +96,7 @@ impl Future for StreamedFlowFileFuture {
         // This would fail because the iterator, and its receiver, would be dropped already and the
         // send would fail.
         if let Ok(ff) = ff.as_mut() {
-            ff.disable_automatic_return();
+            ff.disable_automatic_return_of_internal_reader();
         }
         std::task::Poll::Ready(ff)
     }
@@ -145,4 +145,77 @@ impl IntoResponse for FlowFileParsingError {
 pub fn make_response_stream(max_buf_size: usize) -> (impl AsyncWrite, Body) {
     let (read, write) = tokio::io::duplex(max_buf_size);
     (write, Body::from_stream(ReaderStream::new(read)))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request};
+
+    use super::*;
+
+    fn make_flow_file_request(content: Vec<u8>, content_type: &str) -> Request<Body> {
+        Request::builder()
+            .header("Content-Type", content_type)
+            .header("Content-Length", content.len())
+            .body(Body::from(axum::body::Bytes::from(content)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn flow_file_iterator_rejects_wrong_content_type() {
+        let req = Request::builder()
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let result: Result<FlowFileIterator, _> = req.try_into();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn flow_file_iterator_accepts_flowfile_v3() {
+        let req = make_flow_file_request(vec![], "application/flowfile-v3");
+
+        let result: Result<FlowFileIterator, _> = req.try_into();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flow_file_iterator_non_empty_when_non_zero_content_length() {
+        let req = Request::builder()
+            .header("Content-Type", "application/flowfile-v3")
+            .header("Content-Length", "12345")
+            .body(Body::empty())
+            .unwrap();
+
+        let iter: FlowFileIterator = req.try_into().unwrap();
+        assert!(!iter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flow_file_iterator_empty_when_zero_content_length() {
+        let req = Request::builder()
+            .header("Content-Type", "application/flowfile-v3")
+            .header("Content-Length", "0")
+            .body(Body::empty())
+            .unwrap();
+
+        let iter: FlowFileIterator = req.try_into().unwrap();
+        assert!(iter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_flow_file_future_requires_content() {
+        let req = Request::builder()
+            .header("Content-Type", "application/flowfile-v3")
+            .body(Body::empty())
+            .unwrap();
+
+        let result: Result<StreamedFlowFileFuture, _> = req.try_into();
+        assert!(result.is_ok());
+
+        let ff_future = result.unwrap();
+        let result = ff_future.await;
+        assert!(result.is_err());
+    }
 }

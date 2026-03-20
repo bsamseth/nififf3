@@ -3,7 +3,6 @@ use nifioxide::{FlowFileIterator, FlowFileParsingError, axum::StreamedFlowFileFu
 
 use anyhow::{Context, Result};
 use axum::{
-    body::Body,
     http::{HeaderMap, HeaderName, HeaderValue},
     response::IntoResponse,
 };
