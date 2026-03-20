@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, pin::Pin};
+use std::{collections::HashMap, io, ops::Deref, pin::Pin};
 
 use axum::body::BodyDataStream;
 use futures::{FutureExt, Stream, TryStreamExt};
@@ -10,20 +10,23 @@ use tokio_util::{bytes::Bytes, io::StreamReader};
 ///
 /// The attributes from the flow file are available directly in memory,
 /// while the body is streamed.
-pub struct FlowFile {
-    size: u64,
-    attributes: HashMap<String, String>,
+pub struct StreamedFlowFile {
+    header: FlowFileHeader,
     contents: Option<FlowFileContentReader>,
-    tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
+    pub(crate) tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
-impl FlowFile {
-    /// The length of the body of the flow file.
+pub struct FlowFileHeader {
+    size: u64,
+    attributes: HashMap<String, String>,
+}
+
+impl FlowFileHeader {
+    /// The length of the content of the flow file this header describes.
     ///
-    /// Note that this is not how many bytes may be left in the [`Self::body()`] reader,
-    /// but rather how many bytes the reader is expected to produce in total, according
+    /// Note that this is not how many bytes may be left in the content,
+    /// but rather how many bytes the content is expected to contain in total, according
     /// to the flow file header.
-    #[inline]
     #[must_use]
     pub fn len(&self) -> u64 {
         self.size
@@ -46,7 +49,9 @@ impl FlowFile {
     pub fn attributes_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.attributes
     }
+}
 
+impl StreamedFlowFile {
     /// A reader of the (remaining) bytes of the body of the flow file.
     ///
     /// This contains the actual file content, and is expected to yield [`Self::len()`]
@@ -58,7 +63,15 @@ impl FlowFile {
     }
 }
 
-impl Drop for FlowFile {
+impl Deref for StreamedFlowFile {
+    type Target = FlowFileHeader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.header
+    }
+}
+
+impl Drop for StreamedFlowFile {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take()
             && let Some(contents) = self.contents.take()
@@ -71,33 +84,13 @@ impl Drop for FlowFile {
     }
 }
 
-/// Trait for converting streams of data into a [`FlowFileIterator`].
-///
-/// See [`FlowFileIterator::from`] for which types can be used as a source.
-pub trait IntoFlowFiles {
-    fn into_flow_files(self) -> FlowFileIterator;
-}
-
-impl<S: Into<FlowFileIterator>> IntoFlowFiles for S {
-    fn into_flow_files(self) -> FlowFileIterator {
-        self.into()
-    }
-}
-
-impl From<BodyDataStream> for FlowFileIterator {
-    fn from(body: BodyDataStream) -> Self {
-        let stream: BoxedByteStream = Box::pin(body.map_err(io::Error::other));
-        let reader = StreamReader::new(stream);
-        let state = Some(FlowFileIteratorState::Owned(reader));
-        Self { state }
-    }
-}
 /// Errors that can occur during parsing of [`FlowFile`]s.
 #[derive(Debug, Error)]
 pub enum FlowFileParsingError {
     /// The file did not contain the expected `b"NiFiFF3"` magic byte header.
     #[error("Incorrect flow file magic bytes, expected 'NiFiFF3' but got {0:?}")]
     BadMagicBytes([u8; 7]),
+
     /// IO error while parsing a flow file.
     ///
     /// The context indicates in which stage of parsing the error occured.
@@ -106,30 +99,55 @@ pub enum FlowFileParsingError {
         context: &'static str,
         io_error: tokio::io::Error,
     },
+
     /// Internal receive error while waiting to receive the stream reader back from a flow file reader.
-    #[error("broken internal flow file parsing channel: {0}")]
+    #[error("Broken internal flow file parsing channel: {0}")]
     BrokenChannel(#[from] tokio::sync::oneshot::error::RecvError),
+
+    /// Content length was less than a flow file indicated it contained.
+    /// This occurs if the content length in the flow file header doesn't agree with the request
+    /// content length about how many bytes are left in the stream.
+    #[error(
+        "Content length of {content_length} less than flow file header indicated {flow_file_required}"
+    )]
+    ContentLengthLengthMismatch {
+        content_length: u64,
+        flow_file_required: u64,
+    },
+
+    /// If a flow file was expected, but the content length stopped us from trying to parse one out.
+    /// This can happen when extracting and expecting a single flow file, but the content length of
+    /// the post payload was zero.
+    #[error("A flow file was expected in the request payload.")]
+    FlowFileExpected,
+
+    /// If a single flow file was expected, but we received trailing data.
+    /// This can happen if multiple flow files where sent, or if the flow file header size value
+    /// reports a smaller size than the payload length contains.
+    #[error(
+        "A single flow file was expected in the request payload, but excess data was received."
+    )]
+    SingleFlowFileExpected,
 
     /// Generic I/O error.
     #[error("IO error while processing flowfile: {0}")]
     Io(#[from] tokio::io::Error),
 }
 
-/// Boxed byte stream type
-type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
-type ByteStreamReader = StreamReader<BoxedByteStream, Bytes>;
-type FlowFileParseResult = Result<
-    (
-        Option<FlowFile>,
-        tokio::sync::oneshot::Receiver<FlowFileContentReader>,
-    ),
-    (FlowFileParsingError, ByteStreamReader),
->;
+/// Trait for converting streams of data into a [`FlowFileIterator`].
+///
+/// See [`FlowFileIterator::from`] for which types can be used as a source.
+pub trait IntoFlowFiles {
+    fn into_flow_files(self) -> FlowFileIterator;
+}
 
 /// Parser capable of yielding successive [`FlowFile`]s from a stream of bytes.
 pub struct FlowFileIterator {
     /// The state of the iterator, [`None`] only when the iterator is done.
     state: Option<FlowFileIteratorState>,
+    /// The expected length of the inner reader, as reported by Content-Length header.
+    /// This might not be available, e.g. in case of chunked encoding.
+    remaining_length: Option<u64>,
 }
 pub enum FlowFileIteratorState {
     Owned(ByteStreamReader),
@@ -138,8 +156,62 @@ pub enum FlowFileIteratorState {
     NeedsToDrain(Pin<Box<dyn Future<Output = Result<ByteStreamReader, tokio::io::Error>> + Send>>),
 }
 
+impl From<(BodyDataStream, Option<u64>)> for FlowFileIterator {
+    fn from((body, maybe_content_length): (BodyDataStream, Option<u64>)) -> Self {
+        let stream: BoxedByteStream = Box::pin(body.map_err(io::Error::other));
+        let reader = StreamReader::new(stream);
+        let state = Some(FlowFileIteratorState::Owned(reader));
+        Self {
+            state,
+            remaining_length: maybe_content_length,
+        }
+    }
+}
+
+impl<S: Into<FlowFileIterator>> IntoFlowFiles for S {
+    fn into_flow_files(self) -> FlowFileIterator {
+        self.into()
+    }
+}
+
+/// Boxed byte stream type
+type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
+type ByteStreamReader = StreamReader<BoxedByteStream, Bytes>;
+type FlowFileParseResult = Result<
+    (
+        Option<StreamedFlowFile>,
+        tokio::sync::oneshot::Receiver<FlowFileContentReader>,
+        u64,
+    ),
+    (FlowFileParsingError, ByteStreamReader),
+>;
+
+impl FlowFileIterator {
+    pub fn new(reader: impl Into<ByteStreamReader>) -> Self {
+        Self {
+            state: Some(FlowFileIteratorState::Owned(reader.into())),
+            remaining_length: None,
+        }
+    }
+
+    pub fn new_with_content_length(
+        reader: impl Into<ByteStreamReader>,
+        content_length: u64,
+    ) -> Self {
+        Self {
+            state: Some(FlowFileIteratorState::Owned(reader.into())),
+            remaining_length: Some(content_length),
+        }
+    }
+
+    /// Return `true` if the iterator knows that it will not yield more flow files.
+    pub fn is_empty(&self) -> bool {
+        self.remaining_length.is_some_and(|r| r == 0) || self.state.is_none()
+    }
+}
+
 impl Stream for FlowFileIterator {
-    type Item = Result<FlowFile, FlowFileParsingError>;
+    type Item = Result<StreamedFlowFile, FlowFileParsingError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -187,19 +259,33 @@ impl Stream for FlowFileIterator {
                     }
                 },
                 FlowFileIteratorState::Owned(reader) => {
+                    if this.remaining_length.is_some_and(|n| n == 0) {
+                        tracing::trace!("Hit expected EOF, no more files in iterator");
+                        return Poll::Ready(None);
+                    }
                     let reader = Box::pin(parse_flow_file_from_reader(reader));
                     this.state = Some(FlowFileIteratorState::Parsing(reader));
                 }
                 FlowFileIteratorState::Parsing(mut parse_fut) => match parse_fut.poll_unpin(cx) {
-                    Poll::Ready(Ok((None, _))) => {
+                    Poll::Ready(Ok((None, _, _))) => {
                         return Poll::Ready(None);
                     }
-                    Poll::Ready(Ok((Some(flow_file), receiver))) => {
+                    Poll::Ready(Ok((Some(flow_file), receiver, total_ff_length))) => {
+                        if let Some(remaining_length) = this.remaining_length.as_mut() {
+                            if *remaining_length < total_ff_length {
+                                return Poll::Ready(Some(Err(
+                                    FlowFileParsingError::ContentLengthLengthMismatch {
+                                        content_length: *remaining_length,
+                                        flow_file_required: total_ff_length,
+                                    },
+                                )));
+                            }
+                            *remaining_length = remaining_length.saturating_sub(total_ff_length);
+                        }
                         this.state = Some(FlowFileIteratorState::OnLoan(receiver));
                         return Poll::Ready(Some(Ok(flow_file)));
                     }
-                    Poll::Ready(Err((parsing_err, reader))) => {
-                        this.state = Some(FlowFileIteratorState::Owned(reader));
+                    Poll::Ready(Err((parsing_err, _reader))) => {
                         return Poll::Ready(Some(Err(parsing_err)));
                     }
                     Poll::Pending => {
@@ -224,7 +310,7 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
             let _ = tx.send(FlowFileContentReader {
                 inner: reader.take(0),
             });
-            return Ok((None, rx));
+            return Ok((None, rx, 0));
         }
         return Err((
             FlowFileParsingError::Malformed {
@@ -234,11 +320,17 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
             reader,
         ));
     }
+
+    let mut read_count = 7u64;
+
     if &buf != b"NiFiFF3" {
         return Err((FlowFileParsingError::BadMagicBytes(buf), reader));
     }
     let n_attributes = match read_field_length(&mut reader).await {
-        Ok(n) => n as usize,
+        Ok(n) => {
+            read_count += field_length_encoded_size(n);
+            n as usize
+        }
         Err(io) => {
             return Err((
                 FlowFileParsingError::Malformed {
@@ -249,6 +341,7 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
             ));
         }
     };
+
     let mut attributes = HashMap::with_capacity(n_attributes);
     for _ in 0..n_attributes {
         let key = match read_string(&mut reader).await {
@@ -263,6 +356,8 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
                 ));
             }
         };
+        read_count += string_encoded_size(&key);
+
         let value = match read_string(&mut reader).await {
             Ok(value) => value,
             Err(io) => {
@@ -275,6 +370,7 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
                 ));
             }
         };
+        read_count += string_encoded_size(&value);
         attributes.insert(key, value);
     }
 
@@ -290,19 +386,20 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
             ));
         }
     };
+    read_count += 8 + size;
 
     let file_reader = FlowFileContentReader {
         inner: reader.take(size),
     };
 
     Ok((
-        Some(FlowFile {
-            size,
-            attributes,
+        Some(StreamedFlowFile {
+            header: FlowFileHeader { size, attributes },
             contents: Some(file_reader),
             tx: Some(tx),
         }),
         rx,
+        read_count,
     ))
 }
 
@@ -341,6 +438,14 @@ async fn read_string<R: AsyncReadExt + Unpin>(r: &mut R) -> tokio::io::Result<St
     let mut string = String::with_capacity(n);
     r.take(n as u64).read_to_string(&mut string).await?;
     Ok(string)
+}
+
+fn field_length_encoded_size(n: u32) -> u64 {
+    if n >= u32::from(u16::MAX) { 6 } else { 2 }
+}
+fn string_encoded_size(s: &str) -> u64 {
+    let n = u32::try_from(s.len()).expect("string size less than u32::MAX");
+    u64::from(n) + field_length_encoded_size(n)
 }
 
 impl std::fmt::Debug for FlowFileIteratorState {

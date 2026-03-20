@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use nifioxide::FlowFileIterator;
+use nifioxide::{FlowFileIterator, FlowFileParsingError, axum::StreamedFlowFileFuture};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -13,7 +13,9 @@ use tokio::io::AsyncReadExt;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let app = axum::Router::new().route("/process", axum::routing::post(process));
+    let app = axum::Router::new()
+        .route("/process-multiple", axum::routing::post(process_multiple))
+        .route("/process-single", axum::routing::post(process_single));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:9999")
         .await
         .context("binding api server to address")?;
@@ -54,7 +56,37 @@ async fn main() -> Result<()> {
 // 4. Produce arbitrary output.
 
 #[tracing::instrument(ret, skip_all)]
-async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
+async fn process_single(
+    ff: StreamedFlowFileFuture,
+) -> Result<impl IntoResponse, FlowFileParsingError> {
+    let mut ff = ff.await?;
+
+    tracing::info!("Flow file with size: {}", ff.len());
+    for (key, value) in ff.attributes() {
+        tracing::debug!("attrib: {key}: {value}");
+    }
+
+    let mut buf = [0u8; 128];
+    let n = match ff.body().read(&mut buf).await {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::error!("error from reading ff body: {err}");
+            return Err(err.into());
+        }
+    };
+    tracing::debug!("read {n} bytes from file body");
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HeaderName::from_static("processed-by"),
+        HeaderValue::from_static("axum+nifioxide"),
+    );
+
+    Ok((axum::http::StatusCode::OK, response_headers))
+}
+
+#[tracing::instrument(ret, skip_all)]
+async fn process_multiple(flow_files: FlowFileIterator) -> impl IntoResponse {
     let s = flow_files.filter_map(|ff| async move {
         let mut ff = match ff {
             Ok(ff) => ff,
@@ -89,5 +121,5 @@ async fn process(flow_files: FlowFileIterator) -> impl IntoResponse {
         HeaderValue::from_static("axum+nifioxide"),
     );
 
-    (axum::http::StatusCode::OK, response_headers, body).into_response()
+    (axum::http::StatusCode::OK, response_headers, body)
 }

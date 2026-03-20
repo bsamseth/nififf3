@@ -1,14 +1,8 @@
-use std::{
-    collections::HashMap, convert::Infallible, io::SeekFrom, marker::PhantomData, pin::Pin,
-    task::Poll,
-};
+use std::{collections::HashMap, convert::Infallible, pin::Pin, task::Poll};
 
-use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
-    BufWriter,
-};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt};
 
-use crate::{FlowFile, FlowFileContentReader};
+use crate::{FlowFileContentReader, StreamedFlowFile};
 
 pub trait Storage: AsyncRead + AsyncSeek {
     type Error;
@@ -41,12 +35,14 @@ pub struct OutputFlowFile<R: AsyncRead + AsyncSeek> {
     content: R,
 }
 
-struct OutputFlowFileWithoutContent(HashMap<String, String>);
+pub struct OutputFlowFileWithoutContent(HashMap<String, String>);
 
 impl<R: AsyncRead + AsyncSeek> OutputFlowFile<R> {
+    #[must_use]
     pub fn empty() -> OutputFlowFileWithoutContent {
         OutputFlowFileWithoutContent(HashMap::new())
     }
+    #[must_use]
     pub fn with_attributes(attributes: HashMap<String, String>) -> OutputFlowFileWithoutContent {
         OutputFlowFileWithoutContent(attributes)
     }
@@ -105,7 +101,11 @@ impl<W: AsyncWrite + Unpin> FlowFileEncoder<W> {
     ///
     /// # Errors
     /// TODO
-    pub async fn write_flow_file<F, Fut>(&mut self, mut ff: FlowFile, f: F) -> anyhow::Result<()>
+    pub async fn write_flow_file<F, Fut>(
+        &mut self,
+        mut ff: StreamedFlowFile,
+        f: F,
+    ) -> anyhow::Result<()>
     where
         F: FnOnce(FlowFileBodyWriter<'_, W>, &mut FlowFileContentReader) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<()>>,
