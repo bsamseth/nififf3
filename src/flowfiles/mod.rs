@@ -1,7 +1,9 @@
+mod error;
+mod flowfile;
 mod header;
-mod reader;
-mod writer;
+mod streamreader;
 
+pub use error::FlowFileParsingError;
+pub use flowfile::FlowFile;
 pub use header::FlowFileHeader;
-pub use reader::{FlowFileIterator, FlowFileParsingError, IntoFlowFiles, StreamedFlowFile};
-pub use writer::OutputFlowFile;
+pub use streamreader::{FlowFileStream, IntoFlowFiles, StreamedFlowFile};

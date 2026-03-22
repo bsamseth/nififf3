@@ -1,7 +1,5 @@
 //! Glue between this crate and [`axum`].
 
-mod handler;
-
 use axum::{
     body::Body,
     http::{
@@ -14,9 +12,9 @@ use futures::{FutureExt, StreamExt};
 use tokio::io::AsyncWrite;
 use tokio_util::io::ReaderStream;
 
-use crate::{FlowFileIterator, FlowFileParsingError, IntoFlowFiles, StreamedFlowFile};
+use crate::{FlowFileParsingError, FlowFileStream, IntoFlowFiles, StreamedFlowFile};
 
-impl<S> axum::extract::FromRequest<S> for FlowFileIterator
+impl<S> axum::extract::FromRequest<S> for FlowFileStream
 where
     S: Send + Sync,
 {
@@ -27,7 +25,7 @@ where
     }
 }
 
-impl TryFrom<axum::extract::Request> for FlowFileIterator {
+impl TryFrom<axum::extract::Request> for FlowFileStream {
     type Error = (StatusCode, &'static str);
 
     fn try_from(req: axum::extract::Request) -> Result<Self, Self::Error> {
@@ -74,8 +72,30 @@ impl TryFrom<axum::extract::Request> for StreamedFlowFileFuture {
 
 /// Extractor that when awaited gives you a single flow file.
 ///
-/// Use this if your endpoint only wants to expect a single
-pub struct StreamedFlowFileFuture(FlowFileIterator);
+/// Use this if your endpoint only wants to expect a single flow file, and produce an error if zero
+/// or more than one is provided instead.
+///
+/// # Example
+///
+/// ```
+/// use tokio::io::AsyncReadExt;
+/// use nifioxide::{FlowFileParsingError, axum::StreamedFlowFileFuture};
+///
+/// async fn process_single(
+///     ff: StreamedFlowFileFuture,
+/// ) -> Result<impl axum::response::IntoResponse, FlowFileParsingError> {
+///     let mut ff = ff.await?;
+///
+///     println!("Flow file with size: {}", ff.size());
+///     for (key, value) in ff.attributes() {
+///         println!("attrib: {key}: {value}");
+///     }
+///
+///     let mut buf = Vec::with_capacity(ff.size() as usize);
+///     ff.contents().read_to_end(&mut buf).await?;
+///     Ok((axum::http::StatusCode::OK, buf))
+/// }
+pub struct StreamedFlowFileFuture(FlowFileStream);
 
 impl Future for StreamedFlowFileFuture {
     type Output = Result<StreamedFlowFile, FlowFileParsingError>;
@@ -168,7 +188,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result: Result<FlowFileIterator, _> = req.try_into();
+        let result: Result<FlowFileStream, _> = req.try_into();
         assert!(result.is_err());
     }
 
@@ -176,7 +196,7 @@ mod tests {
     async fn flow_file_iterator_accepts_flowfile_v3() {
         let req = make_flow_file_request(vec![], "application/flowfile-v3");
 
-        let result: Result<FlowFileIterator, _> = req.try_into();
+        let result: Result<FlowFileStream, _> = req.try_into();
         assert!(result.is_ok());
     }
 
@@ -188,7 +208,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let iter: FlowFileIterator = req.try_into().unwrap();
+        let iter: FlowFileStream = req.try_into().unwrap();
         assert!(!iter.is_empty());
     }
 
@@ -200,7 +220,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let iter: FlowFileIterator = req.try_into().unwrap();
+        let iter: FlowFileStream = req.try_into().unwrap();
         assert!(iter.is_empty());
     }
 

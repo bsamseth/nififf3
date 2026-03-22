@@ -1,5 +1,4 @@
 use futures::{StreamExt, TryStreamExt};
-use nifioxide::{FlowFileIterator, FlowFileParsingError, axum::StreamedFlowFileFuture};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -7,6 +6,8 @@ use axum::{
     response::IntoResponse,
 };
 use tokio::io::AsyncReadExt;
+
+use nifioxide::{FlowFileParsingError, FlowFileStream, axum::StreamedFlowFileFuture};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,7 +67,7 @@ async fn process_single(
     }
 
     let mut buf = [0u8; 128];
-    let n = match ff.body().read(&mut buf).await {
+    let n = match ff.contents().read(&mut buf).await {
         Ok(n) => n,
         Err(err) => {
             tracing::error!("error from reading ff body: {err}");
@@ -86,7 +87,7 @@ async fn process_single(
 
 #[tracing::instrument(ret, skip_all)]
 async fn process_multiple(
-    flow_files: FlowFileIterator,
+    flow_files: FlowFileStream,
 ) -> Result<impl IntoResponse, FlowFileParsingError> {
     flow_files
         .then(|ff| async move {
@@ -96,7 +97,7 @@ async fn process_multiple(
                 tracing::debug!("attrib: {key}: {value}");
             }
             let mut buf = [0u8; 128];
-            let n = ff.body().read(&mut buf).await?;
+            let n = ff.contents().read(&mut buf).await?;
             tracing::debug!("read {n} bytes from file body");
             Ok::<_, FlowFileParsingError>(())
         })

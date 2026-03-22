@@ -4,13 +4,17 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::FlowFileHeader;
 
-pub struct OutputFlowFile<R> {
+/// A NiFi Flow File v3.
+///
+/// This is generic over the type that holds the content. The header is kept in memory as a
+/// [`FlowFileHeader`].
+pub struct FlowFile<R> {
     header: FlowFileHeader,
     /// The content of the flow file.
     content: R,
 }
 
-impl OutputFlowFile<()> {
+impl FlowFile<()> {
     #[must_use]
     pub fn empty() -> Self {
         Self::empty_with_attributes(HashMap::default())
@@ -24,7 +28,7 @@ impl OutputFlowFile<()> {
     }
 }
 
-impl<R> OutputFlowFile<R> {
+impl<R> FlowFile<R> {
     pub fn new(
         size: impl Into<u64>,
         attributes: impl Into<HashMap<String, String>>,
@@ -52,7 +56,15 @@ impl<R> OutputFlowFile<R> {
     }
 }
 
-impl<R: AsyncRead + Unpin> OutputFlowFile<R> {
+impl<R> std::ops::Deref for FlowFile<R> {
+    type Target = FlowFileHeader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.header
+    }
+}
+
+impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// Write the flow file to the provided writer.
     ///
     /// This will write the header, followed by using [`tokio::io::copy`] to copy the content into
