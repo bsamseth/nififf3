@@ -1,5 +1,7 @@
+mod header;
 mod reader;
 mod writer;
 
-pub use reader::*;
+pub use header::FlowFileHeader;
+pub use reader::{FlowFileIterator, FlowFileParsingError, IntoFlowFiles, StreamedFlowFile};
 pub use writer::{OutputFlowFile, Storage};

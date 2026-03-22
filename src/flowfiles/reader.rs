@@ -6,6 +6,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::{bytes::Bytes, io::StreamReader};
 
+use super::FlowFileHeader;
+
 /// A NiFi Flow File v3 with a streamed body.
 ///
 /// The attributes from the flow file are available directly in memory,
@@ -16,52 +18,12 @@ pub struct StreamedFlowFile {
     tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
-/// Representation of the header of a NiFi Flow File v3.
-///
-/// A NiFi Flow File v3 header contains, when decoded, all the attributes attached to the content,
-/// as well as the size in bytes of the content.
-#[derive(Debug, Clone)]
-pub struct FlowFileHeader {
-    size: u64,
-    attributes: HashMap<String, String>,
-}
-
-impl FlowFileHeader {
-    /// The length of the content of the flow file this header describes.
-    ///
-    /// Note that this is not how many bytes may be left in the content,
-    /// but rather how many bytes the content is expected to contain in total, according
-    /// to the flow file header.
-    #[must_use]
-    pub fn len(&self) -> u64 {
-        self.size
-    }
-
-    /// Return `true` if the flow file self-reports to be empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.size == 0
-    }
-
-    /// All attributes contained in the flow file.
-    #[must_use]
-    pub fn attributes(&self) -> &HashMap<String, String> {
-        &self.attributes
-    }
-
-    /// All attributes contained in the flow file.
-    #[must_use]
-    pub fn attributes_mut(&mut self) -> &mut HashMap<String, String> {
-        &mut self.attributes
-    }
-}
-
 impl StreamedFlowFile {
     /// A reader of the (remaining) bytes of the body of the flow file.
     ///
-    /// This contains the actual file content, and is expected to yield [`Self::len()`]
-    /// bytes in total. It is guaranteed to produce no more bytes than this, but a
-    /// truncated file would give EOF early.
+    /// This contains the actual file content, and is expected to yield [`FlowFileHeader::len()`]
+    /// bytes in total. It is guaranteed to produce no more bytes than this, but a truncated file
+    /// would give EOF early.
     #[expect(clippy::missing_panics_doc, reason = "never panics, or else bug")]
     pub fn body(&mut self) -> impl AsyncRead {
         self.contents.as_mut().expect("body should be present")
@@ -97,7 +59,9 @@ impl Drop for StreamedFlowFile {
     }
 }
 
-/// Errors that can occur during parsing of NiFi Flow Files.
+/// Errors that can occur during parsing of NiFi Flow Files from a streaming source.
+///
+/// The source will typically be an HTTP POST body, but could also be other byte streams.
 #[derive(Debug, Error)]
 pub enum FlowFileParsingError {
     /// The file did not contain the expected `b"NiFiFF3"` magic byte header.
@@ -419,7 +383,7 @@ async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFilePa
 
     Ok((
         Some(StreamedFlowFile {
-            header: FlowFileHeader { size, attributes },
+            header: FlowFileHeader::new(size, attributes),
             contents: Some(file_reader),
             tx: Some(tx),
         }),
