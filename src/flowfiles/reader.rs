@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::{bytes::Bytes, io::StreamReader};
 
-/// A NiFi Flow File V3 with a streamed body.
+/// A NiFi Flow File v3 with a streamed body.
 ///
 /// The attributes from the flow file are available directly in memory,
 /// while the body is streamed.
@@ -16,6 +16,10 @@ pub struct StreamedFlowFile {
     tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
+/// Representation of the header of a NiFi Flow File v3.
+///
+/// A NiFi Flow File v3 header contains, when decoded, all the attributes attached to the content,
+/// as well as the size in bytes of the content.
 #[derive(Debug, Clone)]
 pub struct FlowFileHeader {
     size: u64,
@@ -59,7 +63,7 @@ impl StreamedFlowFile {
     /// bytes in total. It is guaranteed to produce no more bytes than this, but a
     /// truncated file would give EOF early.
     #[expect(clippy::missing_panics_doc, reason = "never panics, or else bug")]
-    pub fn body(&mut self) -> &mut FlowFileContentReader {
+    pub fn body(&mut self) -> impl AsyncRead {
         self.contents.as_mut().expect("body should be present")
     }
 
@@ -93,7 +97,7 @@ impl Drop for StreamedFlowFile {
     }
 }
 
-/// Errors that can occur during parsing of [`FlowFile`]s.
+/// Errors that can occur during parsing of NiFi Flow Files.
 #[derive(Debug, Error)]
 pub enum FlowFileParsingError {
     /// The file did not contain the expected `b"NiFiFF3"` magic byte header.
@@ -110,6 +114,9 @@ pub enum FlowFileParsingError {
     },
 
     /// Internal receive error while waiting to receive the stream reader back from a flow file reader.
+    ///
+    /// Such an error is never expected, and if it occurs you should consider the relevant
+    /// [`FlowFileIterator`] unusable.
     #[error("Broken internal flow file parsing channel: {0}")]
     BrokenChannel(#[from] tokio::sync::oneshot::error::RecvError),
 
@@ -150,7 +157,16 @@ pub trait IntoFlowFiles {
     fn into_flow_files(self) -> FlowFileIterator;
 }
 
-/// Parser capable of yielding successive [`FlowFile`]s from a stream of bytes.
+/// Extractor capable of yielding successive [`StreamedFlowFile`]s from a stream of bytes.
+///
+/// This should be used as a [`futures::Stream`] of [`StreamedFlowFile`]s. One notable thing about
+/// this stream is that because each item is a streamed flow file, you must process each flow file
+/// in order, because they share the same stream of bytes behind the scenes.
+///
+/// This is normally imposed by the iterface of [`futures::Stream`], but in theory you could
+/// attempt to collect all the files into e.g. a `Vec<StreamedFlowFile>`. This will not work, and
+/// will cause a deadlocked future because we cannot parse out subsequent flow files before the
+/// content of the first one is consumed.
 pub struct FlowFileIterator {
     /// The state of the iterator, [`None`] only when the iterator is done.
     state: Option<FlowFileIteratorState>,
@@ -158,7 +174,7 @@ pub struct FlowFileIterator {
     /// This might not be available, e.g. in case of chunked encoding.
     remaining_length: Option<u64>,
 }
-pub enum FlowFileIteratorState {
+enum FlowFileIteratorState {
     Owned(ByteStreamReader),
     Parsing(Pin<Box<dyn Future<Output = FlowFileParseResult> + Send>>),
     OnLoan(tokio::sync::oneshot::Receiver<FlowFileContentReader>),
@@ -311,7 +327,7 @@ impl Stream for FlowFileIterator {
 ///
 /// # Errors
 /// IO errors will propagate up. Otherwise this can return an error if the flowfile is malformed.
-pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFileParseResult {
+async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFileParseResult {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut buf = [0u8; 7];
     if let Err(err) = reader.read_exact(&mut buf).await {
@@ -413,6 +429,7 @@ pub async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFi
 }
 
 /// Async reader for a single file
+#[doc(hidden)]
 pub struct FlowFileContentReader {
     inner: tokio::io::Take<ByteStreamReader>,
 }

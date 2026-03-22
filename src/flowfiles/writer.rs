@@ -2,8 +2,6 @@ use std::{collections::HashMap, convert::Infallible, pin::Pin, task::Poll};
 
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt};
 
-use crate::{FlowFileContentReader, StreamedFlowFile};
-
 pub trait Storage: AsyncRead + AsyncSeek {
     type Error;
 
@@ -95,30 +93,6 @@ pub struct FlowFileEncoder<W> {
 impl<W: AsyncWrite + Unpin> FlowFileEncoder<W> {
     pub fn new(writer: W) -> Self {
         Self { writer }
-    }
-
-    /// Write a streaming flow file.
-    ///
-    /// # Errors
-    /// TODO
-    pub async fn write_flow_file<F, Fut>(
-        &mut self,
-        mut ff: StreamedFlowFile,
-        f: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce(FlowFileBodyWriter<'_, W>, &mut FlowFileContentReader) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<()>>,
-    {
-        write_flowfile_header(&mut self.writer, ff.attributes(), ff.len()).await?;
-
-        let body_writer = FlowFileBodyWriter {
-            writer: &mut self.writer,
-        };
-
-        f(body_writer, ff.body()).await?;
-
-        Ok(())
     }
 }
 
