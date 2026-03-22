@@ -6,7 +6,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 ///
 /// A NiFi Flow File v3 header contains, when decoded, all the attributes attached to the content,
 /// as well as the size in bytes of the content.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlowFileHeader {
     size: u64,
     attributes: HashMap<String, String>,
@@ -22,13 +22,14 @@ impl FlowFileHeader {
         Self { size, attributes }
     }
 
-    /// The length of the content of the flow file this header describes.
+    /// The length in bytes of the content of the flow file this header describes.
     ///
-    /// Note that this is not how many bytes may be left in the content,
-    /// but rather how many bytes the content is expected to contain in total, according
-    /// to the flow file header.
+    /// Note that this is not how many bytes may be left in the related content (for stateful
+    /// content readers, such as a file with a cursor, or a tcp connection), but rather how many
+    /// bytes the content is expected to contain in total.
+    #[doc(alias = "len")]
     #[must_use]
-    pub fn len(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.size
     }
 

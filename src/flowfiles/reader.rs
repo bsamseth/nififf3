@@ -12,6 +12,13 @@ use super::FlowFileHeader;
 ///
 /// The attributes from the flow file are available directly in memory,
 /// while the body is streamed.
+///
+/// This represents a kind of lock on a byte stream, where this type owns the byte stream until it
+/// has consumed the flow file it represents. Upon droppping this type it yields back control of
+/// the byte stream to the [`FlowFileIterator`] it was produced from.
+///
+/// If you obtain an instance of this type by using it as an Axum extractor, then it represents the
+/// entire payload of the HTTP body, and nothing special happens when it is dropped.
 pub struct StreamedFlowFile {
     header: FlowFileHeader,
     contents: Option<FlowFileContentReader>,
@@ -51,7 +58,7 @@ impl Drop for StreamedFlowFile {
         if let Some(tx) = self.tx.take()
             && let Some(contents) = self.contents.take()
         {
-            tracing::trace!("dropping flowfile with size {}", self.len());
+            tracing::trace!("dropping flowfile with size {}", self.size());
             if tx.send(contents).is_err() {
                 tracing::error!("failed to send stream back to iterator");
             }
@@ -393,8 +400,7 @@ async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFilePa
 }
 
 /// Async reader for a single file
-#[doc(hidden)]
-pub struct FlowFileContentReader {
+struct FlowFileContentReader {
     inner: tokio::io::Take<ByteStreamReader>,
 }
 
@@ -527,7 +533,7 @@ mod tests {
         };
 
         let ff = result.unwrap();
-        assert_eq!(ff.len(), 0);
+        assert_eq!(ff.size(), 0);
         assert!(ff.is_empty());
         assert!(ff.attributes().is_empty());
         assert_eq!(read_count, 7 + 2 + 8); // magic + attr count + size
@@ -545,7 +551,7 @@ mod tests {
         };
 
         let ff = result.unwrap();
-        assert_eq!(ff.len(), 7); // "content" is 7 bytes
+        assert_eq!(ff.size(), 7); // "content" is 7 bytes
         assert_eq!(ff.attributes().len(), 2);
         assert_eq!(
             ff.attributes().get("filename"),

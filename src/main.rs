@@ -60,7 +60,7 @@ async fn process_single(
 ) -> Result<impl IntoResponse, FlowFileParsingError> {
     let mut ff = ff.await?;
 
-    tracing::info!("Flow file with size: {}", ff.len());
+    tracing::info!("Flow file with size: {}", ff.size());
     for (key, value) in ff.attributes() {
         tracing::debug!("attrib: {key}: {value}");
     }
@@ -91,7 +91,7 @@ async fn process_multiple(
     flow_files
         .then(|ff| async move {
             let mut ff = ff?;
-            tracing::info!("Flow file with size: {}", ff.len());
+            tracing::info!("Flow file with size: {}", ff.size());
             for (key, value) in ff.attributes() {
                 tracing::debug!("attrib: {key}: {value}");
             }
