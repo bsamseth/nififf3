@@ -66,7 +66,7 @@ impl FlowFileHeader {
     ///
     /// # Errors
     /// Write errors from the writer are propagated up.
-    pub async fn serialize_into<W: AsyncWrite + Unpin>(
+    pub async fn serialize_header_into<W: AsyncWrite + Unpin>(
         &self,
         mut writer: W,
     ) -> tokio::io::Result<()> {
