@@ -32,7 +32,13 @@ impl IntoResponse for FlowFileParsingError {
 ///
 /// Writing bytes into the writer will end up in the streamed response body.
 ///
-/// See [`tokio::io::duplex`] for the meaning of `max_buf_size`.
+/// This is useful when you want to process some stream of data into the response, but avoid having
+/// the whole response buffered in memory. Axum needs to be given a response body so that it can
+/// start pulling bytes from it onto the network connection. But we also want to keep processing
+/// the data stream at the same time. We solve this by spawning a task that produces bytes into a
+/// writer and returning the connected body to axum.
+///
+/// See [`tokio::io::simplex`] for the meaning of `max_buf_size`.
 ///
 /// # Example
 ///
@@ -52,6 +58,6 @@ impl IntoResponse for FlowFileParsingError {
 /// }
 /// ```
 pub fn make_response_stream(max_buf_size: usize) -> (impl AsyncWrite, Body) {
-    let (read, write) = tokio::io::duplex(max_buf_size);
+    let (read, write) = tokio::io::simplex(max_buf_size);
     (write, Body::from_stream(ReaderStream::new(read)))
 }
