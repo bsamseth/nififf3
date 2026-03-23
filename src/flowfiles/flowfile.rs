@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::collections::HashMap;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -26,17 +26,17 @@ impl FlowFile<()> {
             content: (),
         }
     }
+    #[must_use]
+    pub fn builder() -> FlowFileBuilder<Unset, Unset, Unset> {
+        FlowFileBuilder {
+            size: Unset,
+            attributes: Unset,
+            content: Unset,
+        }
+    }
 }
 
 impl<C> FlowFile<C> {
-    #[must_use]
-    pub fn builder() -> FlowFileBuilder<Unset<u64>, Unset<HashMap<String, String>>, Unset<C>> {
-        FlowFileBuilder {
-            size: Unset(PhantomData),
-            attributes: Unset(PhantomData),
-            content: Unset(PhantomData),
-        }
-    }
     pub fn new(
         size: impl Into<u64>,
         attributes: impl Into<HashMap<String, String>>,
@@ -85,20 +85,14 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
         &mut self,
         mut w: W,
     ) -> tokio::io::Result<()> {
-        self.header.serialize_into(&mut w).await?;
+        self.header.serialize_header_into(&mut w).await?;
         tokio::io::copy(&mut self.content, &mut w).await?;
         Ok(())
     }
 }
 
-impl<T: Into<HashMap<String, String>>> From<T> for FlowFile<()> {
-    fn from(value: T) -> Self {
-        FlowFile::empty_with_attributes(value.into())
-    }
-}
-
 #[doc(hidden)]
-pub struct Unset<T>(PhantomData<T>);
+pub struct Unset;
 #[doc(hidden)]
 pub struct Set<T>(T);
 
@@ -108,7 +102,7 @@ pub struct FlowFileBuilder<Size, Attributes, Content> {
     attributes: Attributes,
     content: Content,
 }
-impl<S, C> FlowFileBuilder<S, Unset<HashMap<String, String>>, C> {
+impl<S, C> FlowFileBuilder<S, Unset, C> {
     pub fn attributes(
         self,
         attributes: impl Into<HashMap<String, String>>,
@@ -120,7 +114,7 @@ impl<S, C> FlowFileBuilder<S, Unset<HashMap<String, String>>, C> {
         }
     }
 }
-impl<A, C> FlowFileBuilder<Unset<u64>, A, C> {
+impl<A, C> FlowFileBuilder<Unset, A, C> {
     pub fn size(self, size: impl Into<u64>) -> FlowFileBuilder<Set<u64>, A, C> {
         FlowFileBuilder {
             size: Set(size.into()),
@@ -129,8 +123,8 @@ impl<A, C> FlowFileBuilder<Unset<u64>, A, C> {
         }
     }
 }
-impl<S, A, C> FlowFileBuilder<S, A, Unset<C>> {
-    pub fn content(self, content: C) -> FlowFileBuilder<S, A, Set<C>> {
+impl<S, A> FlowFileBuilder<S, A, Unset> {
+    pub fn content<C>(self, content: C) -> FlowFileBuilder<S, A, Set<C>> {
         FlowFileBuilder {
             size: self.size,
             attributes: self.attributes,
@@ -148,33 +142,19 @@ impl<C> FlowFileBuilder<Set<u64>, Set<HashMap<String, String>>, Set<C>> {
     }
 }
 
-impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
-    pub fn content_from_slice(
+impl<A> FlowFileBuilder<Unset, A, Unset> {
+    pub fn content_from_bytes(
         self,
-        content: &[u8],
-    ) -> FlowFileBuilder<Set<u64>, A, std::io::Cursor<Vec<u8>>> {
+        content: impl Into<Vec<u8>>,
+    ) -> FlowFileBuilder<Set<u64>, A, Set<std::io::Cursor<Vec<u8>>>> {
+        let content = content.into();
         FlowFileBuilder {
             size: Set(content.len() as u64),
             attributes: self.attributes,
-            content: std::io::Cursor::new(Vec::from(content)),
+            content: Set(std::io::Cursor::new(content)),
         }
     }
-}
 
-impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
-    pub fn content_from_vec(
-        self,
-        content: Vec<u8>,
-    ) -> FlowFileBuilder<Set<u64>, A, std::io::Cursor<Vec<u8>>> {
-        FlowFileBuilder {
-            size: Set(content.len() as u64),
-            attributes: self.attributes,
-            content: std::io::Cursor::new(content),
-        }
-    }
-}
-
-impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
     pub async fn content_from_file(
         self,
         content: impl Into<tokio::fs::File>,
@@ -187,9 +167,7 @@ impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
             content: Set(file),
         })
     }
-}
 
-impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
     pub async fn content_from_reader_buffered_in_memory<R: AsyncRead + Unpin>(
         self,
         mut reader: R,
@@ -205,7 +183,7 @@ impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
 }
 
 #[cfg(feature = "tempfile")]
-impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
+impl<A> FlowFileBuilder<Unset, A, Unset> {
     pub async fn content_from_reader_buffered_in_tempfile<R: AsyncRead + Unpin>(
         self,
         mut reader: R,
@@ -221,5 +199,14 @@ impl<A, C> FlowFileBuilder<Unset<u64>, A, Unset<C>> {
             attributes: self.attributes,
             content: Set(file),
         })
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for FlowFile<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowFile")
+            .field("header", &self.header)
+            .field("content", &self.content)
+            .finish()
     }
 }
