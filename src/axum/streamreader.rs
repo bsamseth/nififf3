@@ -5,9 +5,7 @@ use futures::{FutureExt, Stream, TryStreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::{bytes::Bytes, io::StreamReader};
 
-use crate::FlowFileParsingError;
-
-use super::FlowFileHeader;
+use crate::{FlowFileHeader, FlowFileParsingError};
 
 /// A NiFi Flow File v3 with a streamed body.
 ///
@@ -32,7 +30,7 @@ use super::FlowFileHeader;
 /// [`contents()`](Self::contents()) method:
 ///
 /// ```
-/// use nifioxide::{StreamedFlowFile, FlowFileHeader};
+/// use nifioxide::{axum::StreamedFlowFile, FlowFileHeader};
 /// use tokio::io::AsyncReadExt;
 ///
 /// async fn process_flow_file(mut ff: StreamedFlowFile) {
@@ -69,7 +67,7 @@ impl StreamedFlowFile {
     /// # Example
     ///
     /// ```
-    /// use nifioxide::StreamedFlowFile;
+    /// use nifioxide::axum::StreamedFlowFile;
     /// use tokio::io::AsyncReadExt;
     ///
     /// async fn read_content(mut ff: StreamedFlowFile) -> Result<Vec<u8>, tokio::io::Error> {
@@ -158,7 +156,7 @@ pub trait IntoFlowFiles {
 /// # Example
 ///
 /// ```
-/// use nifioxide::{FlowFileStream, StreamedFlowFile};
+/// use nifioxide::axum::{FlowFileStream, StreamedFlowFile};
 /// use futures::StreamExt;
 /// use tokio::io::AsyncReadExt;
 ///
@@ -232,7 +230,7 @@ impl FlowFileStream {
     /// # Arguments
     ///
     /// * `reader` - A reader that can be converted to a `ByteStreamReader`. This is typically
-    ///              created from an HTTP body stream using [`tokio_util::io::StreamReader`].
+    ///   created from an HTTP body stream using [`tokio_util::io::StreamReader`].
     ///
     /// # Example
     ///
@@ -253,7 +251,7 @@ impl FlowFileStream {
     ///
     /// * `reader` - A reader that can be converted to a `ByteStreamReader`.
     /// * `content_length` - The total size of the request body in bytes, typically from the
-    ///                      Content-Length header.
+    ///   Content-Length header.
     ///
     /// # Example
     ///
@@ -276,22 +274,6 @@ impl FlowFileStream {
     ///
     /// Note: If created via [`new()`](Self::new()) without content length, this will always
     /// return `false` until the stream is exhausted.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use nifioxide::FlowFileStream;
-    ///
-    /// async fn check_if_empty() {
-    ///     // Without content length, we don't know if there are files until we try to read
-    ///     // let stream = FlowFileStream::new(reader);
-    ///     // assert!(!stream.is_empty());
-    ///
-    ///     // With zero content length, we know immediately
-    ///     // let stream = FlowFileStream::new_with_content_length(reader, 0);
-    ///     // assert!(stream.is_empty());
-    /// }
-    /// ```
     pub fn is_empty(&self) -> bool {
         self.remaining_length.is_some_and(|r| r == 0) || self.state.is_none()
     }

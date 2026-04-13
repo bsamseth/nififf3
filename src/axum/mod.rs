@@ -24,7 +24,7 @@
 //! # Example
 //!
 //! ```
-//! use nifioxide::FlowFileStream;
+//! use nifioxide::axum::FlowFileStream;
 //! use futures::StreamExt;
 //!
 //! async fn handle_multiple(mut stream: FlowFileStream) -> impl axum::response::IntoResponse {
@@ -37,8 +37,10 @@
 
 mod extract;
 mod response;
+mod streamreader;
 
 pub use extract::StreamedFlowFileFuture;
+pub use streamreader::{FlowFileStream, IntoFlowFiles, StreamedFlowFile};
 
 use axum::{body::Body, http::StatusCode, response::IntoResponse};
 use tokio::io::AsyncWrite;

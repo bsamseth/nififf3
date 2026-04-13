@@ -4,7 +4,8 @@ use axum::http::{
 };
 use futures::{FutureExt, StreamExt};
 
-use crate::{FlowFileParsingError, FlowFileStream, IntoFlowFiles, StreamedFlowFile};
+use super::streamreader::{FlowFileStream, IntoFlowFiles, StreamedFlowFile};
+use crate::FlowFileParsingError;
 
 /// Axum extractor for parsing a stream of NiFi Flow Files from the request body.
 ///
@@ -15,7 +16,7 @@ use crate::{FlowFileParsingError, FlowFileStream, IntoFlowFiles, StreamedFlowFil
 /// # Extractor Pattern
 ///
 /// ```
-/// use nifioxide::FlowFileStream;
+/// use nifioxide::axum::FlowFileStream;
 /// use futures::StreamExt;
 ///
 /// async fn handler(mut stream: FlowFileStream) -> impl axum::response::IntoResponse {
