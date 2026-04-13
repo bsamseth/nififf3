@@ -2,6 +2,9 @@
 name = "nifioxide"
 version = "0.1.0"
 edition = "2024"
+description = "Write HTTP processors for NiFi in Rust."
+license = "MIT"
+repository = "https://github.com/bsamseth/nifioxide"
 
 [dependencies]
 axum = "0.8.8"
