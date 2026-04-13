@@ -7,8 +7,8 @@
 //!
 //! ## Extractors
 //!
-//! - [StreamedFlowFiles] - Extract a stream of multiple flow files from a request body.
-//! - [StreamedFlowFileFuture] - Extract a single flow file, returning an error if zero or
+//! - [StreamedFlowFiles](crate::axum::StreamedFlowFiles) - Extract a stream of multiple flow files from a request body.
+//! - [StreamedFlowFileFuture](crate::axum::StreamedFlowFileFuture) - Extract a single flow file, returning an error if zero or
 //!   more than one is provided.
 //!
 //! ## Content-Type
