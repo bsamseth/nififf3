@@ -1,4 +1,39 @@
 //! Glue between this crate and [`axum`].
+//!
+//! This module provides integration with the [Axum](https://github.com/tokio-rs/axum) web framework.
+//! It enables parsing NiFi Flow Files from HTTP requests and generating Flow File responses.
+//!
+//! # HTTP Integration
+//!
+//! ## Extractors
+//!
+//! - [`FlowFileStream`](crate::FlowFileStream) - Extract a stream of multiple flow files from a request body.
+//! - [`StreamedFlowFileFuture`] - Extract a single flow file, returning an error if zero or
+//!   more than one is provided.
+//!
+//! ## Content-Type
+//!
+//! Both extractors require the `Content-Type: application/flowfile-v3` header. Requests with
+//! other content types will receive a `415 UNSUPPORTED_MEDIA_TYPE` response.
+//!
+//! ## Responses
+//!
+//! - [`FlowFile`](crate::FlowFile) implements `IntoResponse`, enabling direct return from handlers.
+//! - [`FlowFileParsingError`] implements `IntoResponse`, returning appropriate error codes.
+//!
+//! # Example
+//!
+//! ```
+//! use nifioxide::FlowFileStream;
+//! use futures::StreamExt;
+//!
+//! async fn handle_multiple(mut stream: FlowFileStream) -> impl axum::response::IntoResponse {
+//!     while let Some(result) = stream.next().await {
+//!         let mut ff = result.unwrap();
+//!     }
+//!     "OK"
+//! }
+//! ```
 
 mod extract;
 mod response;
@@ -11,6 +46,17 @@ use tokio_util::io::ReaderStream;
 
 use crate::FlowFileParsingError;
 
+/// HTTP response implementation for [`FlowFileParsingError`].
+///
+/// Maps parsing errors to appropriate HTTP status codes:
+///
+/// - [`BadMagicBytes`](FlowFileParsingError::BadMagicBytes): `400 Bad Request`
+/// - [`Malformed`](FlowFileParsingError::Malformed): `400 Bad Request`
+/// - [`BrokenChannel`](FlowFileParsingError::BrokenChannel): `400 Bad Request`
+/// - [`ContentLengthLengthMismatch`](FlowFileParsingError::ContentLengthLengthMismatch): `400 Bad Request`
+/// - [`FlowFileExpected`](FlowFileParsingError::FlowFileExpected): `400 Bad Request`
+/// - [`SingleFlowFileExpected`](FlowFileParsingError::SingleFlowFileExpected): `422 Unprocessable Entity`
+/// - [`Io`](FlowFileParsingError::Io): `500 Internal Server Error`
 impl IntoResponse for FlowFileParsingError {
     fn into_response(self) -> axum::response::Response {
         let status_code = match self {

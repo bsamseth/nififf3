@@ -12,14 +12,39 @@ use super::FlowFileHeader;
 /// A NiFi Flow File v3 with a streamed body.
 ///
 /// The attributes from the flow file are available directly in memory,
-/// while the body is streamed.
+/// while the body is streamed. This type represents a "lock" on the underlying byte stream -
+/// it owns the portion of the stream containing this flow file's content.
 ///
-/// This represents a kind of lock on a byte stream, where this type owns the byte stream until it
-/// has consumed the flow file it represents. Upon droppping this type it yields back control of
-/// the byte stream to the [`FlowFileStream`] it was produced from.
+/// # Drop Behavior
 ///
-/// If you obtain an instance of this type by using it as an Axum extractor, then it represents the
-/// entire payload of the HTTP body, and nothing special happens when it is dropped.
+/// When a `StreamedFlowFile` is dropped, it automatically returns the content reader to the
+/// [`FlowFileStream`] it was created from, allowing subsequent flow files to be parsed.
+/// If you obtained this via an Axum extractor, nothing special happens on drop.
+///
+/// # Deref
+///
+/// This type implements `Deref` to [`FlowFileHeader`], allowing direct
+/// access to attributes and size via the header methods.
+///
+/// # Usage
+///
+/// Access attributes and content via the inherited methods from `FlowFileHeader` and the
+/// [`contents()`](Self::contents()) method:
+///
+/// ```
+/// use nifioxide::{StreamedFlowFile, FlowFileHeader};
+/// use tokio::io::AsyncReadExt;
+///
+/// async fn process_flow_file(mut ff: StreamedFlowFile) {
+///     // Access attributes via deref to FlowFileHeader
+///     println!("Size: {}", ff.size());
+///     println!("Filename: {}", ff.attributes().get("filename").unwrap());
+///
+///     // Read the content
+///     let mut buf = Vec::new();
+///     ff.contents().read_to_end(&mut buf).await.unwrap();
+/// }
+/// ```
 pub struct StreamedFlowFile {
     header: FlowFileHeader,
     contents: Option<FlowFileContentReader>,
@@ -27,11 +52,32 @@ pub struct StreamedFlowFile {
 }
 
 impl StreamedFlowFile {
-    /// A reader of the (remaining) bytes of the contents of the flow file.
+    /// Get an async reader for the content of the flow file.
     ///
-    /// This contains the actual file content, and is expected to yield [`FlowFileHeader::size()`]
-    /// bytes in total. It is guaranteed to produce no more bytes than this, but a truncated file
-    /// would give EOF early.
+    /// This returns an [`impl AsyncRead`](tokio::io::AsyncRead) that provides access to the
+    /// flow file's content bytes. The reader is limited to exactly [`FlowFileHeader::size()`]
+    /// bytes - reading beyond that will return EOF.
+    ///
+    /// **Important**: You must consume all content before the stream can advance to the next
+    /// flow file. The stream relies on the content being fully read to know where the next
+    /// flow file begins.
+    ///
+    /// # Returns
+    ///
+    /// An `impl AsyncRead` that reads at most [`size()`](FlowFileHeader::size()) bytes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use nifioxide::StreamedFlowFile;
+    /// use tokio::io::AsyncReadExt;
+    ///
+    /// async fn read_content(mut ff: StreamedFlowFile) -> Result<Vec<u8>, tokio::io::Error> {
+    ///     let mut buf = Vec::new();
+    ///     ff.contents().read_to_end(&mut buf).await?;
+    ///     Ok(buf)
+    /// }
+    /// ```
     #[expect(clippy::missing_panics_doc, reason = "never panics, or else bug")]
     pub fn contents(&mut self) -> impl AsyncRead {
         self.contents.as_mut().expect("body should be present")
@@ -40,7 +86,8 @@ impl StreamedFlowFile {
     /// Prevent automatic return of content reader when this struct is dropped.
     ///
     /// Call this when the related [`FlowFileStream`] will be dropped before this struct,
-    /// such as when extracting a single flow file from the iterator.
+    /// such as when extracting a single flow file from the iterator. This is used internally
+    /// by [`StreamedFlowFileFuture`](crate::axum::StreamedFlowFileFuture).
     pub(crate) fn disable_automatic_return_of_internal_reader(&mut self) {
         let _ = self.tx.take();
     }
@@ -69,21 +116,69 @@ impl Drop for StreamedFlowFile {
 
 /// Trait for converting streams of data into a [`FlowFileStream`].
 ///
-/// See [`FlowFileStream::from`] for which types can be used as a source.
+/// This trait is implemented for types that can serve as a source for parsing NiFi Flow Files.
+/// The most common source is an HTTP request body from Axum.
+///
+/// # Implementations
+///
+/// - [`(BodyDataStream, Option<u64>)`](axum::body::BodyDataStream) - Used when extracting from HTTP requests
+/// - Custom stream readers (via `tokio_util::io::StreamReader`)
 pub trait IntoFlowFiles {
+    /// Convert this type into a [`FlowFileStream`].
     fn into_flow_files(self) -> FlowFileStream;
 }
 
-/// Extractor capable of yielding successive [`StreamedFlowFile`]s from a stream of bytes.
+/// A stream of NiFi Flow Files parsed from a byte stream.
 ///
-/// This should be used as a [`futures::Stream`] of [`StreamedFlowFile`]s. One notable thing about
-/// this stream is that because each item is a streamed flow file, you must process each flow file
-/// in order, because they share the same stream of bytes behind the scenes.
+/// This implements [`futures::Stream`], yielding successive [`StreamedFlowFile`]s from the
+/// underlying byte stream. Each flow file is streamed, meaning the attributes are available in
+/// memory but the content is read on-demand.
 ///
-/// This is normally imposed by the iterface of [`futures::Stream`], but in theory you could
-/// attempt to collect all the files into e.g. a `Vec<StreamedFlowFile>`. This will not work, and
-/// will cause a deadlocked future because we cannot parse out subsequent flow files before the
-/// content of the first one is consumed.
+/// # Important: Sequential Processing Required
+///
+/// Because each flow file's content is streamed from a shared underlying byte stream, you **must**
+/// process flow files in order. You cannot collect all flow files into a collection (like `Vec`)
+/// before processing them, as this will cause a deadlock - the parser cannot read subsequent
+/// flow files until the current one's content is consumed.
+///
+/// # Creation
+///
+/// FlowFileStream is typically created by:
+/// 1. Using it as an Axum extractor: `async fn handler(ff: FlowFileStream)`
+/// 2. Using [`IntoFlowFiles`] trait on a reader: `reader.into_flow_files()`
+///
+/// # Errors
+///
+/// The stream yields [`Result<StreamedFlowFile, FlowFileParsingError>`](FlowFileParsingError).
+/// Common errors include:
+/// - [`BadMagicBytes`](FlowFileParsingError::BadMagicBytes) - Data doesn't start with "NiFiFF3"
+/// - [`Malformed`](FlowFileParsingError::Malformed) - Data is truncated or malformed
+/// - [`ContentLengthLengthMismatch`](FlowFileParsingError::ContentLengthLengthMismatch) - Content-Length header doesn't match actual data
+///
+/// # Example
+///
+/// ```
+/// use nifioxide::{FlowFileStream, StreamedFlowFile};
+/// use futures::StreamExt;
+/// use tokio::io::AsyncReadExt;
+///
+/// async fn process_flow_files(mut stream: FlowFileStream) {
+///     while let Some(result) = stream.next().await {
+///         match result {
+///             Ok(mut ff) => {
+///                 println!("Processing flow file: size={}", ff.size());
+///                 // Read content
+///                 let mut buf = Vec::new();
+///                 ff.contents().read_to_end(&mut buf).await.unwrap();
+///                 println!("Content: {:?}", String::from_utf8_lossy(&buf));
+///             }
+///             Err(e) => {
+///                 eprintln!("Error reading flow file: {}", e);
+///             }
+///         }
+///     }
+/// }
+/// ```
 pub struct FlowFileStream {
     /// The state of the iterator, [`None`] only when the iterator is done.
     state: Option<FlowFileStreamState>,
@@ -129,6 +224,19 @@ type FlowFileParseResult = Result<
 >;
 
 impl FlowFileStream {
+    /// Create a new FlowFileStream from a reader.
+    ///
+    /// This creates a stream without knowledge of the total content length. The stream will
+    /// continue reading until EOF.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - A reader that can be converted to a `ByteStreamReader`. This is typically
+    ///              created from an HTTP body stream using [`tokio_util::io::StreamReader`].
+    ///
+    /// # Example
+    ///
+    /// Most users will use the [`IntoFlowFiles`] trait instead. See its documentation for examples.
     pub fn new(reader: impl Into<ByteStreamReader>) -> Self {
         Self {
             state: Some(FlowFileStreamState::Owned(reader.into())),
@@ -136,6 +244,20 @@ impl FlowFileStream {
         }
     }
 
+    /// Create a new FlowFileStream from a reader with known content length.
+    ///
+    /// This is useful when the Content-Length header is available, allowing the stream to
+    /// detect when all flow files have been read (when remaining_length reaches 0).
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - A reader that can be converted to a `ByteStreamReader`.
+    /// * `content_length` - The total size of the request body in bytes, typically from the
+    ///                      Content-Length header.
+    ///
+    /// # Example
+    ///
+    /// Most users will use the [`IntoFlowFiles`] trait instead. See its documentation for examples.
     pub fn new_with_content_length(
         reader: impl Into<ByteStreamReader>,
         content_length: u64,
@@ -146,7 +268,30 @@ impl FlowFileStream {
         }
     }
 
-    /// Return `true` if the iterator knows that it will not yield more flow files.
+    /// Returns `true` if the iterator knows that it will not yield more flow files.
+    ///
+    /// This can happen when:
+    /// - The content length was set to 0 via [`new_with_content_length()`](Self::new_with_content_length()).
+    /// - All flow files have already been consumed (the stream has ended).
+    ///
+    /// Note: If created via [`new()`](Self::new()) without content length, this will always
+    /// return `false` until the stream is exhausted.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use nifioxide::FlowFileStream;
+    ///
+    /// async fn check_if_empty() {
+    ///     // Without content length, we don't know if there are files until we try to read
+    ///     // let stream = FlowFileStream::new(reader);
+    ///     // assert!(!stream.is_empty());
+    ///
+    ///     // With zero content length, we know immediately
+    ///     // let stream = FlowFileStream::new_with_content_length(reader, 0);
+    ///     // assert!(stream.is_empty());
+    /// }
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.remaining_length.is_some_and(|r| r == 0) || self.state.is_none()
     }

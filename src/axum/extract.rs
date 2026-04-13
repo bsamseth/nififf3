@@ -6,6 +6,37 @@ use futures::{FutureExt, StreamExt};
 
 use crate::{FlowFileParsingError, FlowFileStream, IntoFlowFiles, StreamedFlowFile};
 
+/// Axum extractor for parsing a stream of NiFi Flow Files from the request body.
+///
+/// This extractor reads the entire request body as a stream of NiFi Flow Files (v3).
+/// Each flow file is parsed lazily - only the header is read initially, with content
+/// streamed on-demand.
+///
+/// # Extractor Pattern
+///
+/// ```
+/// use nifioxide::FlowFileStream;
+/// use futures::StreamExt;
+///
+/// async fn handler(mut stream: FlowFileStream) -> impl axum::response::IntoResponse {
+///     while let Some(result) = stream.next().await {
+///         match result {
+///             Ok(_ff) => {
+///                 // Process flow file
+///             }
+///             Err(e) => {
+///                 return (axum::http::StatusCode::BAD_REQUEST, e.to_string());
+///             }
+///         }
+///     }
+///     (axum::http::StatusCode::OK, "OK".to_string())
+/// }
+/// ```
+///
+/// # Rejection
+///
+/// Returns `(StatusCode::UNSUPPORTED_MEDIA_TYPE, &str)` if the Content-Type header
+/// is missing or not `application/flowfile-v3`.
 impl<S> axum::extract::FromRequest<S> for FlowFileStream
 where
     S: Send + Sync,
@@ -43,6 +74,30 @@ impl TryFrom<axum::extract::Request> for FlowFileStream {
     }
 }
 
+/// Axum extractor for parsing a single NiFi Flow File from the request body.
+///
+/// This extractor is a [`Future`] that resolves to a single [`StreamedFlowFile`].
+/// It provides a convenient way to handle endpoints that expect exactly one flow file.
+///
+/// # Usage
+///
+/// As an extractor, you use it directly as a parameter. Since it's a [`Future`], you await it:
+///
+/// ```
+/// async fn handler(
+///     ff: nifioxide::axum::StreamedFlowFileFuture
+/// ) -> Result<impl axum::response::IntoResponse, nifioxide::FlowFileParsingError> {
+///     let mut _ff = ff.await?;  // Await the future to get the flow file
+///     Ok("OK")
+/// }
+/// ```
+///
+/// # Errors
+///
+/// - `(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Only Content-Type: application/flowfile-v3 is accepted.")` - Wrong or missing Content-Type
+/// - `FlowFileParsingError::FlowFileExpected` - No flow file in request body (empty request)
+/// - `FlowFileParsingError::SingleFlowFileExpected` - Multiple flow files in request body
+/// - `FlowFileParsingError::*` - Other parsing errors (malformed flow file, etc.)
 impl<S> axum::extract::FromRequest<S> for StreamedFlowFileFuture
 where
     S: Send + Sync,
