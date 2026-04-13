@@ -151,8 +151,10 @@ async fn from_reader_into_memory(
 
 ## License
 
-Licensed under either of:
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE)
-- MIT license ([LICENSE-MIT](LICENSE-MIT)
+This project is licensed under the [MIT license](LICENSE).
 
-at your option.
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you shall be licensed as MIT, without any additional
+terms or conditions.
