@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, ops::Deref, pin::Pin};
+use std::{collections::HashMap, io, pin::Pin};
 
 use axum::body::BodyDataStream;
 use futures::{FutureExt, Stream, TryStreamExt};
@@ -19,95 +19,34 @@ use crate::{FlowFileHeader, FlowFileParsingError};
 /// [`StreamedFlowFiles`] it was created from, allowing subsequent flow files to be parsed.
 /// If you obtained this via an Axum extractor, nothing special happens on drop.
 ///
-/// # Deref
 ///
-/// This type implements `Deref` to [`FlowFileHeader`], allowing direct
-/// access to attributes and size via the header methods.
-///
-/// # Usage
-///
-/// Access attributes and content via the inherited methods from `FlowFileHeader` and the
-/// [`contents()`](Self::contents()) method:
-///
-/// ```
-/// use nifioxide::{axum::StreamedFlowFile, FlowFileHeader};
-/// use tokio::io::AsyncReadExt;
-///
-/// async fn process_flow_file(mut ff: StreamedFlowFile) {
-///     // Access attributes via deref to FlowFileHeader
-///     println!("Size: {}", ff.size());
-///     println!("Filename: {}", ff.attributes().get("filename").unwrap());
-///
-///     // Read the content
-///     let mut buf = Vec::new();
-///     ff.contents().read_to_end(&mut buf).await.unwrap();
-/// }
-/// ```
-pub struct StreamedFlowFile {
-    header: FlowFileHeader,
-    contents: Option<FlowFileContentReader>,
+/// For more general documentation, see [`FlowFile`](crate::FlowFile).
+pub type StreamedFlowFile = crate::FlowFile<BorrowedFlowfileContentReader>;
+
+#[doc(hidden)]
+pub struct BorrowedFlowfileContentReader {
+    content: Option<FlowFileContentReader>,
     tx: Option<tokio::sync::oneshot::Sender<FlowFileContentReader>>,
 }
 
 impl StreamedFlowFile {
-    /// Get an async reader for the content of the flow file.
-    ///
-    /// This returns an [`impl AsyncRead`](tokio::io::AsyncRead) that provides access to the
-    /// flow file's content bytes. The reader is limited to exactly [`FlowFileHeader::size()`]
-    /// bytes - reading beyond that will return EOF.
-    ///
-    /// **Important**: You must consume all content before the stream can advance to the next
-    /// flow file. The stream relies on the content being fully read to know where the next
-    /// flow file begins.
-    ///
-    /// # Returns
-    ///
-    /// An `impl AsyncRead` that reads at most [`size()`](FlowFileHeader::size()) bytes.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use nifioxide::axum::StreamedFlowFile;
-    /// use tokio::io::AsyncReadExt;
-    ///
-    /// async fn read_content(mut ff: StreamedFlowFile) -> Result<Vec<u8>, tokio::io::Error> {
-    ///     let mut buf = Vec::new();
-    ///     ff.contents().read_to_end(&mut buf).await?;
-    ///     Ok(buf)
-    /// }
-    /// ```
-    #[expect(clippy::missing_panics_doc, reason = "never panics, or else bug")]
-    pub fn contents(&mut self) -> impl AsyncRead {
-        self.contents.as_mut().expect("body should be present")
-    }
-
     /// Prevent automatic return of content reader when this struct is dropped.
     ///
     /// Call this when the related [`StreamedFlowFiles`] will be dropped before this struct,
     /// such as when extracting a single flow file from the iterator. This is used internally
     /// by [`StreamedFlowFileFuture`](crate::axum::StreamedFlowFileFuture).
     pub(crate) fn disable_automatic_return_of_internal_reader(&mut self) {
-        let _ = self.tx.take();
+        let _ = self.content.tx.take();
     }
 }
 
-impl Deref for StreamedFlowFile {
-    type Target = FlowFileHeader;
-
-    fn deref(&self) -> &Self::Target {
-        &self.header
-    }
-}
-
-impl Drop for StreamedFlowFile {
+impl Drop for BorrowedFlowfileContentReader {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take()
-            && let Some(contents) = self.contents.take()
+            && let Some(content) = self.content.take()
+            && tx.send(content).is_err()
         {
-            tracing::trace!("dropping flowfile with size {}", self.size());
-            if tx.send(contents).is_err() {
-                tracing::error!("failed to send stream back to iterator");
-            }
+            tracing::error!("failed to send stream back to iterator");
         }
     }
 }
@@ -167,7 +106,7 @@ pub trait IntoFlowFiles {
 ///                 println!("Processing flow file: size={}", ff.size());
 ///                 // Read content
 ///                 let mut buf = Vec::new();
-///                 ff.contents().read_to_end(&mut buf).await.unwrap();
+///                 ff.content_mut().read_to_end(&mut buf).await.unwrap();
 ///                 println!("Content: {:?}", String::from_utf8_lossy(&buf));
 ///             }
 ///             Err(e) => {
@@ -464,8 +403,10 @@ async fn parse_flow_file_from_reader(mut reader: ByteStreamReader) -> FlowFilePa
     Ok((
         Some(StreamedFlowFile {
             header: FlowFileHeader::new(size, attributes),
-            contents: Some(file_reader),
-            tx: Some(tx),
+            content: BorrowedFlowfileContentReader {
+                content: Some(file_reader),
+                tx: Some(tx),
+            },
         }),
         rx,
         read_count,
@@ -491,6 +432,19 @@ impl AsyncRead for FlowFileContentReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncRead for BorrowedFlowfileContentReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let Some(content) = self.content.as_mut() else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        Pin::new(content).poll_read(cx, buf)
     }
 }
 
@@ -528,12 +482,12 @@ impl std::fmt::Debug for StreamedFlowFilesState {
     }
 }
 
-impl std::fmt::Debug for StreamedFlowFile {
+impl std::fmt::Debug for BorrowedFlowfileContentReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamedFlowFile")
-            .field("header", &self.header)
-            .field("contents", &"<impl AsyncRead>")
-            .finish_non_exhaustive()
+        f.debug_struct("BorrowedFlowfileContentReader")
+            .field("content", &self.content)
+            .field("tx", &self.tx)
+            .finish()
     }
 }
 
@@ -647,7 +601,7 @@ mod tests {
 
         let mut ff = result.unwrap();
         let mut buf = Vec::new();
-        ff.contents().read_to_end(&mut buf).await.unwrap();
+        ff.content_mut().read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, content);
     }
 

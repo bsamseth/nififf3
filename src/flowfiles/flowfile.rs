@@ -33,9 +33,9 @@ use super::FlowFileHeader;
 ///
 /// For reading flow files from a stream, see [`crate::axum::StreamedFlowFiles`] and [`crate::axum::StreamedFlowFile`].
 pub struct FlowFile<C> {
-    header: FlowFileHeader,
+    pub(crate) header: FlowFileHeader,
     /// The content of the flow file.
-    content: C,
+    pub(crate) content: C,
 }
 
 impl FlowFile<()> {
@@ -207,6 +207,14 @@ impl<C> std::ops::DerefMut for FlowFile<C> {
 }
 
 impl<R: AsyncRead + Unpin> FlowFile<R> {
+    /// Serialize the flow file into a writer.
+    ///
+    /// This will write the header using [`FlowFileHeader::serialize_header_into`], followed by
+    /// using [`tokio::io::copy`] to copy the bytes from the content into the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`tokio::io::Error`] if writing fails. See the above functions for more details.
     pub async fn serialize_into<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
         mut w: W,
@@ -487,7 +495,7 @@ impl<A> FlowFileBuilder<Unset, A, Unset> {
     /// Set content from a reader, buffering it to a temporary file.
     ///
     /// This is useful for handling large content that you don't want to keep entirely in memory.
-    /// The reader's contents are copied to a temporary file, which is then used as the content source.
+    /// The reader's content is copied to a temporary file, which is then used as the content source.
     /// The file is seeked back to the beginning so it can be read.
     ///
     /// Requires the `tempfile` feature to be enabled.

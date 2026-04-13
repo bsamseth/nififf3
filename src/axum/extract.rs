@@ -4,7 +4,7 @@ use axum::http::{
 };
 use futures::{FutureExt, StreamExt};
 
-use super::streamreader::{StreamedFlowFiles, IntoFlowFiles, StreamedFlowFile};
+use super::streamreader::{IntoFlowFiles, StreamedFlowFile, StreamedFlowFiles};
 use crate::FlowFileParsingError;
 
 /// Axum extractor for parsing a stream of NiFi Flow Files from the request body.
@@ -140,7 +140,7 @@ impl TryFrom<axum::extract::Request> for StreamedFlowFileFuture {
 ///     }
 ///
 ///     let mut buf = Vec::with_capacity(ff.size() as usize);
-///     ff.contents().read_to_end(&mut buf).await?;
+///     ff.content_mut().read_to_end(&mut buf).await?;
 ///     Ok((axum::http::StatusCode::OK, buf))
 /// }
 pub struct StreamedFlowFileFuture(StreamedFlowFiles);

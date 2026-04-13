@@ -44,7 +44,7 @@ async fn process_single(
     }
 
     let mut buf = [0u8; 128];
-    let n = match ff.contents().read(&mut buf).await {
+    let n = match ff.content_mut().read(&mut buf).await {
         Ok(n) => n,
         Err(err) => {
             tracing::error!("error from reading ff body: {err}");
@@ -81,7 +81,7 @@ async fn process_multiple(
                 tracing::debug!("attrib: {key}: {value}");
             }
             let mut buf = [0u8; 128];
-            let n = ff.contents().read(&mut buf).await?;
+            let n = ff.content_mut().read(&mut buf).await?;
             tracing::debug!("read {n} bytes from file body");
             Ok::<_, FlowFileParsingError>(())
         })
@@ -119,7 +119,7 @@ async fn process_single_streamed_multi_output(
     tokio::spawn(async move {
         let total_size = ff.size();
         let mut first_half = Vec::with_capacity((total_size / 2) as usize);
-        ff.contents()
+        ff.content_mut()
             .take(total_size / 2)
             .read_to_end(&mut first_half)
             .await?;
@@ -134,12 +134,12 @@ async fn process_single_streamed_multi_output(
             // slices), you have to specify the size explicitly. As we just give it the input stream
             // reader here, we can calculate the expected size.
             .size(total_size - first_flow_file.header().size())
-            .content(ff.contents())
+            .content(ff.content_mut())
             // Alteratively, if we don't know the size, we would need to consume the reader and count
             // how many bytes were read. In this case you'd do either of these two:
             //
-            // .content_from_reader_buffered_in_memory(ff.contents()).await?
-            // .content_from_reader_buffered_in_tempfile(ff.contents()).await?
+            // .content_from_reader_buffered_in_memory(ff.content_mut()).await?
+            // .content_from_reader_buffered_in_tempfile(ff.content_mut()).await?
             .build();
 
         first_flow_file.serialize_into(&mut w).await?;
