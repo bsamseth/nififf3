@@ -16,7 +16,7 @@ use crate::{FlowFileHeader, FlowFileParsingError};
 /// # Drop Behavior
 ///
 /// When a `StreamedFlowFile` is dropped, it automatically returns the content reader to the
-/// [`FlowFileStream`] it was created from, allowing subsequent flow files to be parsed.
+/// [`StreamedFlowFiles`] it was created from, allowing subsequent flow files to be parsed.
 /// If you obtained this via an Axum extractor, nothing special happens on drop.
 ///
 /// # Deref
@@ -83,7 +83,7 @@ impl StreamedFlowFile {
 
     /// Prevent automatic return of content reader when this struct is dropped.
     ///
-    /// Call this when the related [`FlowFileStream`] will be dropped before this struct,
+    /// Call this when the related [`StreamedFlowFiles`] will be dropped before this struct,
     /// such as when extracting a single flow file from the iterator. This is used internally
     /// by [`StreamedFlowFileFuture`](crate::axum::StreamedFlowFileFuture).
     pub(crate) fn disable_automatic_return_of_internal_reader(&mut self) {
@@ -112,7 +112,7 @@ impl Drop for StreamedFlowFile {
     }
 }
 
-/// Trait for converting streams of data into a [`FlowFileStream`].
+/// Trait for converting streams of data into a [`StreamedFlowFiles`].
 ///
 /// This trait is implemented for types that can serve as a source for parsing NiFi Flow Files.
 /// The most common source is an HTTP request body from Axum.
@@ -122,8 +122,8 @@ impl Drop for StreamedFlowFile {
 /// - [`(BodyDataStream, Option<u64>)`](axum::body::BodyDataStream) - Used when extracting from HTTP requests
 /// - Custom stream readers (via `tokio_util::io::StreamReader`)
 pub trait IntoFlowFiles {
-    /// Convert this type into a [`FlowFileStream`].
-    fn into_flow_files(self) -> FlowFileStream;
+    /// Convert this type into a [`StreamedFlowFiles`].
+    fn into_flow_files(self) -> StreamedFlowFiles;
 }
 
 /// A stream of NiFi Flow Files parsed from a byte stream.
@@ -141,8 +141,8 @@ pub trait IntoFlowFiles {
 ///
 /// # Creation
 ///
-/// FlowFileStream is typically created by:
-/// 1. Using it as an Axum extractor: `async fn handler(ff: FlowFileStream)`
+/// StreamedFlowFiles is created in one of two ways:
+/// 1. Using it as an Axum extractor: `async fn handler(ff: StreamedFlowFiles)`
 /// 2. Using [`IntoFlowFiles`] trait on a reader: `reader.into_flow_files()`
 ///
 /// # Errors
@@ -156,11 +156,11 @@ pub trait IntoFlowFiles {
 /// # Example
 ///
 /// ```
-/// use nifioxide::axum::{FlowFileStream, StreamedFlowFile};
+/// use nifioxide::axum::{StreamedFlowFiles, StreamedFlowFile};
 /// use futures::StreamExt;
 /// use tokio::io::AsyncReadExt;
 ///
-/// async fn process_flow_files(mut stream: FlowFileStream) {
+/// async fn process_flow_files(mut stream: StreamedFlowFiles) {
 ///     while let Some(result) = stream.next().await {
 ///         match result {
 ///             Ok(mut ff) => {
@@ -177,25 +177,25 @@ pub trait IntoFlowFiles {
 ///     }
 /// }
 /// ```
-pub struct FlowFileStream {
+pub struct StreamedFlowFiles {
     /// The state of the iterator, [`None`] only when the iterator is done.
-    state: Option<FlowFileStreamState>,
+    state: Option<StreamedFlowFilesState>,
     /// The expected length of the inner reader, as reported by Content-Length header.
     /// This might not be available, e.g. in case of chunked encoding.
     remaining_length: Option<u64>,
 }
-enum FlowFileStreamState {
+enum StreamedFlowFilesState {
     Owned(ByteStreamReader),
     Parsing(Pin<Box<dyn Future<Output = FlowFileParseResult> + Send>>),
     OnLoan(tokio::sync::oneshot::Receiver<FlowFileContentReader>),
     NeedsToDrain(Pin<Box<dyn Future<Output = Result<ByteStreamReader, tokio::io::Error>> + Send>>),
 }
 
-impl From<(BodyDataStream, Option<u64>)> for FlowFileStream {
+impl From<(BodyDataStream, Option<u64>)> for StreamedFlowFiles {
     fn from((body, maybe_content_length): (BodyDataStream, Option<u64>)) -> Self {
         let stream: BoxedByteStream = Box::pin(body.map_err(io::Error::other));
         let reader = StreamReader::new(stream);
-        let state = Some(FlowFileStreamState::Owned(reader));
+        let state = Some(StreamedFlowFilesState::Owned(reader));
         Self {
             state,
             remaining_length: maybe_content_length,
@@ -203,8 +203,8 @@ impl From<(BodyDataStream, Option<u64>)> for FlowFileStream {
     }
 }
 
-impl<S: Into<FlowFileStream>> IntoFlowFiles for S {
-    fn into_flow_files(self) -> FlowFileStream {
+impl<S: Into<StreamedFlowFiles>> IntoFlowFiles for S {
+    fn into_flow_files(self) -> StreamedFlowFiles {
         self.into()
     }
 }
@@ -221,8 +221,8 @@ type FlowFileParseResult = Result<
     (FlowFileParsingError, ByteStreamReader),
 >;
 
-impl FlowFileStream {
-    /// Create a new FlowFileStream from a reader.
+impl StreamedFlowFiles {
+    /// Create a new StreamedFlowFiles from a reader.
     ///
     /// This creates a stream without knowledge of the total content length. The stream will
     /// continue reading until EOF.
@@ -237,12 +237,12 @@ impl FlowFileStream {
     /// Most users will use the [`IntoFlowFiles`] trait instead. See its documentation for examples.
     pub fn new(reader: impl Into<ByteStreamReader>) -> Self {
         Self {
-            state: Some(FlowFileStreamState::Owned(reader.into())),
+            state: Some(StreamedFlowFilesState::Owned(reader.into())),
             remaining_length: None,
         }
     }
 
-    /// Create a new FlowFileStream from a reader with known content length.
+    /// Create a new StreamedFlowFiles from a reader with known content length.
     ///
     /// This is useful when the Content-Length header is available, allowing the stream to
     /// detect when all flow files have been read (when remaining_length reaches 0).
@@ -261,7 +261,7 @@ impl FlowFileStream {
         content_length: u64,
     ) -> Self {
         Self {
-            state: Some(FlowFileStreamState::Owned(reader.into())),
+            state: Some(StreamedFlowFilesState::Owned(reader.into())),
             remaining_length: Some(content_length),
         }
     }
@@ -279,7 +279,7 @@ impl FlowFileStream {
     }
 }
 
-impl Stream for FlowFileStream {
+impl Stream for StreamedFlowFiles {
     type Item = Result<StreamedFlowFile, FlowFileParsingError>;
 
     fn poll_next(
@@ -297,45 +297,45 @@ impl Stream for FlowFileStream {
             };
 
             match state {
-                FlowFileStreamState::OnLoan(mut receiver) => match receiver.poll_unpin(cx) {
+                StreamedFlowFilesState::OnLoan(mut receiver) => match receiver.poll_unpin(cx) {
                     Poll::Ready(Ok(reader)) => {
                         if reader.inner.limit() > 0 {
                             let drain_fut = Box::pin(reader.drain());
-                            this.state = Some(FlowFileStreamState::NeedsToDrain(drain_fut));
+                            this.state = Some(StreamedFlowFilesState::NeedsToDrain(drain_fut));
                         } else {
                             this.state =
-                                Some(FlowFileStreamState::Owned(reader.inner.into_inner()));
+                                Some(StreamedFlowFilesState::Owned(reader.inner.into_inner()));
                         }
                     }
                     Poll::Ready(Err(err)) => {
                         return Poll::Ready(Some(Err(err.into())));
                     }
                     Poll::Pending => {
-                        this.state = Some(FlowFileStreamState::OnLoan(receiver));
+                        this.state = Some(StreamedFlowFilesState::OnLoan(receiver));
                         return Poll::Pending;
                     }
                 },
-                FlowFileStreamState::NeedsToDrain(mut reader) => match reader.poll_unpin(cx) {
+                StreamedFlowFilesState::NeedsToDrain(mut reader) => match reader.poll_unpin(cx) {
                     Poll::Ready(Ok(reader)) => {
-                        this.state = Some(FlowFileStreamState::Owned(reader));
+                        this.state = Some(StreamedFlowFilesState::Owned(reader));
                     }
                     Poll::Ready(Err(err)) => {
                         return Poll::Ready(Some(Err(err.into())));
                     }
                     Poll::Pending => {
-                        this.state = Some(FlowFileStreamState::NeedsToDrain(reader));
+                        this.state = Some(StreamedFlowFilesState::NeedsToDrain(reader));
                         return Poll::Pending;
                     }
                 },
-                FlowFileStreamState::Owned(reader) => {
+                StreamedFlowFilesState::Owned(reader) => {
                     if this.remaining_length.is_some_and(|n| n == 0) {
                         tracing::trace!("Hit expected EOF, no more files in iterator");
                         return Poll::Ready(None);
                     }
                     let reader = Box::pin(parse_flow_file_from_reader(reader));
-                    this.state = Some(FlowFileStreamState::Parsing(reader));
+                    this.state = Some(StreamedFlowFilesState::Parsing(reader));
                 }
-                FlowFileStreamState::Parsing(mut parse_fut) => match parse_fut.poll_unpin(cx) {
+                StreamedFlowFilesState::Parsing(mut parse_fut) => match parse_fut.poll_unpin(cx) {
                     Poll::Ready(Ok((None, _, _))) => {
                         return Poll::Ready(None);
                     }
@@ -351,14 +351,14 @@ impl Stream for FlowFileStream {
                             }
                             *remaining_length = remaining_length.saturating_sub(total_ff_length);
                         }
-                        this.state = Some(FlowFileStreamState::OnLoan(receiver));
+                        this.state = Some(StreamedFlowFilesState::OnLoan(receiver));
                         return Poll::Ready(Some(Ok(flow_file)));
                     }
                     Poll::Ready(Err((parsing_err, _reader))) => {
                         return Poll::Ready(Some(Err(parsing_err)));
                     }
                     Poll::Pending => {
-                        this.state = Some(FlowFileStreamState::Parsing(parse_fut));
+                        this.state = Some(StreamedFlowFilesState::Parsing(parse_fut));
                         return Poll::Pending;
                     }
                 },
@@ -517,7 +517,7 @@ fn string_encoded_size(s: &str) -> u64 {
     u64::from(n) + field_length_encoded_size(n)
 }
 
-impl std::fmt::Debug for FlowFileStreamState {
+impl std::fmt::Debug for StreamedFlowFilesState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Owned(_) => f.debug_tuple("Owned").finish_non_exhaustive(),
@@ -708,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn iterator_empty_stream() {
         let reader = make_byte_stream(vec![]);
-        let mut iter = FlowFileStream::new(reader);
+        let mut iter = StreamedFlowFiles::new(reader);
 
         let next = iter.next().await;
         assert!(next.is_none());
@@ -717,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn iterator_with_content_length_zero_is_empty() {
         let reader = make_byte_stream(vec![]);
-        let iter = FlowFileStream::new_with_content_length(reader, 0);
+        let iter = StreamedFlowFiles::new_with_content_length(reader, 0);
 
         assert!(iter.is_empty());
     }
@@ -726,7 +726,7 @@ mod tests {
     async fn iterator_single_flow_file() {
         let data = encode_flow_file(&[("key", "value")], b"body");
         let reader = make_byte_stream(data);
-        let mut iter = FlowFileStream::new(reader);
+        let mut iter = StreamedFlowFiles::new(reader);
 
         {
             let ff = iter.next().await.unwrap().unwrap();
@@ -746,7 +746,7 @@ mod tests {
         combined.extend(data2);
 
         let reader = make_byte_stream(combined);
-        let mut iter = FlowFileStream::new(reader);
+        let mut iter = StreamedFlowFiles::new(reader);
 
         {
             let ff1 = iter.next().await.unwrap().unwrap();
@@ -765,7 +765,7 @@ mod tests {
     async fn iterator_content_length_mismatch() {
         let data = encode_flow_file(&[], b"extra content after header");
         let reader = make_byte_stream(data);
-        let mut iter = FlowFileStream::new_with_content_length(reader, 9);
+        let mut iter = StreamedFlowFiles::new_with_content_length(reader, 9);
 
         let result = iter.next().await;
         match result {

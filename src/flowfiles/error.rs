@@ -21,7 +21,7 @@ pub enum FlowFileParsingError {
     /// Internal receive error while waiting to receive the stream reader back from a flow file reader.
     ///
     /// Such an error is never expected, and if it occurs you should consider the relevant
-    /// [`crate::FlowFileStream`] unusable.
+    /// [`crate::axum::StreamedFlowFiles`] unusable.
     #[error("Broken internal flow file parsing channel: {0}")]
     BrokenChannel(#[from] tokio::sync::oneshot::error::RecvError),
 

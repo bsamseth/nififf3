@@ -7,8 +7,8 @@
 //!
 //! ## Extractors
 //!
-//! - [`FlowFileStream`](crate::FlowFileStream) - Extract a stream of multiple flow files from a request body.
-//! - [`StreamedFlowFileFuture`] - Extract a single flow file, returning an error if zero or
+//! - [StreamedFlowFiles] - Extract a stream of multiple flow files from a request body.
+//! - [StreamedFlowFileFuture] - Extract a single flow file, returning an error if zero or
 //!   more than one is provided.
 //!
 //! ## Content-Type
@@ -24,10 +24,10 @@
 //! # Example
 //!
 //! ```
-//! use nifioxide::axum::FlowFileStream;
+//! use nifioxide::axum::StreamedFlowFiles;
 //! use futures::StreamExt;
 //!
-//! async fn handle_multiple(mut stream: FlowFileStream) -> impl axum::response::IntoResponse {
+//! async fn handle_multiple(mut stream: StreamedFlowFiles) -> impl axum::response::IntoResponse {
 //!     while let Some(result) = stream.next().await {
 //!         let mut ff = result.unwrap();
 //!     }
@@ -40,7 +40,7 @@ mod response;
 mod streamreader;
 
 pub use extract::StreamedFlowFileFuture;
-pub use streamreader::{FlowFileStream, IntoFlowFiles, StreamedFlowFile};
+pub use streamreader::{IntoFlowFiles, StreamedFlowFile, StreamedFlowFiles};
 
 use axum::{body::Body, http::StatusCode, response::IntoResponse};
 use tokio::io::AsyncWrite;

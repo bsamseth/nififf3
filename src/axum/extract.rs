@@ -4,7 +4,7 @@ use axum::http::{
 };
 use futures::{FutureExt, StreamExt};
 
-use super::streamreader::{FlowFileStream, IntoFlowFiles, StreamedFlowFile};
+use super::streamreader::{StreamedFlowFiles, IntoFlowFiles, StreamedFlowFile};
 use crate::FlowFileParsingError;
 
 /// Axum extractor for parsing a stream of NiFi Flow Files from the request body.
@@ -16,10 +16,10 @@ use crate::FlowFileParsingError;
 /// # Extractor Pattern
 ///
 /// ```
-/// use nifioxide::axum::FlowFileStream;
+/// use nifioxide::axum::StreamedFlowFiles;
 /// use futures::StreamExt;
 ///
-/// async fn handler(mut stream: FlowFileStream) -> impl axum::response::IntoResponse {
+/// async fn handler(mut stream: StreamedFlowFiles) -> impl axum::response::IntoResponse {
 ///     while let Some(result) = stream.next().await {
 ///         match result {
 ///             Ok(_ff) => {
@@ -38,7 +38,7 @@ use crate::FlowFileParsingError;
 ///
 /// Returns `(StatusCode::UNSUPPORTED_MEDIA_TYPE, &str)` if the Content-Type header
 /// is missing or not `application/flowfile-v3`.
-impl<S> axum::extract::FromRequest<S> for FlowFileStream
+impl<S> axum::extract::FromRequest<S> for StreamedFlowFiles
 where
     S: Send + Sync,
 {
@@ -49,7 +49,7 @@ where
     }
 }
 
-impl TryFrom<axum::extract::Request> for FlowFileStream {
+impl TryFrom<axum::extract::Request> for StreamedFlowFiles {
     type Error = (StatusCode, &'static str);
 
     fn try_from(req: axum::extract::Request) -> Result<Self, Self::Error> {
@@ -143,7 +143,7 @@ impl TryFrom<axum::extract::Request> for StreamedFlowFileFuture {
 ///     ff.contents().read_to_end(&mut buf).await?;
 ///     Ok((axum::http::StatusCode::OK, buf))
 /// }
-pub struct StreamedFlowFileFuture(FlowFileStream);
+pub struct StreamedFlowFileFuture(StreamedFlowFiles);
 
 impl Future for StreamedFlowFileFuture {
     type Output = Result<StreamedFlowFile, FlowFileParsingError>;
@@ -191,7 +191,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let result: Result<FlowFileStream, _> = req.try_into();
+        let result: Result<StreamedFlowFiles, _> = req.try_into();
         assert!(result.is_err());
     }
 
@@ -199,7 +199,7 @@ mod tests {
     async fn flow_file_iterator_accepts_flowfile_v3() {
         let req = make_flow_file_request(vec![], "application/flowfile-v3");
 
-        let result: Result<FlowFileStream, _> = req.try_into();
+        let result: Result<StreamedFlowFiles, _> = req.try_into();
         assert!(result.is_ok());
     }
 
@@ -211,7 +211,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let iter: FlowFileStream = req.try_into().unwrap();
+        let iter: StreamedFlowFiles = req.try_into().unwrap();
         assert!(!iter.is_empty());
     }
 
@@ -223,7 +223,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let iter: FlowFileStream = req.try_into().unwrap();
+        let iter: StreamedFlowFiles = req.try_into().unwrap();
         assert!(iter.is_empty());
     }
 

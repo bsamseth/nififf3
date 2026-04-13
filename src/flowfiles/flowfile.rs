@@ -31,7 +31,7 @@ use super::FlowFileHeader;
 /// let flow_file = FlowFile::new(1024u64, attrs, std::io::Cursor::new(b"content"));
 /// ```
 ///
-/// For reading flow files from a stream, see [`super::FlowFileStream`] and [`super::StreamedFlowFile`].
+/// For reading flow files from a stream, see [`crate::axum::StreamedFlowFiles`] and [`crate::axum::StreamedFlowFile`].
 pub struct FlowFile<C> {
     header: FlowFileHeader,
     /// The content of the flow file.

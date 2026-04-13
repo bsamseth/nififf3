@@ -71,7 +71,7 @@ async fn process_single(
 
 #[tracing::instrument(ret, skip_all)]
 async fn process_multiple(
-    flow_files: nifioxide::axum::FlowFileStream,
+    flow_files: nifioxide::axum::StreamedFlowFiles,
 ) -> Result<impl IntoResponse, FlowFileParsingError> {
     flow_files
         .then(|ff| async move {
