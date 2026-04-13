@@ -200,6 +200,11 @@ impl<C> std::ops::Deref for FlowFile<C> {
         &self.header
     }
 }
+impl<C> std::ops::DerefMut for FlowFile<C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.header
+    }
+}
 
 impl<R: AsyncRead + Unpin> FlowFile<R> {
     pub async fn serialize_into<W: tokio::io::AsyncWrite + Unpin>(

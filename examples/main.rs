@@ -58,7 +58,6 @@ async fn process_single(
         .content_from_bytes(b"hello")
         .build();
     output
-        .header_mut()
         .attributes_mut()
         .insert("hello".to_string(), "world".to_string());
 
