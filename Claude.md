@@ -87,8 +87,9 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   `futures::Stream` impl was skipped — it needs hand-rolled header state
   machines or an async-stream dependency, and the `next()` loop covers the
   use case).
-- [ ] `SpooledTempFile` builder helper (memory up to a threshold, then disk)
-  as a middle ground between `buffered` and `tempfile`.
+- [x] `SpooledTempFile` builder helper (memory up to a threshold, then disk)
+  as a middle ground between `buffered` and `tempfile` (sync only —
+  `SpooledTempFile` has no async I/O).
 - [ ] Optional `serde` support for `FlowFile<Vec<u8>>` (base64 content),
   which would also let the CLI's JSON model live in the library.
 - [ ] CLI ergonomics: streaming `to-json` (currently buffers the whole

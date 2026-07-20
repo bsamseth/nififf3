@@ -118,6 +118,38 @@ impl FlowFileBuilder {
         Ok(FlowFile::from_raw_parts(size, self.attributes, file))
     }
 
+    /// Finish the build by spooling `content` into a
+    /// [`SpooledTempFile`](tempfile::SpooledTempFile): the content is held
+    /// in memory up to `max_memory` bytes, and rolled over to an anonymous
+    /// temporary file beyond that.
+    ///
+    /// A middle ground between [`buffered`](Self::buffered) (always memory)
+    /// and [`tempfile`](Self::tempfile) (always disk) for content of
+    /// unknown size that is usually small.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let reader = &b"stays in memory"[..];
+    /// let mut flow_file = FlowFile::builder().spooled(reader, 64 * 1024).unwrap();
+    /// assert_eq!(flow_file.size(), 15);
+    /// let mut out = Vec::new();
+    /// flow_file.write_to(&mut out).unwrap();
+    /// ```
+    #[cfg(feature = "tempfile")]
+    pub fn spooled(
+        self,
+        mut content: impl std::io::Read,
+        max_memory: usize,
+    ) -> std::io::Result<FlowFile<tempfile::SpooledTempFile>> {
+        use std::io::Seek;
+
+        let mut file = tempfile::SpooledTempFile::new(max_memory);
+        let size = std::io::copy(&mut content, &mut file)?;
+        file.rewind()?;
+        Ok(FlowFile::from_raw_parts(size, self.attributes, file))
+    }
+
     /// Async version of [`buffered`](Self::buffered): reads an
     /// [`AsyncRead`](tokio::io::AsyncRead) to completion into memory.
     ///
@@ -197,6 +229,26 @@ mod tests {
             .attribute("k", "v")
             .content(&b"hello"[..]);
         assert_eq!(out, expected.to_bytes());
+    }
+
+    #[cfg(feature = "tempfile")]
+    #[test]
+    fn spooled_rolls_to_disk_beyond_the_memory_limit() {
+        let small = FlowFile::builder().spooled(&b"hi"[..], 1024).unwrap();
+        assert_eq!(small.size(), 2);
+        assert!(!small.content().is_rolled());
+
+        let big_content = vec![7u8; 4096];
+        let mut big = FlowFile::builder()
+            .spooled(big_content.as_slice(), 1024)
+            .unwrap();
+        assert_eq!(big.size(), 4096);
+        assert!(big.content().is_rolled());
+
+        let mut out = Vec::new();
+        big.write_to(&mut out).unwrap();
+        let parsed = FlowFile::from_bytes(&out).unwrap();
+        assert_eq!(parsed.into_content(), big_content);
     }
 
     #[cfg(feature = "tokio")]
