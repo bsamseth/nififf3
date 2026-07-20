@@ -29,7 +29,11 @@ Parsing is lazy over the content, meaning the parser only reads as many bytes
 as is needed to parse out the header. When the total length is known it is
 validated against the `size` field.
 
-Creating flow files can be done with a easy-to-use builder API.
+Creating flow files can be done with a easy-to-use builder API. Since the
+binary format stores the content size before the content, serializing from a
+reader requires the size up front; for readers of unknown size the builder can
+spool the content into memory (`buffered`) or, behind the `tempfile` feature,
+into an anonymous temporary file (`tempfile`).
 
 ## CLI
 
