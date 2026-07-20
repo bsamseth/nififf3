@@ -17,7 +17,7 @@ pub use builder::FlowFileBuilder;
 pub use error::Error;
 
 #[cfg(feature = "axum")]
-pub use axum_support::{FlowFileBody, FlowFileRequest};
+pub use axum_support::{FlowFileBody, FlowFileRequest, StrictFlowFileRequest, StrictRejection};
 
 /// Convenience alias for results produced by this crate.
 pub type Result<T> = std::result::Result<T, Error>;

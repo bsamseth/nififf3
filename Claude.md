@@ -79,8 +79,9 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
 
 ## Potential next steps (unscheduled — for review)
 
-- [ ] Axum extractor strictness: optionally reject requests whose
-  `Content-Type` is not `application/flowfile-v3`.
+- [x] Axum extractor strictness: optionally reject requests whose
+  `Content-Type` is not `application/flowfile-v3` (`StrictFlowFileRequest`,
+  responding 415; media type parameters and case are ignored).
 - [ ] First-class multi-flow-file APIs: a sync `Iterator`, an async
   `parse_next_async`, and possibly a `futures::Stream` adapter.
 - [ ] `SpooledTempFile` builder helper (memory up to a threshold, then disk)

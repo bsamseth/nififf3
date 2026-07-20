@@ -80,6 +80,91 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
     }
 }
 
+/// Like [`FlowFileRequest`], but additionally requires the request to carry
+/// `Content-Type: application/flowfile-v3`.
+///
+/// A missing or different content type is rejected with
+/// `415 Unsupported Media Type` before the body is parsed. Media type
+/// parameters (e.g. a `charset`) are ignored in the comparison. The wrapper
+/// dereferences to the inner flow file.
+///
+/// ```no_run
+/// use nififf3::StrictFlowFileRequest;
+///
+/// async fn handler(flow_file: StrictFlowFileRequest) -> Result<String, nififf3::Error> {
+///     let flow_file = flow_file.into_inner().into_bytes_async().await?;
+///     Ok(format!("got {} bytes", flow_file.size()))
+/// }
+/// ```
+#[derive(Debug)]
+pub struct StrictFlowFileRequest(pub FlowFileRequest);
+
+impl StrictFlowFileRequest {
+    /// Unwrap into the inner [`FlowFileRequest`].
+    pub fn into_inner(self) -> FlowFileRequest {
+        self.0
+    }
+}
+
+impl std::ops::Deref for StrictFlowFileRequest {
+    type Target = FlowFileRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StrictFlowFileRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Rejection returned by the [`StrictFlowFileRequest`] extractor.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StrictRejection {
+    /// The request's `Content-Type` was missing or not
+    /// `application/flowfile-v3`; responds with `415 Unsupported Media Type`.
+    #[error("expected content type \"application/flowfile-v3\", got {0:?}")]
+    UnsupportedMediaType(Option<String>),
+
+    /// The body was not a valid flow file; responds with `400 Bad Request`.
+    #[error(transparent)]
+    Parse(#[from] Error),
+}
+
+impl IntoResponse for StrictRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::UnsupportedMediaType(_) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, self.to_string()).into_response()
+            }
+            Self::Parse(err) => err.into_response(),
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
+    type Rejection = StrictRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let content_type = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        // Compare the media type only, ignoring any parameters.
+        let media_type = content_type
+            .as_deref()
+            .map(|value| value.split(';').next().unwrap_or("").trim());
+        if !media_type.is_some_and(|value| value.eq_ignore_ascii_case(MEDIA_TYPE)) {
+            return Err(StrictRejection::UnsupportedMediaType(content_type));
+        }
+        Ok(Self(FlowFileRequest::from_request(req, state).await?))
+    }
+}
+
 /// Respond with the flow file in binary V3 format, streaming the content.
 ///
 /// Sets `Content-Type: application/flowfile-v3` and a `Content-Length`
