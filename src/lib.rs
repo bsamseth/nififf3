@@ -1,30 +1,5 @@
-//! Utilities for working with NiFi's FlowFile V3 file format.
-//!
-//! A flow file consists of a set of string attributes and a binary content
-//! payload. This crate parses and serializes the V3 binary format
-//! (`application/flowfile-v3`), compatible with NiFi's `FlowFilePackagerV3`
-//! and `FlowFileUnpackagerV3`.
-//!
-//! # Example
-//!
-//! ```
-//! use nififf3::FlowFile;
-//!
-//! let flow_file = FlowFile::builder()
-//!     .attribute("filename", "greeting.txt")
-//!     .content(&b"Hello, NiFi!"[..]);
-//! let bytes = flow_file.to_bytes();
-//!
-//! let parsed = FlowFile::from_bytes(&bytes).unwrap();
-//! assert_eq!(parsed.attributes()["filename"], "greeting.txt");
-//! assert_eq!(parsed.content().as_slice(), b"Hello, NiFi!");
-//! ```
-//!
-//! Parsing from a reader is lazy: [`FlowFile::parse`] only consumes the
-//! header, and the content is exposed as a reader limited to the declared
-//! content size. The async equivalents ([`FlowFile::parse_async`],
-//! [`FlowFile::write_to_async`]) are available behind the `tokio` feature,
-//! and axum request/response integration behind the `axum` feature.
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
 use std::collections::HashMap;
 
@@ -115,6 +90,17 @@ impl<R> FlowFile<R> {
     }
 
     /// Transform the content container, keeping size and attributes.
+    ///
+    /// The declared [`size`](Self::size) is carried over unchanged, so the
+    /// new container should hold (or produce) the same content.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder().content(&b"hi"[..]);
+    /// let flow_file = flow_file.map_content(std::io::Cursor::new);
+    /// assert_eq!(flow_file.size(), 2);
+    /// ```
     pub fn map_content<T>(self, f: impl FnOnce(R) -> T) -> FlowFile<T> {
         FlowFile {
             size: self.size,
@@ -137,6 +123,19 @@ impl FlowFile<Vec<u8>> {
     /// after the content is a [`Error::TrailingData`]. To read several
     /// concatenated flow files from one buffer, use [`FlowFile::parse_next`]
     /// instead.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let bytes = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..])
+    ///     .to_bytes();
+    ///
+    /// let flow_file = FlowFile::from_bytes(&bytes).unwrap();
+    /// assert_eq!(flow_file.attributes()["filename"], "greeting.txt");
+    /// assert_eq!(flow_file.content().as_slice(), b"hello");
+    /// ```
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = bytes;
         let (attributes, size) = sync::parse_header(&mut reader, None)?;
@@ -154,6 +153,14 @@ impl FlowFile<Vec<u8>> {
     }
 
     /// Serialize the flow file to the binary V3 format.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let bytes = FlowFile::builder().content(&b"hi"[..]).to_bytes();
+    /// assert!(bytes.starts_with(b"NiFiFF3"));
+    /// assert!(bytes.ends_with(b"hi"));
+    /// ```
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = format::encode_header(&self.attributes, self.content.len() as u64);
         buf.extend_from_slice(&self.content);
@@ -165,6 +172,14 @@ impl FlowFile<Vec<u8>> {
     ///
     /// Useful for handing an in-memory flow file to reader-based APIs such
     /// as the axum response integration.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let mut flow_file = FlowFile::builder().content(&b"hi"[..]).into_reader();
+    /// let mut out = Vec::new();
+    /// flow_file.write_to(&mut out).unwrap(); // reader-based serialization
+    /// ```
     pub fn into_reader(self) -> FlowFile<std::io::Cursor<Vec<u8>>> {
         self.map_content(std::io::Cursor::new)
     }

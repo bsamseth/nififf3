@@ -66,6 +66,18 @@ impl<R: Read> FlowFile<io::Take<R>> {
     /// The header is read in small increments, so wrap unbuffered sources
     /// (files, sockets) in a [`std::io::BufReader`].
     ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
+    ///
+    /// // Only the header is consumed; the content can be read incrementally.
+    /// let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
+    /// assert_eq!(flow_file.size(), 5);
+    /// let flow_file = flow_file.into_bytes().unwrap();
+    /// assert_eq!(flow_file.content().as_slice(), b"hello");
+    /// ```
+    ///
     /// [`size`]: FlowFile::size
     pub fn parse(mut reader: R) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None)?;
@@ -83,6 +95,21 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// Returns `Ok(None)` on a clean end of input. The previous flow file's
     /// content must be fully consumed before calling this again, otherwise
     /// parsing resumes in the middle of that content.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+    /// bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
+    ///
+    /// let mut reader = bytes.as_slice();
+    /// let mut count = 0;
+    /// while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
+    ///     count += 1;
+    ///     flow_file.into_bytes().unwrap(); // consume the content
+    /// }
+    /// assert_eq!(count, 2);
+    /// ```
     pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
@@ -109,6 +136,17 @@ impl<R: Read> FlowFile<R> {
     /// Returns the number of content bytes copied. If the content reader
     /// ends before `size` bytes were read, an [`Error::SizeMismatch`] is
     /// returned (with the writer left partially written).
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let content = &b"hello"[..]; // any `impl Read`
+    /// let mut flow_file = FlowFile::builder().reader(content, 5);
+    ///
+    /// let mut out = Vec::new();
+    /// flow_file.write_to(&mut out).unwrap();
+    /// assert_eq!(FlowFile::from_bytes(&out).unwrap().size(), 5);
+    /// ```
     ///
     /// [`size`]: FlowFile::size
     pub fn write_to<W: Write>(&mut self, writer: &mut W) -> Result<u64> {

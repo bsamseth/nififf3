@@ -57,6 +57,15 @@ impl FlowFileBuilder {
     /// If the size is not known, use [`buffered`](Self::buffered) or (with
     /// the `tempfile` feature) [`tempfile`](Self::tempfile) to spool the
     /// reader first.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let content = &b"hello"[..]; // any `impl Read`
+    /// let mut flow_file = FlowFile::builder().reader(content, 5);
+    /// let mut out = Vec::new();
+    /// flow_file.write_to(&mut out).unwrap();
+    /// ```
     pub fn reader<R>(self, content: R, size: u64) -> FlowFile<R> {
         FlowFile::from_raw_parts(size, self.attributes, content)
     }
@@ -66,6 +75,14 @@ impl FlowFileBuilder {
     /// Useful when the content size is not known up front. The whole
     /// content is held in memory; for large content prefer
     /// [`tempfile`](Self::tempfile) (behind the `tempfile` feature).
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let reader = &b"length unknown ahead of time"[..];
+    /// let flow_file = FlowFile::builder().buffered(reader).unwrap();
+    /// assert_eq!(flow_file.size(), 28);
+    /// ```
     pub fn buffered(self, mut content: impl std::io::Read) -> std::io::Result<FlowFile<Vec<u8>>> {
         let mut buf = Vec::new();
         content.read_to_end(&mut buf)?;
@@ -78,6 +95,16 @@ impl FlowFileBuilder {
     /// Useful when the content size is not known up front and may be too
     /// large to buffer in memory. The file is deleted when the returned
     /// flow file (or its content) is dropped.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let reader = &b"spooled to disk"[..];
+    /// let mut flow_file = FlowFile::builder().tempfile(reader).unwrap();
+    /// assert_eq!(flow_file.size(), 15);
+    /// let mut out = Vec::new();
+    /// flow_file.write_to(&mut out).unwrap();
+    /// ```
     #[cfg(feature = "tempfile")]
     pub fn tempfile(
         self,
@@ -91,7 +118,18 @@ impl FlowFileBuilder {
         Ok(FlowFile::from_raw_parts(size, self.attributes, file))
     }
 
-    /// Async version of [`buffered`](Self::buffered).
+    /// Async version of [`buffered`](Self::buffered): reads an
+    /// [`AsyncRead`](tokio::io::AsyncRead) to completion into memory.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let reader = &b"hello"[..]; // any `impl AsyncRead + Unpin`
+    /// let flow_file = FlowFile::builder().buffered_async(reader).await.unwrap();
+    /// assert_eq!(flow_file.size(), 5);
+    /// # });
+    /// ```
     #[cfg(feature = "tokio")]
     pub async fn buffered_async(
         self,
@@ -104,7 +142,18 @@ impl FlowFileBuilder {
         Ok(self.content(buf))
     }
 
-    /// Async version of [`tempfile`](Self::tempfile).
+    /// Async version of [`tempfile`](Self::tempfile): spools an
+    /// [`AsyncRead`](tokio::io::AsyncRead) into an anonymous temporary file.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let reader = &b"spooled to disk"[..]; // any `impl AsyncRead + Unpin`
+    /// let flow_file = FlowFile::builder().tempfile_async(reader).await.unwrap();
+    /// assert_eq!(flow_file.size(), 15);
+    /// # });
+    /// ```
     #[cfg(all(feature = "tokio", feature = "tempfile"))]
     pub async fn tempfile_async(
         self,

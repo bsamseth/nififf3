@@ -73,3 +73,35 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
 - [x] Doc comments with examples on the public API; `cargo doc` clean.
 - [x] `cargo fmt`, `cargo clippy --all-features` clean; tests pass for the
   feature matrix (default, `tokio`, `axum`, `cli`, `--all-features`).
+- [x] Rewrite the README as a reference with examples, embed it as the crate
+  docs root (`#![doc = include_str!]`), enable `missing_docs` warnings, and
+  add usage examples throughout the item docs.
+
+## Potential next steps (unscheduled — for review)
+
+- [ ] Axum extractor strictness: optionally reject requests whose
+  `Content-Type` is not `application/flowfile-v3`.
+- [ ] First-class multi-flow-file APIs: a sync `Iterator`, an async
+  `parse_next_async`, and possibly a `futures::Stream` adapter.
+- [ ] `SpooledTempFile` builder helper (memory up to a threshold, then disk)
+  as a middle ground between `buffered` and `tempfile`.
+- [ ] Optional `serde` support for `FlowFile<Vec<u8>>` (base64 content),
+  which would also let the CLI's JSON model live in the library.
+- [ ] CLI ergonomics: streaming `to-json` (currently buffers the whole
+  input), an `attrs`/`inspect` subcommand that prints attributes without
+  decoding content, and a `content` subcommand extracting raw content.
+- [ ] Parser hardening for untrusted input: configurable limits on attribute
+  count and attribute length (a crafted header can currently request up to
+  4 GiB allocations per attribute) and a request-size limit knob for the
+  axum extractor.
+
+### May be later
+- [ ] Fuzzing (`cargo-fuzz`) and property-based round-trip tests for the
+  parser; interop tests against files produced by a real NiFi instance.
+- [ ] CI (feature-matrix build/test/clippy/fmt), and crates.io publishing
+  metadata (repository/keywords/categories).
+
+
+### Won't do
+
+- [-] ~~FlowFile V1/V2 support (`application/flowfile`, `flowfile-v2`) with format auto-detection, mirroring NiFi's other packagers.~~

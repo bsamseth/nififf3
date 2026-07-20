@@ -1,57 +1,203 @@
-# NiFi Flow File 3
+# nififf3
 
-This crate provides helpful utilities for working with NiFi's Flow File V3 file type.
+Utilities for working with NiFi's FlowFile V3 file format
+(`application/flowfile-v3`), wire-compatible with NiFi's `FlowFilePackagerV3`
+and `FlowFileUnpackagerV3`.
 
-## Parsing flow files
+A flow file is a binary content payload together with a set of string
+key-value attributes. The central type is `FlowFile<R>`, generic over the
+container of the content: an in-memory `Vec<u8>`, any `std::io::Read`, or
+(behind the `tokio` feature) any `tokio::io::AsyncRead`.
 
-At its core, this crate provides this type:
+## Parsing
 
+`FlowFile::from_bytes` parses a buffer holding exactly one flow file and
+validates the declared content size against the bytes present:
+
+```rust
+use nififf3::FlowFile;
+
+// A flow file as produced by NiFi (or, here, by this crate).
+let bytes = FlowFile::builder()
+    .attribute("filename", "greeting.txt")
+    .content(&b"Hello, NiFi!"[..])
+    .to_bytes();
+
+let flow_file = FlowFile::from_bytes(&bytes).unwrap();
+assert_eq!(flow_file.size(), 12);
+assert_eq!(flow_file.attributes()["filename"], "greeting.txt");
+assert_eq!(flow_file.content().as_slice(), b"Hello, NiFi!");
 ```
-struct FlowFile<R> {
-  size: u64,
-  attributes: HashMap<String, String>,
-  content: R,
+
+`FlowFile::parse` is lazy: it consumes only the header from a reader and
+returns the content as a reader limited to the declared size, so arbitrarily
+large flow files can be processed without buffering them:
+
+```rust
+use nififf3::FlowFile;
+
+let bytes = FlowFile::builder().content(&b"streamed"[..]).to_bytes();
+
+// Only the header is read here; `flow_file.content()` is a size-limited reader.
+let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
+assert_eq!(flow_file.size(), 8);
+
+// Read the content when you need it, e.g. all at once:
+let flow_file = flow_file.into_bytes().unwrap();
+assert_eq!(flow_file.content().as_slice(), b"streamed");
+```
+
+NiFi concatenates multiple flow files back-to-back in a single stream;
+`FlowFile::parse_next` reads them one at a time and returns `None` on a clean
+end of input:
+
+```rust
+use nififf3::FlowFile;
+
+let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
+
+let mut reader = bytes.as_slice();
+let mut contents = Vec::new();
+while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
+    contents.push(flow_file.into_bytes().unwrap().into_content());
 }
+assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
 ```
 
-The flow file consists:
+## Creating flow files
 
-- `size`: The length of the `content` in bytes.
-- `attributes`: A set of key-value pairs of text-attributes assigned to the content.
-- `content`: The actual content, generic over the container type.
+Flow files are created with a builder: add attributes, then supply the
+content to finish the build. In-memory content infers the size:
 
-The content can be `std::io::Read`, `tokio::io::AsyncRead` or `Vec<u8>`. The
-type defines functions to parse out a flow file from either of the types, as
-well as ways of serializing into the binary format of a flow file v3 to a
-`std::io::Write/tokio::io::AsyncWrite/Vec<u8>`.
+```rust
+use nififf3::FlowFile;
 
-Parsing is lazy over the content, meaning the parser only reads as many bytes
-as is needed to parse out the header. When the total length is known it is
-validated against the `size` field.
+let flow_file = FlowFile::builder()
+    .attribute("filename", "data.bin")
+    .attributes([("a", "1"), ("b", "2")])
+    .content(vec![1, 2, 3]);
+assert_eq!(flow_file.size(), 3);
+let bytes = flow_file.to_bytes();
+```
 
-Creating flow files can be done with a easy-to-use builder API. Since the
-binary format stores the content size before the content, serializing from a
-reader requires the size up front; for readers of unknown size the builder can
-spool the content into memory (`buffered`) or, behind the `tempfile` feature,
-into an anonymous temporary file (`tempfile`).
+The binary format stores the content size *before* the content, so
+serializing from a reader requires the size up front
+(`builder().reader(read, size)`). For readers of unknown length, the builder
+can spool the content to learn its size — into memory, or (behind the
+`tempfile` feature) into an anonymous temporary file that is deleted on drop:
 
-## CLI
+```rust
+use nififf3::FlowFile;
 
-A CLI tool is available for working with flow files.
+let reader = &b"length unknown ahead of time"[..]; // any `impl Read`
+let flow_file = FlowFile::builder()
+    .attribute("source", "example")
+    .buffered(reader)
+    .unwrap();
+assert_eq!(flow_file.size(), 28);
+```
 
-- `nififf3 to-json`: Read flow files and convert them to JSON.
-  - Fields in the JSON: `size`, `attributes` and `content`. The content is base64 encoded.
-- `nififf3 from-json`: Turn a JSON file into a flow file.
-  - The JSON must have the same structure as produced from `to-json`.
-- `nififf3 create`: Create a flow file
-  - Attributes given as `key=value` arguments, and content set to stdin.
+```rust,ignore
+// Requires the `tempfile` feature. Content is spooled to disk, not memory.
+let flow_file = FlowFile::builder().tempfile(reader)?;
+let flow_file = FlowFile::builder().tempfile_async(reader).await?; // + `tokio`
+```
 
+Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
+`write_to` for `std::io::Write`, and `write_to_async` for
+`tokio::io::AsyncWrite`.
 
-Both `to-json` and `from-json` take an optional path as their argument, reading from stdin if no filename is given. The filename `-` is also interpreted as stdin.
+## Async I/O (`tokio` feature)
 
-## Axum Integration
+The async API mirrors the sync one: `parse_async` reads only the header and
+exposes the content as a size-limited `AsyncRead`; `into_bytes_async` and
+`write_to_async` consume it.
 
-Gated behind the `axum` feature is support for extracting a flow file from
-requests, and turning flow files into responses. This support streaming, where
-the content of the flow file is read incrementally, supporting arbitraryly
-large flow files without needing to have them all in memory.
+```rust,ignore
+use nififf3::FlowFile;
+use tokio::io::BufReader;
+
+let file = BufReader::new(tokio::fs::File::open("data.ff3").await?);
+let flow_file = FlowFile::parse_async(file).await?;
+println!("{} bytes: {:?}", flow_file.size(), flow_file.attributes());
+
+// Stream the content somewhere without buffering it...
+let mut flow_file = flow_file;
+flow_file.write_to_async(&mut tokio::io::stdout()).await?;
+```
+
+## Axum integration (`axum` feature)
+
+Handlers can take a `FlowFileRequest` extractor, which parses the flow file
+header from the request body and streams the content incrementally —
+arbitrarily large flow files never need to be in memory. Flow files with
+`AsyncRead` content implement `IntoResponse` (streaming, with
+`Content-Type: application/flowfile-v3`), as does the error type (as a
+`400 Bad Request`).
+
+```rust,ignore
+use axum::{Router, routing::post};
+use nififf3::{FlowFile, FlowFileRequest};
+
+async fn echo(flow_file: FlowFileRequest) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
+    // The content streams from the request body; buffer it here for brevity.
+    let flow_file = flow_file.into_bytes_async().await?;
+    Ok(FlowFile::builder()
+        .attribute("echoed", "true")
+        .content(flow_file.into_content())
+        .into_reader())
+}
+
+let app: Router = Router::new().route("/echo", post(echo));
+```
+
+## CLI (`cli` feature)
+
+A CLI for converting between flow files and JSON, installed with
+`cargo install nififf3 --features cli`:
+
+```console
+$ echo -n "hello" | nififf3 create filename=greeting.txt > greeting.ff3
+$ nififf3 to-json greeting.ff3
+{"size":5,"attributes":{"filename":"greeting.txt"},"content":"aGVsbG8="}
+$ nififf3 to-json greeting.ff3 | nififf3 from-json | cmp - greeting.ff3
+```
+
+- `nififf3 to-json [path]` — convert flow files to JSON, one object per line
+  per flow file (concatenated inputs are supported). The fields are `size`,
+  `attributes`, and the base64-encoded `content`.
+- `nififf3 from-json [path]` — the inverse: read JSON objects as produced by
+  `to-json` and write flow files to stdout.
+- `nififf3 create key=value ...` — create a flow file with the given
+  attributes; the content is read from stdin.
+
+`to-json` and `from-json` read from stdin when the path is omitted or `-`.
+
+## Feature flags
+
+No features are enabled by default; the sync API is always available.
+
+- `tokio` — async parsing and serialization over `AsyncRead`/`AsyncWrite`.
+- `axum` — request extractor and response types (implies `tokio`).
+- `tempfile` — spool content of unknown length to a temporary file.
+- `cli` — the `nififf3` binary.
+
+## Wire format
+
+The V3 format, as written by NiFi's `FlowFilePackagerV3`:
+
+```text
+"NiFiFF3"          7-byte magic header
+attribute count    field length
+per attribute:
+  key              field length + UTF-8 bytes
+  value            field length + UTF-8 bytes
+content size       8-byte big-endian integer
+content            <content size> bytes
+```
+
+A *field length* is 2 bytes big-endian; values of `0xFFFF` and above are
+written as the marker `0xFF 0xFF` followed by the value as 4 bytes
+big-endian. Attributes are serialized in sorted key order so output is
+deterministic (NiFi accepts any order).

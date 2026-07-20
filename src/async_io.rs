@@ -53,6 +53,19 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     ///
     /// The header is read in small increments, so wrap unbuffered sources in
     /// a [`tokio::io::BufReader`].
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
+    ///
+    /// let flow_file = FlowFile::parse_async(bytes.as_slice()).await.unwrap();
+    /// assert_eq!(flow_file.size(), 5);
+    /// let flow_file = flow_file.into_bytes_async().await.unwrap();
+    /// assert_eq!(flow_file.content().as_slice(), b"hello");
+    /// # });
+    /// ```
     pub async fn parse_async(mut reader: R) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader).await?;
         Ok(FlowFile::from_raw_parts(
@@ -64,7 +77,22 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
 }
 
 impl<R: AsyncRead + Unpin> FlowFile<R> {
-    /// Async version of [`FlowFile::write_to`].
+    /// Async version of [`FlowFile::write_to`]: serialize the flow file to a
+    /// writer, reading exactly [`size`](FlowFile::size) bytes from the
+    /// content reader. Returns the number of content bytes copied.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let content = &b"hello"[..]; // any `impl AsyncRead + Unpin`
+    /// let mut flow_file = FlowFile::builder().reader(content, 5);
+    ///
+    /// let mut out = Vec::new();
+    /// flow_file.write_to_async(&mut out).await.unwrap();
+    /// assert_eq!(FlowFile::from_bytes(&out).unwrap().size(), 5);
+    /// # });
+    /// ```
     pub async fn write_to_async<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<u64> {
         writer.write_all(&self.header_bytes()).await?;
         let copied = tokio::io::copy(&mut (&mut self.content).take(self.size), writer).await?;

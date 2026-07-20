@@ -17,7 +17,12 @@ pub enum Error {
 
     /// The content length does not match the size declared in the header.
     #[error("content size mismatch: header declares {expected} bytes, got {actual}")]
-    SizeMismatch { expected: u64, actual: u64 },
+    SizeMismatch {
+        /// The content size declared in the flow file header.
+        expected: u64,
+        /// The number of content bytes actually available.
+        actual: u64,
+    },
 
     /// Extra bytes remained after the declared content when parsing a buffer
     /// expected to hold exactly one flow file.
