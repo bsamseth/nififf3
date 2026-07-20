@@ -12,6 +12,8 @@ mod sync;
 mod async_io;
 #[cfg(feature = "axum")]
 mod axum_support;
+#[cfg(feature = "serde")]
+mod serde_support;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;

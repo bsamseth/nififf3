@@ -90,8 +90,8 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
 - [x] `SpooledTempFile` builder helper (memory up to a threshold, then disk)
   as a middle ground between `buffered` and `tempfile` (sync only —
   `SpooledTempFile` has no async I/O).
-- [ ] Optional `serde` support for `FlowFile<Vec<u8>>` (base64 content),
-  which would also let the CLI's JSON model live in the library.
+- [x] Optional `serde` support for `FlowFile<Vec<u8>>` (base64 content);
+  the CLI's JSON model now lives in the library (`cli` implies `serde`).
 - [ ] CLI ergonomics: streaming `to-json` (currently buffers the whole
   input), an `attrs`/`inspect` subcommand that prints attributes without
   decoding content, and a `content` subcommand extracting raw content.

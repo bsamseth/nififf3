@@ -1,10 +1,7 @@
-use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use nififf3::FlowFile;
 
@@ -36,15 +33,6 @@ enum Command {
         #[arg(value_name = "KEY=VALUE")]
         attributes: Vec<String>,
     },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct JsonFlowFile {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    #[serde(default)]
-    attributes: BTreeMap<String, String>,
-    content: String,
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -79,13 +67,7 @@ fn read_input(path: Option<&Path>) -> io::Result<Vec<u8>> {
 fn to_json(mut input: &[u8]) -> Result<()> {
     let mut stdout = io::stdout().lock();
     while let Some(flow_file) = FlowFile::parse_next(&mut input)? {
-        let (size, attributes, content) = flow_file.into_bytes()?.into_parts();
-        let json = JsonFlowFile {
-            size: Some(size),
-            attributes: attributes.into_iter().collect(),
-            content: BASE64.encode(content),
-        };
-        serde_json::to_writer(&mut stdout, &json)?;
+        serde_json::to_writer(&mut stdout, &flow_file.into_bytes()?)?;
         writeln!(stdout)?;
     }
     Ok(())
@@ -93,22 +75,8 @@ fn to_json(mut input: &[u8]) -> Result<()> {
 
 fn from_json(input: &[u8]) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    for item in serde_json::Deserializer::from_slice(input).into_iter::<JsonFlowFile>() {
-        let item = item?;
-        let content = BASE64.decode(item.content.as_bytes())?;
-        if let Some(size) = item.size
-            && size != content.len() as u64
-        {
-            return Err(format!(
-                "size field ({size}) does not match decoded content length ({})",
-                content.len()
-            )
-            .into());
-        }
-        let flow_file = FlowFile::builder()
-            .attributes(item.attributes)
-            .content(content);
-        stdout.write_all(&flow_file.to_bytes())?;
+    for flow_file in serde_json::Deserializer::from_slice(input).into_iter::<FlowFile<Vec<u8>>>() {
+        stdout.write_all(&flow_file?.to_bytes())?;
     }
     Ok(())
 }

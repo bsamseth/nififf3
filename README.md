@@ -181,7 +181,9 @@ No features are enabled by default; the sync API is always available.
 - `tokio` — async parsing and serialization over `AsyncRead`/`AsyncWrite`.
 - `axum` — request extractor and response types (implies `tokio`).
 - `tempfile` — spool content of unknown length to a temporary file.
-- `cli` — the `nififf3` binary.
+- `serde` — `Serialize`/`Deserialize` for in-memory flow files, with the
+  content base64 encoded; this is the JSON shape the CLI uses.
+- `cli` — the `nififf3` binary (implies `serde`).
 
 ## Wire format
 
