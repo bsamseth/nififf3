@@ -65,6 +65,28 @@ while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
 assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
 ```
 
+### Untrusted input
+
+A crafted header can declare millions of attributes or multi-gigabyte
+attribute values. The plain parsing functions trust their input (matching
+NiFi's own unpackager, and never allocating more than the input actually
+provides); for untrusted input the `*_with_limits` variants enforce caps on
+the header:
+
+```rust
+use nififf3::{Error, FlowFile, Limits};
+
+let bytes = FlowFile::builder()
+    .attribute("key", "a value longer than ten bytes")
+    .content(&b"hi"[..])
+    .to_bytes();
+
+// Defaults: at most 4096 attributes, 1 MiB per attribute key/value.
+let limits = Limits::default().max_attribute_len(10);
+let err = FlowFile::parse_with_limits(bytes.as_slice(), &limits).unwrap_err();
+assert!(matches!(err, Error::AttributeTooLong { .. }));
+```
+
 ## Creating flow files
 
 Flow files are created with a builder: add attributes, then supply the
@@ -130,8 +152,11 @@ flow_file.write_to_async(&mut tokio::io::stdout()).await?;
 ## Axum integration (`axum` feature)
 
 Handlers can take a `FlowFileRequest` extractor, which parses the flow file
-header from the request body and streams the content incrementally —
-arbitrarily large flow files never need to be in memory. Flow files with
+header from the request body (applying `Limits::default()`, since request
+bodies are untrusted) and streams the content incrementally — arbitrarily
+large flow files never need to be in memory. `StrictFlowFileRequest`
+additionally rejects requests without a `application/flowfile-v3` content
+type with `415 Unsupported Media Type`. Flow files with
 `AsyncRead` content implement `IntoResponse` (streaming, with
 `Content-Type: application/flowfile-v3`), as does the error type (as a
 `400 Bad Request`).

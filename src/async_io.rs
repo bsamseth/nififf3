@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::format::{MAGIC, MAX_VALUE_2_BYTES};
-use crate::{Error, FlowFile, Result};
+use crate::{Error, FlowFile, Limits, Result};
 
 async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> Result<usize> {
     let mut buf = [0u8; 2];
@@ -20,16 +20,32 @@ async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> Result<usize> {
     }
 }
 
-async fn read_string<R: AsyncRead + Unpin>(reader: &mut R) -> Result<String> {
+async fn read_string<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: Option<usize>,
+) -> Result<String> {
     let len = read_field_len(reader).await?;
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
+    if let Some(limit) = max_len
+        && len > limit
+    {
+        return Err(Error::AttributeTooLong { len, limit });
+    }
+    // Grow the buffer as bytes actually arrive instead of trusting the
+    // declared length, so a crafted header cannot force a huge allocation.
+    let mut buf = Vec::new();
+    let read = reader.take(len as u64).read_to_end(&mut buf).await?;
+    if read != len {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attribute truncated").into(),
+        );
+    }
     Ok(String::from_utf8(buf)?)
 }
 
 pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
     reader: &mut R,
     first_byte: Option<u8>,
+    limits: &Limits,
 ) -> Result<(HashMap<String, String>, u64)> {
     let mut magic = [0u8; 7];
     match first_byte {
@@ -45,10 +61,15 @@ pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
         return Err(Error::InvalidMagic(magic));
     }
     let count = read_field_len(reader).await?;
+    if let Some(limit) = limits.max_attributes
+        && count > limit
+    {
+        return Err(Error::TooManyAttributes { count, limit });
+    }
     let mut attributes = HashMap::with_capacity(count.min(1024));
     for _ in 0..count {
-        let key = read_string(reader).await?;
-        let value = read_string(reader).await?;
+        let key = read_string(reader, limits.max_attribute_len).await?;
+        let value = read_string(reader, limits.max_attribute_len).await?;
         attributes.insert(key, value);
     }
     let mut size = [0u8; 8];
@@ -75,8 +96,14 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// assert_eq!(flow_file.content().as_slice(), b"hello");
     /// # });
     /// ```
-    pub async fn parse_async(mut reader: R) -> Result<Self> {
-        let (attributes, size) = parse_header(&mut reader, None).await?;
+    pub async fn parse_async(reader: R) -> Result<Self> {
+        Self::parse_async_with_limits(reader, &Limits::UNLIMITED).await
+    }
+
+    /// Like [`parse_async`](Self::parse_async), but enforcing [`Limits`] on
+    /// the header. Use this for untrusted input.
+    pub async fn parse_async_with_limits(mut reader: R, limits: &Limits) -> Result<Self> {
+        let (attributes, size) = parse_header(&mut reader, None, limits).await?;
         Ok(FlowFile::from_raw_parts(
             size,
             attributes,
@@ -110,6 +137,15 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// # });
     /// ```
     pub async fn parse_next_async(reader: &'r mut R) -> Result<Option<Self>> {
+        Self::parse_next_async_with_limits(reader, &Limits::UNLIMITED).await
+    }
+
+    /// Like [`parse_next_async`](Self::parse_next_async), but enforcing
+    /// [`Limits`] on the header. Use this for untrusted input.
+    pub async fn parse_next_async_with_limits(
+        reader: &'r mut R,
+        limits: &Limits,
+    ) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
             match reader.read(&mut first).await {
@@ -119,7 +155,7 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
                 Err(e) => return Err(e.into()),
             }
         }
-        let (attributes, size) = parse_header(reader, Some(first[0])).await?;
+        let (attributes, size) = parse_header(reader, Some(first[0]), limits).await?;
         Ok(Some(FlowFile::from_raw_parts(
             size,
             attributes,
@@ -153,17 +189,25 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
 #[derive(Debug)]
 pub struct FlowFilesAsync<R> {
     reader: R,
+    limits: Limits,
     done: bool,
 }
 
 impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
-    /// Iterate over the flow files in `reader`.
+    /// Iterate over the flow files in `reader`, without header limits.
     ///
     /// The header parsing reads in small increments, so wrap unbuffered
     /// sources in a [`tokio::io::BufReader`].
     pub fn new(reader: R) -> Self {
+        Self::with_limits(reader, Limits::UNLIMITED)
+    }
+
+    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
+    /// Use this for untrusted input.
+    pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
+            limits,
             done: false,
         }
     }
@@ -173,11 +217,12 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         if self.done {
             return None;
         }
-        let result = match FlowFile::parse_next_async(&mut self.reader).await {
-            Ok(None) => None,
-            Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await),
-            Err(err) => Some(Err(err)),
-        };
+        let result =
+            match FlowFile::parse_next_async_with_limits(&mut self.reader, &self.limits).await {
+                Ok(None) => None,
+                Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await),
+                Err(err) => Some(Err(err)),
+            };
         if !matches!(result, Some(Ok(_))) {
             self.done = true;
         }
@@ -280,6 +325,20 @@ mod tests {
             Some(Err(Error::InvalidMagic(_)))
         ));
         assert!(flow_files.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn async_limits_reject_oversized_attributes() {
+        let bytes = FlowFile::builder()
+            .attribute("key", "a value larger than the limit")
+            .content(Vec::new())
+            .to_bytes();
+
+        let limits = Limits::default().max_attribute_len(8);
+        assert!(matches!(
+            FlowFile::parse_async_with_limits(bytes.as_slice(), &limits).await,
+            Err(Error::AttributeTooLong { limit: 8, .. })
+        ));
     }
 
     #[tokio::test]

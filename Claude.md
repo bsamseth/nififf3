@@ -96,10 +96,13 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   time instead of buffering everything), plus `attrs` (size + attributes as
   JSON lines, content skipped without decoding) and `content` (raw content
   to stdout, streamed and size-checked).
-- [ ] Parser hardening for untrusted input: configurable limits on attribute
-  count and attribute length (a crafted header can currently request up to
-  4 GiB allocations per attribute) and a request-size limit knob for the
-  axum extractor.
+- [x] Parser hardening for untrusted input: `Limits` (max attribute count /
+  attribute byte length) with `*_with_limits` parse variants; the axum
+  extractors apply `Limits::default()`. Independently of limits, attribute
+  buffers now grow as bytes arrive instead of pre-allocating the declared
+  length, so allocation bombs fail fast even in unlimited mode. (A
+  request-size knob was skipped: content is streamed, never allocated, and
+  axum's `DefaultBodyLimit` already covers total body size.)
 
 ### May be later
 - [ ] Fuzzing (`cargo-fuzz`) and property-based round-trip tests for the

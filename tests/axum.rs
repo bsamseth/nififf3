@@ -136,6 +136,28 @@ async fn strict_extractor_rejects_invalid_body_with_400() {
 }
 
 #[tokio::test]
+async fn extractor_applies_default_header_limits() {
+    let flow_file = FlowFile::builder()
+        .attributes((0..5000).map(|i| (format!("k{i}"), "v")))
+        .content(Vec::new());
+    let response = app()
+        .oneshot(
+            Request::post("/echo")
+                .body(Body::from(flow_file.to_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("attribute count")
+    );
+}
+
+#[tokio::test]
 async fn invalid_body_is_rejected_with_400() {
     let response = app()
         .oneshot(

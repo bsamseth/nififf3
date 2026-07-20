@@ -14,7 +14,7 @@ use futures_core::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
-use crate::{Error, FlowFile, MEDIA_TYPE};
+use crate::{Error, FlowFile, Limits, MEDIA_TYPE};
 
 /// A flow file extracted from an axum request.
 ///
@@ -22,6 +22,11 @@ use crate::{Error, FlowFile, MEDIA_TYPE};
 /// the size declared in the flow file header — the content is never
 /// buffered in memory by the extractor, so arbitrarily large flow files can
 /// be processed incrementally.
+///
+/// Request bodies are untrusted, so the header is parsed with
+/// [`Limits::default`]. To use different limits, extract the raw
+/// [`axum::body::Body`] and call
+/// [`FlowFile::parse_async_with_limits`] on a reader over it.
 ///
 /// ```no_run
 /// use nififf3::FlowFileRequest;
@@ -76,7 +81,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
             stream: req.into_body().into_data_stream(),
             chunk: Bytes::new(),
         };
-        FlowFile::parse_async(body).await
+        FlowFile::parse_async_with_limits(body, &Limits::default()).await
     }
 }
 

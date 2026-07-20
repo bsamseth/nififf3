@@ -6,6 +6,7 @@ use std::collections::HashMap;
 mod builder;
 mod error;
 mod format;
+mod limits;
 mod sync;
 
 #[cfg(feature = "tokio")]
@@ -17,6 +18,7 @@ mod serde_support;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;
+pub use limits::Limits;
 pub use sync::FlowFiles;
 
 #[cfg(feature = "tokio")]
@@ -144,7 +146,7 @@ impl FlowFile<Vec<u8>> {
     /// ```
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = bytes;
-        let (attributes, size) = sync::parse_header(&mut reader, None)?;
+        let (attributes, size) = sync::parse_header(&mut reader, None, &Limits::UNLIMITED)?;
         let actual = reader.len() as u64;
         if actual < size {
             return Err(Error::SizeMismatch {

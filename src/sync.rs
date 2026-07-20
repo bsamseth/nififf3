@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
 use crate::format::{MAGIC, MAX_VALUE_2_BYTES};
-use crate::{Error, FlowFile, Result};
+use crate::{Error, FlowFile, Limits, Result};
 
 fn read_field_len(reader: &mut impl Read) -> Result<usize> {
     let mut buf = [0u8; 2];
@@ -19,10 +19,20 @@ fn read_field_len(reader: &mut impl Read) -> Result<usize> {
     }
 }
 
-fn read_string(reader: &mut impl Read) -> Result<String> {
+fn read_string(reader: &mut impl Read, max_len: Option<usize>) -> Result<String> {
     let len = read_field_len(reader)?;
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf)?;
+    if let Some(limit) = max_len
+        && len > limit
+    {
+        return Err(Error::AttributeTooLong { len, limit });
+    }
+    // Grow the buffer as bytes actually arrive instead of trusting the
+    // declared length, so a crafted header cannot force a huge allocation.
+    let mut buf = Vec::new();
+    let read = reader.take(len as u64).read_to_end(&mut buf)?;
+    if read != len {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "attribute truncated").into());
+    }
     Ok(String::from_utf8(buf)?)
 }
 
@@ -31,6 +41,7 @@ fn read_string(reader: &mut impl Read) -> Result<String> {
 pub(crate) fn parse_header(
     reader: &mut impl Read,
     first_byte: Option<u8>,
+    limits: &Limits,
 ) -> Result<(HashMap<String, String>, u64)> {
     let mut magic = [0u8; 7];
     match first_byte {
@@ -44,10 +55,15 @@ pub(crate) fn parse_header(
         return Err(Error::InvalidMagic(magic));
     }
     let count = read_field_len(reader)?;
+    if let Some(limit) = limits.max_attributes
+        && count > limit
+    {
+        return Err(Error::TooManyAttributes { count, limit });
+    }
     let mut attributes = HashMap::with_capacity(count.min(1024));
     for _ in 0..count {
-        let key = read_string(reader)?;
-        let value = read_string(reader)?;
+        let key = read_string(reader, limits.max_attribute_len)?;
+        let value = read_string(reader, limits.max_attribute_len)?;
         attributes.insert(key, value);
     }
     let mut size = [0u8; 8];
@@ -79,8 +95,15 @@ impl<R: Read> FlowFile<io::Take<R>> {
     /// ```
     ///
     /// [`size`]: FlowFile::size
-    pub fn parse(mut reader: R) -> Result<Self> {
-        let (attributes, size) = parse_header(&mut reader, None)?;
+    pub fn parse(reader: R) -> Result<Self> {
+        Self::parse_with_limits(reader, &Limits::UNLIMITED)
+    }
+
+    /// Like [`parse`](Self::parse), but enforcing [`Limits`] on the header.
+    ///
+    /// Use this for untrusted input; see [`Limits`] for the threat model.
+    pub fn parse_with_limits(mut reader: R, limits: &Limits) -> Result<Self> {
+        let (attributes, size) = parse_header(&mut reader, None, limits)?;
         Ok(FlowFile::from_raw_parts(
             size,
             attributes,
@@ -111,6 +134,12 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// assert_eq!(count, 2);
     /// ```
     pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
+        Self::parse_next_with_limits(reader, &Limits::UNLIMITED)
+    }
+
+    /// Like [`parse_next`](Self::parse_next), but enforcing [`Limits`] on
+    /// the header. Use this for untrusted input.
+    pub fn parse_next_with_limits(reader: &'r mut R, limits: &Limits) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
             match reader.read(&mut first) {
@@ -120,7 +149,7 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
                 Err(e) => return Err(e.into()),
             }
         }
-        let (attributes, size) = parse_header(reader, Some(first[0]))?;
+        let (attributes, size) = parse_header(reader, Some(first[0]), limits)?;
         Ok(Some(FlowFile::from_raw_parts(
             size,
             attributes,
@@ -206,17 +235,25 @@ impl<R: Read> FlowFile<R> {
 #[derive(Debug)]
 pub struct FlowFiles<R> {
     reader: R,
+    limits: Limits,
     done: bool,
 }
 
 impl<R: Read> FlowFiles<R> {
-    /// Iterate over the flow files in `reader`.
+    /// Iterate over the flow files in `reader`, without header limits.
     ///
     /// The header parsing reads in small increments, so wrap unbuffered
     /// sources (files, sockets) in a [`std::io::BufReader`].
     pub fn new(reader: R) -> Self {
+        Self::with_limits(reader, Limits::UNLIMITED)
+    }
+
+    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
+    /// Use this for untrusted input.
+    pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
+            limits,
             done: false,
         }
     }
@@ -229,7 +266,7 @@ impl<R: Read> Iterator for FlowFiles<R> {
         if self.done {
             return None;
         }
-        let result = match FlowFile::parse_next(&mut self.reader) {
+        let result = match FlowFile::parse_next_with_limits(&mut self.reader, &self.limits) {
             Ok(None) => None,
             Ok(Some(flow_file)) => Some(flow_file.into_bytes()),
             Err(err) => Some(Err(err)),
@@ -377,6 +414,50 @@ mod tests {
             FlowFile::from_bytes(&bytes[..10]),
             Err(Error::Io(_))
         ));
+    }
+
+    #[test]
+    fn limits_reject_excess_attribute_count() {
+        let flow_file = FlowFile::builder()
+            .attributes((0..10).map(|i| (format!("k{i}"), "v")))
+            .content(Vec::new());
+        let bytes = flow_file.to_bytes();
+
+        let limits = Limits::default().max_attributes(5);
+        assert!(matches!(
+            FlowFile::parse_with_limits(bytes.as_slice(), &limits),
+            Err(Error::TooManyAttributes {
+                count: 10,
+                limit: 5
+            })
+        ));
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), &Limits::default()).is_ok());
+    }
+
+    #[test]
+    fn limits_reject_oversized_attributes() {
+        let bytes = FlowFile::builder()
+            .attribute("key", "a value larger than the limit")
+            .content(Vec::new())
+            .to_bytes();
+
+        let limits = Limits::default().max_attribute_len(8);
+        assert!(matches!(
+            FlowFile::parse_with_limits(bytes.as_slice(), &limits),
+            Err(Error::AttributeTooLong { limit: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn declared_length_beyond_input_fails_without_allocating() {
+        // Header declaring a ~4 GiB attribute key, but hardly any actual data.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NiFiFF3");
+        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
+        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]); // key length
+        bytes.extend_from_slice(b"tiny");
+        let err = FlowFile::parse(bytes.as_slice()).unwrap_err();
+        assert!(matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 
     #[test]

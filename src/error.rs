@@ -28,4 +28,24 @@ pub enum Error {
     /// expected to hold exactly one flow file.
     #[error("{0} trailing bytes after flow file content")]
     TrailingData(u64),
+
+    /// The header declares more attributes than the configured
+    /// [`Limits`](crate::Limits) allow.
+    #[error("attribute count {count} exceeds the limit of {limit}")]
+    TooManyAttributes {
+        /// The attribute count declared in the header.
+        count: usize,
+        /// The configured maximum.
+        limit: usize,
+    },
+
+    /// An attribute key or value is longer than the configured
+    /// [`Limits`](crate::Limits) allow.
+    #[error("attribute length {len} exceeds the limit of {limit} bytes")]
+    AttributeTooLong {
+        /// The declared length of the key or value, in bytes.
+        len: usize,
+        /// The configured maximum.
+        limit: usize,
+    },
 }
