@@ -15,6 +15,10 @@ mod axum_support;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;
+pub use sync::FlowFiles;
+
+#[cfg(feature = "tokio")]
+pub use async_io::FlowFilesAsync;
 
 #[cfg(feature = "axum")]
 pub use axum_support::{FlowFileBody, FlowFileRequest, StrictFlowFileRequest, StrictRejection};

@@ -82,8 +82,11 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
 - [x] Axum extractor strictness: optionally reject requests whose
   `Content-Type` is not `application/flowfile-v3` (`StrictFlowFileRequest`,
   responding 415; media type parameters and case are ignored).
-- [ ] First-class multi-flow-file APIs: a sync `Iterator`, an async
-  `parse_next_async`, and possibly a `futures::Stream` adapter.
+- [x] First-class multi-flow-file APIs: `FlowFiles` (sync `Iterator`),
+  `parse_next_async`, and `FlowFilesAsync` with an async `next()` (a real
+  `futures::Stream` impl was skipped — it needs hand-rolled header state
+  machines or an async-stream dependency, and the `next()` loop covers the
+  use case).
 - [ ] `SpooledTempFile` builder helper (memory up to a threshold, then disk)
   as a middle ground between `buffered` and `tempfile`.
 - [ ] Optional `serde` support for `FlowFile<Vec<u8>>` (base64 content),

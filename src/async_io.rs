@@ -29,9 +29,18 @@ async fn read_string<R: AsyncRead + Unpin>(reader: &mut R) -> Result<String> {
 
 pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
     reader: &mut R,
+    first_byte: Option<u8>,
 ) -> Result<(HashMap<String, String>, u64)> {
     let mut magic = [0u8; 7];
-    reader.read_exact(&mut magic).await?;
+    match first_byte {
+        Some(byte) => {
+            magic[0] = byte;
+            reader.read_exact(&mut magic[1..]).await?;
+        }
+        None => {
+            reader.read_exact(&mut magic).await?;
+        }
+    }
     if magic != MAGIC {
         return Err(Error::InvalidMagic(magic));
     }
@@ -67,12 +76,112 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// # });
     /// ```
     pub async fn parse_async(mut reader: R) -> Result<Self> {
-        let (attributes, size) = parse_header(&mut reader).await?;
+        let (attributes, size) = parse_header(&mut reader, None).await?;
         Ok(FlowFile::from_raw_parts(
             size,
             attributes,
             reader.take(size),
         ))
+    }
+}
+
+impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
+    /// Async version of [`FlowFile::parse_next`]: parse the next flow file
+    /// from a stream of concatenated flow files.
+    ///
+    /// Returns `Ok(None)` on a clean end of input. The previous flow file's
+    /// content must be fully consumed before calling this again, otherwise
+    /// parsing resumes in the middle of that content.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+    /// bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
+    ///
+    /// let mut reader = bytes.as_slice();
+    /// let mut count = 0;
+    /// while let Some(flow_file) = FlowFile::parse_next_async(&mut reader).await.unwrap() {
+    ///     count += 1;
+    ///     flow_file.into_bytes_async().await.unwrap(); // consume the content
+    /// }
+    /// assert_eq!(count, 2);
+    /// # });
+    /// ```
+    pub async fn parse_next_async(reader: &'r mut R) -> Result<Option<Self>> {
+        let mut first = [0u8; 1];
+        loop {
+            match reader.read(&mut first).await {
+                Ok(0) => return Ok(None),
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let (attributes, size) = parse_header(reader, Some(first[0])).await?;
+        Ok(Some(FlowFile::from_raw_parts(
+            size,
+            attributes,
+            reader.take(size),
+        )))
+    }
+}
+
+/// Async equivalent of [`FlowFiles`](crate::FlowFiles): reads concatenated
+/// flow files one at a time, buffering each content in memory.
+///
+/// This is not a [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html);
+/// call [`next`](Self::next) in a loop instead. After an error, `next` keeps
+/// returning `None`, since the stream position is no longer trustworthy.
+///
+/// ```
+/// use nififf3::{FlowFile, FlowFilesAsync};
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+/// bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
+///
+/// let mut flow_files = FlowFilesAsync::new(bytes.as_slice());
+/// let mut contents = Vec::new();
+/// while let Some(flow_file) = flow_files.next().await {
+///     contents.push(flow_file.unwrap().into_content());
+/// }
+/// assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
+/// # });
+/// ```
+#[derive(Debug)]
+pub struct FlowFilesAsync<R> {
+    reader: R,
+    done: bool,
+}
+
+impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
+    /// Iterate over the flow files in `reader`.
+    ///
+    /// The header parsing reads in small increments, so wrap unbuffered
+    /// sources in a [`tokio::io::BufReader`].
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            done: false,
+        }
+    }
+
+    /// The next flow file, or `None` at the end of the input.
+    pub async fn next(&mut self) -> Option<Result<FlowFile<Vec<u8>>>> {
+        if self.done {
+            return None;
+        }
+        let result = match FlowFile::parse_next_async(&mut self.reader).await {
+            Ok(None) => None,
+            Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await),
+            Err(err) => Some(Err(err)),
+        };
+        if !matches!(result, Some(Ok(_))) {
+            self.done = true;
+        }
+        result
     }
 }
 
@@ -156,6 +265,21 @@ mod tests {
         let parsed = parsed.into_bytes_async().await.unwrap();
         assert_eq!(parsed.attributes()["path"], "x");
         assert_eq!(parsed.content().as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn flow_files_async_reads_all_and_fuses_after_error() {
+        let mut bytes = sample().to_bytes();
+        bytes.extend(sample().to_bytes());
+        bytes.extend_from_slice(b"garbage");
+        let mut flow_files = FlowFilesAsync::new(bytes.as_slice());
+        assert!(flow_files.next().await.unwrap().is_ok());
+        assert!(flow_files.next().await.unwrap().is_ok());
+        assert!(matches!(
+            flow_files.next().await,
+            Some(Err(Error::InvalidMagic(_)))
+        ));
+        assert!(flow_files.next().await.is_none());
     }
 
     #[tokio::test]

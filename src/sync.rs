@@ -185,6 +185,64 @@ impl<R: Read> FlowFile<R> {
     }
 }
 
+/// Iterator over a stream of concatenated flow files.
+///
+/// Yields each flow file with its content buffered in memory, and ends on a
+/// clean end of input. After an error the iterator is fused (keeps returning
+/// `None`), since the stream position is no longer trustworthy. To stream
+/// contents instead of buffering them, use [`FlowFile::parse_next`] directly.
+///
+/// ```
+/// use nififf3::{FlowFile, FlowFiles};
+///
+/// let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+/// bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
+///
+/// let contents: Vec<_> = FlowFiles::new(bytes.as_slice())
+///     .map(|flow_file| flow_file.unwrap().into_content())
+///     .collect();
+/// assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
+/// ```
+#[derive(Debug)]
+pub struct FlowFiles<R> {
+    reader: R,
+    done: bool,
+}
+
+impl<R: Read> FlowFiles<R> {
+    /// Iterate over the flow files in `reader`.
+    ///
+    /// The header parsing reads in small increments, so wrap unbuffered
+    /// sources (files, sockets) in a [`std::io::BufReader`].
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Iterator for FlowFiles<R> {
+    type Item = Result<FlowFile<Vec<u8>>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let result = match FlowFile::parse_next(&mut self.reader) {
+            Ok(None) => None,
+            Ok(Some(flow_file)) => Some(flow_file.into_bytes()),
+            Err(err) => Some(Err(err)),
+        };
+        if !matches!(result, Some(Ok(_))) {
+            self.done = true;
+        }
+        result
+    }
+}
+
+impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +316,17 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn flow_files_iterator_fuses_after_error() {
+        let mut bytes = sample_bytes();
+        bytes.extend_from_slice(b"garbage");
+        let mut iter = FlowFiles::new(bytes.as_slice());
+        assert!(iter.next().unwrap().is_ok());
+        assert!(matches!(iter.next(), Some(Err(Error::InvalidMagic(_)))));
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
     }
 
     #[test]
