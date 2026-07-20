@@ -169,10 +169,17 @@ $ nififf3 to-json greeting.ff3 | nififf3 from-json | cmp - greeting.ff3
   `attributes`, and the base64-encoded `content`.
 - `nififf3 from-json [path]` — the inverse: read JSON objects as produced by
   `to-json` and write flow files to stdout.
+- `nififf3 attrs [path]` — print `size` and `attributes` as JSON, one object
+  per line per flow file, without decoding the content.
+- `nififf3 content [path]` — write the raw content of the flow files to
+  stdout.
 - `nififf3 create key=value ...` — create a flow file with the given
   attributes; the content is read from stdin.
 
-`to-json` and `from-json` read from stdin when the path is omitted or `-`.
+Commands taking a path read from stdin when it is omitted or `-`, and
+process flow files one at a time, so streams larger than memory are fine
+(except for `to-json`/`from-json`, which buffer one flow file at a time to
+base64 its content).
 
 ## Feature flags
 

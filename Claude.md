@@ -92,9 +92,10 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   `SpooledTempFile` has no async I/O).
 - [x] Optional `serde` support for `FlowFile<Vec<u8>>` (base64 content);
   the CLI's JSON model now lives in the library (`cli` implies `serde`).
-- [ ] CLI ergonomics: streaming `to-json` (currently buffers the whole
-  input), an `attrs`/`inspect` subcommand that prints attributes without
-  decoding content, and a `content` subcommand extracting raw content.
+- [x] CLI ergonomics: all subcommands stream their input (one flow file at a
+  time instead of buffering everything), plus `attrs` (size + attributes as
+  JSON lines, content skipped without decoding) and `content` (raw content
+  to stdout, streamed and size-checked).
 - [ ] Parser hardening for untrusted input: configurable limits on attribute
   count and attribute length (a crafted header can currently request up to
   4 GiB allocations per attribute) and a request-size limit knob for the

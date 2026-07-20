@@ -95,6 +95,56 @@ fn create_builds_a_flow_file() {
 }
 
 #[test]
+fn attrs_prints_metadata_without_content() {
+    let mut input = sample_bytes();
+    input.extend_from_slice(&sample_bytes());
+
+    let stdout = nififf3()
+        .arg("attrs")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let lines: Vec<serde_json::Value> = stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        assert_eq!(line["size"], 5);
+        assert_eq!(line["attributes"]["filename"], "greeting.txt");
+        assert!(line.get("content").is_none());
+    }
+}
+
+#[test]
+fn content_extracts_raw_content() {
+    let mut input = sample_bytes();
+    input.extend_from_slice(&sample_bytes());
+
+    nififf3()
+        .arg("content")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout("hellohello");
+}
+
+#[test]
+fn content_detects_truncated_input() {
+    let bytes = sample_bytes();
+    nififf3()
+        .arg("content")
+        .write_stdin(bytes[..bytes.len() - 2].to_vec())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("size mismatch"));
+}
+
+#[test]
 fn create_rejects_malformed_attributes() {
     nififf3()
         .args(["create", "not-a-pair"])
