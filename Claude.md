@@ -117,11 +117,18 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   (buffer with `write_bytes` to vouch for content). `tests/unpack.rs` covers
   both paths against a real `.tar.gz`.
 
+- [x] Runnable examples in `examples/`, covering sync and async across
+  1-to-1 (`transform`), 1-to-many (`split`), many-to-1 (`merge`), and the same
+  over HTTP (`axum_service`). Each builds its own input and asserts its own
+  output, so running it is the check; `cargo test` compiles them all, but only
+  CI running them would catch a behaviour change.
+
 ### May be later
 - [ ] Fuzzing (`cargo-fuzz`) and property-based round-trip tests for the
   parser; interop tests against files produced by a real NiFi instance.
-- [ ] CI (feature-matrix build/test/clippy/fmt), and crates.io publishing
-  metadata (repository/keywords/categories).
+- [ ] CI (feature-matrix build/test/clippy/fmt, plus running each example so
+  their assertions count), and crates.io publishing metadata
+  (repository/keywords/categories).
 
 
 ### Won't do

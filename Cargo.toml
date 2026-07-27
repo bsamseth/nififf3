@@ -53,3 +53,19 @@ tokio-stream = "0.1"
 name = "nififf3"
 path = "src/bin/nififf3.rs"
 required-features = ["cli"]
+
+[[example]]
+name = "transform_async"
+required-features = ["tokio"]
+
+[[example]]
+name = "split_async"
+required-features = ["tokio"]
+
+[[example]]
+name = "merge_async"
+required-features = ["tokio"]
+
+[[example]]
+name = "axum_service"
+required-features = ["axum"]

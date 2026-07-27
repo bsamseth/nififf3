@@ -291,6 +291,23 @@ process flow files one at a time, so streams larger than memory are fine
 (except for `to-json`/`from-json`, which buffer one flow file at a time to
 base64 its content).
 
+## Examples
+
+`examples/` holds runnable programs, each self-contained and asserting its own
+output. Run one with `cargo run --example <name>`, adding `--features` where
+the table calls for it:
+
+| example | features | |
+| --- | --- | --- |
+| `transform` / `transform_async` | — / `tokio` | one flow file in, one out |
+| `split` / `split_async` | — / `tokio` | one in, many out |
+| `merge` / `merge_async` | — / `tokio` | many in, one out |
+| `axum_service` | `axum` | one in, one *or* many out, over HTTP |
+
+The `split`/`merge` pair is worth reading together: `merge` reassembles what
+`split` produced, using the fragment attributes the way NiFi's `MergeContent`
+does in `defragment` mode.
+
 ## Feature flags
 
 No features are enabled by default; the sync API is always available.
