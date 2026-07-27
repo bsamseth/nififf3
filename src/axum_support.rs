@@ -218,61 +218,34 @@ enum Source {
 
 /// A response carrying *many* flow files, concatenated as NiFi expects them.
 ///
-/// This is the 1-to-many counterpart to [`FlowFileRequest`]: a handler takes
-/// one flow file in and answers with a flow file per part it found inside.
-/// The parts are produced lazily and streamed out, so neither the number of
-/// parts nor the size of any one of them is bounded by memory.
+/// The 1-to-many counterpart to [`FlowFileRequest`]: a handler takes one flow
+/// file in and answers with a flow file per part it found inside. Parts are
+/// produced lazily and streamed, so neither their number nor the size of any
+/// one of them is bounded by memory. See [`new`](Self::new) for the shape of a
+/// handler.
 ///
 /// # Status codes
 ///
 /// Returning a `FlowFilesResponse` *is* the commitment to a 2xx: by the time
-/// the producer runs, the status line has been sent. Validate whatever you
-/// can up front, while you can still answer with a real status:
+/// the producer runs, the status line has been sent. Validate up front, while
+/// a real status code is still available, and report a problem with an
+/// individual part *as a part* — a flow file whose attributes say what went
+/// wrong — so the good parts still arrive. Returning `Err` from the producer
+/// instead aborts the body, leaving the client with a truncated response and
+/// no status to explain it.
 ///
-/// ```no_run
-/// use nififf3::{Error, FlowFilesResponse, StrictFlowFileRequest};
+/// Which failures can be reported as a part follows from the format writing a
+/// part's size *before* its content:
 ///
-/// async fn unpack(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
-///     let parent = req.into_inner().into_bytes_async().await?; // 400 on a bad flow file
-///     let mut parts = parent.fragments();
-///     Ok(FlowFilesResponse::new(move |mut writer| async move {
-///         for line in parent.content().split(|b| *b == b'\n') {
-///             writer.write_bytes(&parts.next().content(line)).await?;
-///         }
-///         Ok(())
-///     }))
-/// }
-/// ```
+/// - Found before the part is written — a bad archive header, an entry that
+///   will not open — always reportable.
+/// - Found while [`write`](FlowFilesWriterAsync::write) streams a part's
+///   content — not reportable, since the size is already on the wire.
 ///
-/// Once the producer is running, a problem with an individual part is best
-/// reported *as a part* — an otherwise-empty flow file whose attributes say
-/// what went wrong — so that the good parts still reach the client. That is
-/// ordinary control flow in the producer's loop, so this type has no opinion
-/// about it.
-///
-/// Returning `Err` from the producer instead aborts the response body
-/// mid-stream. The client sees a truncated (chunked) response rather than a
-/// clean end of body, which is detectable but carries no status code, so
-/// prefer the error-part pattern above.
-///
-/// # When a part failure is still recoverable
-///
-/// The V3 format writes a part's size *before* its content, so
-/// [`write`](FlowFilesWriterAsync::write) commits to the declared size before
-/// reading a byte of it. Which failures you can report as attributes follows
-/// from that:
-///
-/// - A failure found *before* the part is written — a bad archive header, an
-///   entry that cannot be opened — can always become an error part.
-/// - A failure found *while* streaming a part's content cannot. Its size is
-///   already on the wire, so the only honest outcome is to abort the body.
-///
-/// To report content-level failures as attributes, read the part into memory
-/// first and write it with
-/// [`write_bytes`](FlowFilesWriterAsync::write_bytes): the failure surfaces
-/// while nothing has been committed. That trades the streaming property for
-/// one part's worth of memory, and is worth doing per-part — stream the large
-/// entries, buffer the ones whose integrity you want to vouch for.
+/// To vouch for a part's content, read it into memory and use
+/// [`write_bytes`](FlowFilesWriterAsync::write_bytes) instead, which learns of
+/// the failure before committing to anything. That is worth deciding per part:
+/// stream the large ones, buffer the ones whose integrity matters.
 pub struct FlowFilesResponse {
     source: Source,
     buffer_size: usize,
@@ -290,33 +263,43 @@ impl FlowFilesResponse {
     /// Stream flow files from an async producer.
     ///
     /// `producer` is handed a [`FlowFilesWriterAsync`] and writes parts to it
-    /// in whatever order and shape it likes; the response ends when the
-    /// returned future completes. Each `write` resolves once the part has
-    /// been handed to the socket, so a slow client applies backpressure
-    /// rather than piling up in memory.
+    /// in whatever shape it likes; the response ends when the future
+    /// completes. Each write resolves once the part has reached the socket, so
+    /// a slow client applies backpressure instead of filling memory, and
+    /// writing a part from a reader never buffers its content.
     ///
-    /// Because parts are written from a reader, their content is never
-    /// buffered — this streams a decompressor straight through to the client:
+    /// ```
+    /// use axum::response::IntoResponse;
+    /// use http_body_util::BodyExt;
+    /// use nififf3::{FlowFile, FlowFilesAsync, FlowFilesResponse};
     ///
-    /// ```no_run
-    /// # use nififf3::{Error, FlowFilesResponse, FlowFileRequest};
-    /// # async fn entries() -> Option<(String, u64, tokio::io::Empty)> { None }
-    /// async fn unpack(req: FlowFileRequest) -> Result<FlowFilesResponse, Error> {
-    ///     let mut parts = req.fragments();
-    ///     Ok(FlowFilesResponse::new(move |mut writer| async move {
-    ///         while let Some((name, size, entry)) = entries().await {
-    ///             writer
-    ///                 .write(parts.next().attribute("filename", name).reader(entry, size))
-    ///                 .await?;
-    ///         }
-    ///         Ok(())
-    ///     }))
-    /// }
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "pair.txt")
+    ///     .content(&b"first\nsecond"[..]);
+    /// let mut parts = parent.fragments();
+    ///
+    /// let response = FlowFilesResponse::new(move |mut writer| async move {
+    ///     for line in parent.content().split(|byte| *byte == b'\n') {
+    ///         // `line` is a reader, so its content is never copied into a part.
+    ///         writer.write(parts.next().reader(line, line.len() as u64)).await?;
+    ///     }
+    ///     Ok(())
+    /// })
+    /// .into_response();
+    ///
+    /// let body = response.into_body().collect().await.unwrap().to_bytes();
+    /// let mut flow_files = FlowFilesAsync::new(body.as_ref());
+    ///
+    /// let first = flow_files.next().await.unwrap().unwrap();
+    /// assert_eq!(first.content().as_slice(), b"first");
+    /// assert_eq!(first.attributes()["fragment.index"], "1");
+    /// assert_eq!(first.attributes()["segment.original.filename"], "pair.txt");
+    /// # });
     /// ```
     ///
-    /// If the client disconnects, the next write fails and the producer is
-    /// dropped; a producer that is working rather than writing is aborted
-    /// when the response body is dropped.
+    /// If the client disconnects the next write fails; a producer that is
+    /// working rather than writing is aborted when the body is dropped.
     pub fn new<F, Fut>(producer: F) -> Self
     where
         F: FnOnce(FlowFilesWriterAsync<ResponseSink>) -> Fut + Send + 'static,
@@ -331,15 +314,14 @@ impl FlowFilesResponse {
     /// Stream flow files from a *blocking* producer, run on a blocking
     /// thread.
     ///
-    /// The same shape as [`new`](Self::new) for producers that are
-    /// unavoidably synchronous. Prefer `new` where an async decoder exists:
-    /// aborting a blocking producer that is mid-computation is not possible,
-    /// so it runs to completion (or to its next failing write) even after the
-    /// client goes away.
+    /// The same shape as [`new`](Self::new), for producers that are
+    /// unavoidably synchronous. Prefer `new` where an async decoder exists: a
+    /// blocking producer cannot be aborted mid-computation, so it keeps
+    /// running after the client goes away until its next write fails.
     ///
     /// The parent's content is an [`AsyncRead`]; wrap it in
-    /// [`SyncIoBridge`](tokio_util::io::SyncIoBridge) to feed it to a
-    /// synchronous decoder.
+    /// [`SyncIoBridge`](tokio_util::io::SyncIoBridge) to feed a synchronous
+    /// decoder.
     pub fn blocking<F>(producer: F) -> Self
     where
         F: FnOnce(FlowFilesWriter<BlockingResponseSink>) -> crate::Result<()> + Send + 'static,
@@ -352,10 +334,9 @@ impl FlowFilesResponse {
 
     /// Stream flow files from a [`Stream`] of in-memory parts.
     ///
-    /// A convenience for producers that already yield whole flow files; each
-    /// part is held in memory while it is written. A `Stream` error ends the
-    /// response the same way an error from [`new`](Self::new)'s producer
-    /// does.
+    /// A convenience for producers that already yield whole flow files. A
+    /// `Stream` error ends the response the same way an error from
+    /// [`new`](Self::new)'s producer does.
     pub fn from_stream<S>(parts: S) -> Self
     where
         S: Stream<Item = crate::Result<FlowFile<Vec<u8>>>> + Send + 'static,
@@ -376,14 +357,20 @@ impl FlowFilesResponse {
     /// being chunked.
     ///
     /// ```
+    /// use axum::http::header;
+    /// use axum::response::IntoResponse;
     /// use nififf3::{FlowFile, FlowFilesResponse};
     ///
     /// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
     /// let mut parts = parent.fragments().with_count(2);
+    ///
     /// let response = FlowFilesResponse::from_vec(vec![
     ///     parts.next().content(&b"first"[..]),
     ///     parts.next().content(&b"second"[..]),
-    /// ]);
+    /// ])
+    /// .into_response();
+    ///
+    /// assert!(response.headers().contains_key(header::CONTENT_LENGTH));
     /// ```
     pub fn from_vec(parts: Vec<FlowFile<Vec<u8>>>) -> Self {
         let mut bytes = Vec::new();

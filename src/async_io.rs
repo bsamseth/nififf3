@@ -265,7 +265,11 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
     /// from its content reader. Returns the number of content bytes copied.
     ///
-    /// The content is never buffered, so a part may be arbitrarily large.
+    /// The content is never buffered, so a part may be arbitrarily large. A
+    /// reader that ends early is an [`Error::SizeMismatch`], by which point a
+    /// truncated flow file has already been written; use
+    /// [`write_bytes`](Self::write_bytes) for content whose length must be
+    /// verified before anything is committed.
     pub async fn write<R: AsyncRead + Unpin>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
         let copied = flow_file.write_to_async(&mut self.writer).await?;
         self.count += 1;

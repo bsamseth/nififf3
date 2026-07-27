@@ -283,10 +283,6 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 /// Writes a stream of concatenated flow files, the counterpart to
 /// [`FlowFiles`].
 ///
-/// Flow files are written back-to-back, exactly as NiFi expects them; the
-/// writer holds no state of its own beyond a count, so dropping it mid-stream
-/// simply leaves the flow files written so far.
-///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesWriter};
 ///
@@ -320,8 +316,9 @@ impl<W: Write> FlowFilesWriter<W> {
     /// from its content reader. Returns the number of content bytes copied.
     ///
     /// A content reader that ends early is an [`Error::SizeMismatch`], by
-    /// which point a truncated flow file has already been written — see
-    /// [`FlowFile::write_to`], which this delegates to.
+    /// which point a truncated flow file has already been written. Use
+    /// [`write_bytes`](Self::write_bytes) for content whose length must be
+    /// verified before anything is committed.
     pub fn write<R: Read>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
         let copied = flow_file.write_to(&mut self.writer)?;
         self.count += 1;

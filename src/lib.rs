@@ -126,15 +126,15 @@ impl<R> FlowFile<R> {
 
     /// Start building a new flow file carrying this one's attributes.
     ///
-    /// The [`uuid`](attr::UUID) attribute is replaced with a freshly
-    /// generated one, since in NiFi it identifies a single flow file — use
-    /// [`derive_keep_uuid`](Self::derive_keep_uuid) to copy it verbatim
-    /// instead. Every other attribute is inherited as-is; set an attribute on
-    /// the returned builder to override it, or
+    /// The [`uuid`](attr::UUID) attribute is replaced with a freshly generated
+    /// one, since in NiFi it identifies a single flow file — use
+    /// [`derive_keep_uuid`](Self::derive_keep_uuid) to copy it verbatim. Every
+    /// other attribute is inherited as-is; set one on the returned builder to
+    /// override it, or
     /// [`without_attribute`](FlowFileBuilder::without_attribute) to drop it.
     ///
-    /// Only the attributes are borrowed, so the parent stays available (to
-    /// have its content read, for instance).
+    /// Only the attributes are borrowed, so the parent stays available to have
+    /// its content read.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -150,6 +150,7 @@ impl<R> FlowFile<R> {
     ///
     /// assert_eq!(child.attributes()["source"], "upload");
     /// assert_eq!(child.attributes()["filename"], "report.header.csv");
+    /// assert!(child.attributes().contains_key("uuid")); // freshly generated
     /// ```
     ///
     /// To produce many flow files from one, use [`fragments`](Self::fragments),

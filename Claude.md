@@ -21,7 +21,8 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
 - `sync` parsing/serialization: `std::io::Read`/`Write` (always available).
 - `async` parsing/serialization: `tokio::io::AsyncRead`/`AsyncWrite`, behind a
   `tokio` feature.
-- `axum` feature (implies `tokio`): extractor + `IntoResponse`.
+- `axum` feature (implies `tokio`): extractors + `IntoResponse`, including a
+  streaming many-flow-files response.
 - `cli` feature: `clap`-based binary (`src/bin/nififf3.rs`,
   `required-features = ["cli"]`), pulling in `serde_json` + `base64`.
 
@@ -104,19 +105,17 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   request-size knob was skipped: content is streamed, never allocated, and
   axum's `DefaultBodyLimit` already covers total body size.)
 
-- [x] First-class 1-to-many support (one flow file in, many out — unpacking
-  an archive, splitting a batch). `FlowFilesWriter`/`FlowFilesWriterAsync` as
-  the writing counterpart to `FlowFiles`/`FlowFilesAsync`; `FlowFile::derive`
-  (attributes copied, fresh `uuid`), `derive_keep_uuid`, and
-  `FlowFile::fragments` producing NiFi's `fragment.*` attributes with
-  configurable keys; `FlowFilesResponse` (axum) streaming parts from an async
-  producer closure, with `blocking`/`from_stream`/`from_vec` variants.
-  Returning the response is the commitment to a 2xx, so per-part failures are
-  reported as attributes on their own flow file. Note the format constraint:
-  `write` declares a part's size before reading it, so only failures found
-  *before* a part is written can be reported that way — buffer a part
-  (`write_bytes`) to vouch for its content. `tests/unpack.rs` covers both
-  against a real `.tar.gz`.
+- [x] First-class 1-to-many support (one flow file in, many out).
+  `FlowFilesWriter`/`FlowFilesWriterAsync` as the writing counterpart to
+  `FlowFiles`/`FlowFilesAsync`; `FlowFile::derive`/`derive_keep_uuid` and
+  `FlowFile::fragments` for deriving parts from a parent, carrying NiFi's
+  `fragment.*` attributes under configurable keys; `FlowFilesResponse` (axum)
+  streaming parts from an async producer closure, plus
+  `blocking`/`from_stream`/`from_vec`. Returning the response commits to a
+  2xx, so per-part failures go in the body as attributes — but only those
+  found *before* a part is written, since `write` declares its size first
+  (buffer with `write_bytes` to vouch for content). `tests/unpack.rs` covers
+  both paths against a real `.tar.gz`.
 
 ### May be later
 - [ ] Fuzzing (`cargo-fuzz`) and property-based round-trip tests for the

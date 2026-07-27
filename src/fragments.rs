@@ -26,25 +26,22 @@ impl Default for Keys {
 
 /// A counter for splitting one flow file into many.
 ///
-/// Created with [`FlowFile::fragments`](crate::FlowFile::fragments). Each
-/// call to [`next`](Self::next) yields a [`FlowFileBuilder`] carrying the
-/// parent's attributes (with a fresh [`uuid`](attr::UUID), as
-/// [`derive`](crate::FlowFile::derive) does) plus NiFi's fragment
-/// attributes:
+/// Created with [`FlowFile::fragments`](crate::FlowFile::fragments). Each call
+/// to [`next`](Self::next) yields a [`FlowFileBuilder`] carrying the parent's
+/// attributes — with a fresh [`uuid`](attr::UUID), as
+/// [`derive`](crate::FlowFile::derive) does — plus NiFi's fragment attributes,
+/// which let `MergeContent` reassemble the parent in `defragment` mode:
 ///
-/// - [`fragment.identifier`](attr::FRAGMENT_ID) — a random UUID shared by
-///   every fragment in the set, matching NiFi's `UnpackContent`.
-/// - [`fragment.index`](attr::FRAGMENT_INDEX) — a one-up counter, starting
-///   at 1.
-/// - [`fragment.count`](attr::FRAGMENT_COUNT) — only when
-///   [`with_count`](Self::with_count) was called; the total is rarely known
-///   before the parts have been produced.
+/// - [`fragment.identifier`](attr::FRAGMENT_ID) — a random UUID shared by the
+///   whole set.
+/// - [`fragment.index`](attr::FRAGMENT_INDEX) — a one-up counter from 1.
+/// - [`fragment.count`](attr::FRAGMENT_COUNT) — only after
+///   [`with_count`](Self::with_count); the total is rarely known up front.
 /// - [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) — the
-///   parent's [`filename`](attr::FILENAME), when it had one.
+///   parent's [`filename`](attr::FILENAME), if it had one.
 ///
-/// Together these let NiFi's `MergeContent` reassemble the parent in
-/// `defragment` mode. Any fragment attributes on the parent itself are
-/// dropped rather than inherited, since a new split replaces the old one.
+/// Fragment attributes on the parent are dropped rather than inherited, since
+/// a new split supersedes the old one.
 ///
 /// ```
 /// use nififf3::FlowFile;
@@ -154,11 +151,10 @@ impl Fragments {
 
     /// Start the next fragment, advancing the index.
     ///
-    /// Supply the content (and any attributes that differ from the parent's)
-    /// on the returned builder to finish it. Attributes set on the builder
-    /// win over the inherited and fragment attributes, and
-    /// [`without_attribute`](FlowFileBuilder::without_attribute) can drop any
-    /// of them.
+    /// Finish it by supplying content on the returned builder. Attributes set
+    /// there win over the inherited and fragment ones, and
+    /// [`without_attribute`](FlowFileBuilder::without_attribute) drops any of
+    /// them.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> FlowFileBuilder {
         self.index += 1;

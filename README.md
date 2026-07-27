@@ -179,8 +179,7 @@ assert_eq!(children[1].attributes()["fragment.index"], "2");
 assert_eq!(children[0].attributes()["segment.original.filename"], "pair.txt");
 ```
 
-Each part inherits the parent's attributes and gets its own `uuid`, a
-`fragment.index` counting from 1, and a `fragment.identifier` shared across
+Each part also gets its own `uuid` and a `fragment.identifier` shared across
 the set. The attribute keys are configurable if you need different ones.
 
 ## Async I/O (`tokio` feature)
@@ -232,42 +231,36 @@ let app: Router = Router::new().route("/echo", post(echo));
 
 ### Answering with many flow files
 
-A handler that receives one flow file and produces several — unpacking an
-archive, splitting a batch — returns a `FlowFilesResponse`. It hands the
-handler a `FlowFilesWriterAsync` and streams whatever is written to it, so
-neither the number of parts nor the size of any one part has to fit in
-memory:
+A handler that turns one flow file into several — unpacking an archive,
+splitting a batch — returns a `FlowFilesResponse`. It hands the handler a
+`FlowFilesWriterAsync` and streams whatever is written to it, so neither the
+number of parts nor the size of any one part has to fit in memory:
 
 ```rust,ignore
 use nififf3::{Error, FlowFilesResponse, StrictFlowFileRequest};
 
-async fn unpack(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
-    let parent = req.into_inner();
+async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
+    // Validate here, while a real status code is still available.
+    let parent = req.into_inner().into_bytes_async().await?;
     let mut parts = parent.fragments();
-    let mut archive = Archive::new(GzipDecoder::new(BufReader::new(parent.into_content())));
 
     Ok(FlowFilesResponse::new(move |mut writer| async move {
-        let mut entries = archive.entries()?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-            let size = entry.header().entry_size()?;
-            let name = entry.path()?.display().to_string();
-            // The entry's content streams from the decoder to the socket.
-            writer.write(parts.next().attribute("filename", name).reader(entry, size)).await?;
+        for line in parent.content().split(|byte| *byte == b'\n') {
+            // `line` is a reader, so its content is never copied into a part.
+            writer.write(parts.next().reader(line, line.len() as u64)).await?;
         }
         Ok(())
     }))
 }
 ```
 
-Returning a `FlowFilesResponse` is the commitment to a 2xx: validate whatever
-you can before it, while a real status code is still available. After that,
-report a problem with an individual part *as a part* — an empty flow file
-whose attributes say what went wrong — so the good parts still arrive. See
-the type's documentation for which failures can be reported that way, and
-`FlowFilesResponse::blocking` for producers that are unavoidably synchronous.
-
-`tests/unpack.rs` works the whole thing end to end against a real `.tar.gz`.
+Returning the response is the commitment to a 2xx, so validate before it and
+report a problem with an individual part *as a part* — a flow file whose
+attributes say what went wrong — leaving the good parts to arrive. The type's
+documentation covers which failures can be reported that way, and
+`FlowFilesResponse::blocking` covers producers that are unavoidably
+synchronous. `tests/unpack.rs` drives the whole thing against a real
+`.tar.gz`.
 
 ## CLI (`cli` feature)
 

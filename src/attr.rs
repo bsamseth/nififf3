@@ -1,9 +1,8 @@
 //! Well-known flow file attribute names used by NiFi.
 //!
-//! These are the keys this crate reads or writes on your behalf; NiFi itself
-//! treats them as ordinary attributes, so nothing stops you from using
-//! different names (see [`Fragments`](crate::Fragments), whose keys are
-//! configurable).
+//! NiFi treats these as ordinary attributes, so nothing forces you to use
+//! them — [`Fragments`](crate::Fragments) writes them by default but takes
+//! different keys if you need them.
 
 /// The per-flow-file unique identifier. Replaced with a fresh value by
 /// [`FlowFile::derive`](crate::FlowFile::derive).
