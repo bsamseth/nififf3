@@ -18,6 +18,7 @@ cli = ["dep:clap", "dep:serde_json", "serde"]
 
 [dependencies]
 thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["io-util", "fs"], optional = true }
 tempfile = { version = "3", optional = true }
 axum = { version = "0.8", optional = true }

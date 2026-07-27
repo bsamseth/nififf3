@@ -3,9 +3,12 @@
 
 use std::collections::HashMap;
 
+pub mod attr;
+
 mod builder;
 mod error;
 mod format;
+mod fragments;
 mod limits;
 mod sync;
 
@@ -18,6 +21,7 @@ mod serde_support;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;
+pub use fragments::Fragments;
 pub use limits::Limits;
 pub use sync::FlowFiles;
 
@@ -115,6 +119,74 @@ impl<R> FlowFile<R> {
             attributes: self.attributes,
             content: f(self.content),
         }
+    }
+
+    /// Start building a new flow file carrying this one's attributes.
+    ///
+    /// The [`uuid`](attr::UUID) attribute is replaced with a freshly
+    /// generated one, since in NiFi it identifies a single flow file — use
+    /// [`derive_keep_uuid`](Self::derive_keep_uuid) to copy it verbatim
+    /// instead. Every other attribute is inherited as-is; set an attribute on
+    /// the returned builder to override it, or
+    /// [`without_attribute`](FlowFileBuilder::without_attribute) to drop it.
+    ///
+    /// Only the attributes are borrowed, so the parent stays available (to
+    /// have its content read, for instance).
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "report.csv")
+    ///     .attribute("source", "upload")
+    ///     .content(&b"a,b\n1,2\n"[..]);
+    ///
+    /// let child = parent.derive()
+    ///     .attribute("filename", "report.header.csv")
+    ///     .content(&b"a,b\n"[..]);
+    ///
+    /// assert_eq!(child.attributes()["source"], "upload");
+    /// assert_eq!(child.attributes()["filename"], "report.header.csv");
+    /// ```
+    ///
+    /// To produce many flow files from one, use [`fragments`](Self::fragments),
+    /// which adds NiFi's fragment attributes on top of this.
+    pub fn derive(&self) -> FlowFileBuilder {
+        self.derive_keep_uuid()
+            .attribute(attr::UUID, uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Like [`derive`](Self::derive), but copying the [`uuid`](attr::UUID)
+    /// attribute unchanged rather than generating a new one.
+    ///
+    /// Appropriate when the result represents the *same* flow file rather
+    /// than a new one — a re-encoded or re-compressed payload, say.
+    pub fn derive_keep_uuid(&self) -> FlowFileBuilder {
+        FlowFileBuilder::new().attributes(self.attributes.clone())
+    }
+
+    /// Split this flow file into many, numbering the results with NiFi's
+    /// fragment attributes. See [`Fragments`].
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "pair.txt")
+    ///     .content(&b"first\nsecond"[..]);
+    ///
+    /// let mut parts = parent.fragments().with_count(2);
+    /// let children: Vec<_> = parent
+    ///     .content()
+    ///     .split(|b| *b == b'\n')
+    ///     .map(|line| parts.next().content(line))
+    ///     .collect();
+    ///
+    /// assert_eq!(children[0].attributes()["fragment.index"], "1");
+    /// assert_eq!(children[1].attributes()["fragment.index"], "2");
+    /// ```
+    pub fn fragments(&self) -> Fragments {
+        Fragments::new(&self.attributes)
     }
 
     /// The serialized header (everything up to the content) for this flow file.

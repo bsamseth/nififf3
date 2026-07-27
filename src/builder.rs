@@ -42,6 +42,27 @@ impl FlowFileBuilder {
         self
     }
 
+    /// Remove an attribute, if present.
+    ///
+    /// Mostly useful after [`FlowFile::derive`](crate::FlowFile::derive) or
+    /// [`Fragments::next`](crate::Fragments::next), to drop an inherited
+    /// attribute that does not apply to the new flow file.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "archive.tar")
+    ///     .content(Vec::new());
+    ///
+    /// let child = parent.derive().without_attribute("filename").content(Vec::new());
+    /// assert!(!child.attributes().contains_key("filename"));
+    /// ```
+    pub fn without_attribute(mut self, key: &str) -> Self {
+        self.attributes.remove(key);
+        self
+    }
+
     /// Finish the build with in-memory content; the size is the content length.
     pub fn content(self, content: impl Into<Vec<u8>>) -> FlowFile<Vec<u8>> {
         let content = content.into();

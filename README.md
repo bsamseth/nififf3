@@ -130,6 +130,57 @@ Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
 `write_to` for `std::io::Write`, and `write_to_async` for
 `tokio::io::AsyncWrite`.
 
+## Deriving flow files from flow files
+
+`derive` starts a builder carrying another flow file's attributes, which is
+the usual way to produce a flow file *from* one you received. The `uuid`
+attribute is replaced with a fresh one, since in NiFi it identifies a single
+flow file — `derive_keep_uuid` copies it verbatim instead.
+
+```rust
+use nififf3::FlowFile;
+
+let parent = FlowFile::builder()
+    .attribute("filename", "report.csv")
+    .attribute("source", "upload")
+    .content(&b"a,b\n1,2\n"[..]);
+
+let child = parent.derive()
+    .attribute("filename", "report.header.csv")
+    .without_attribute("source")
+    .content(&b"a,b\n"[..]);
+
+assert_eq!(child.attributes()["filename"], "report.header.csv");
+assert!(!child.attributes().contains_key("source"));
+```
+
+When one flow file becomes *many* — an archive unpacked into a flow file per
+entry, a batch split into records — `fragments` numbers the results with
+NiFi's fragment attributes, so `MergeContent` can reassemble them downstream:
+
+```rust
+use nififf3::FlowFile;
+
+let parent = FlowFile::builder()
+    .attribute("filename", "pair.txt")
+    .content(&b"first\nsecond"[..]);
+
+let mut parts = parent.fragments().with_count(2);
+let children: Vec<_> = parent
+    .content()
+    .split(|byte| *byte == b'\n')
+    .map(|line| parts.next().content(line))
+    .collect();
+
+assert_eq!(children[0].attributes()["fragment.index"], "1");
+assert_eq!(children[1].attributes()["fragment.index"], "2");
+assert_eq!(children[0].attributes()["segment.original.filename"], "pair.txt");
+```
+
+Each part inherits the parent's attributes and gets its own `uuid`, a
+`fragment.index` counting from 1, and a `fragment.identifier` shared across
+the set. The attribute keys are configurable if you need different ones.
+
 ## Async I/O (`tokio` feature)
 
 The async API mirrors the sync one: `parse_async` reads only the header and
