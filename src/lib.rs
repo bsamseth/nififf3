@@ -23,10 +23,10 @@ pub use builder::FlowFileBuilder;
 pub use error::Error;
 pub use fragments::Fragments;
 pub use limits::Limits;
-pub use sync::FlowFiles;
+pub use sync::{FlowFiles, FlowFilesWriter};
 
 #[cfg(feature = "tokio")]
-pub use async_io::FlowFilesAsync;
+pub use async_io::{FlowFilesAsync, FlowFilesWriterAsync};
 
 #[cfg(feature = "axum")]
 pub use axum_support::{FlowFileBody, FlowFileRequest, StrictFlowFileRequest, StrictRejection};

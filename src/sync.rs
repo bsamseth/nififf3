@@ -280,6 +280,77 @@ impl<R: Read> Iterator for FlowFiles<R> {
 
 impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 
+/// Writes a stream of concatenated flow files, the counterpart to
+/// [`FlowFiles`].
+///
+/// Flow files are written back-to-back, exactly as NiFi expects them; the
+/// writer holds no state of its own beyond a count, so dropping it mid-stream
+/// simply leaves the flow files written so far.
+///
+/// ```
+/// use nififf3::{FlowFile, FlowFilesWriter};
+///
+/// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
+/// let mut parts = parent.fragments().with_count(2);
+///
+/// let mut out = Vec::new();
+/// let mut writer = FlowFilesWriter::new(&mut out);
+/// writer.write_bytes(&parts.next().content(&b"first"[..]))?;
+/// writer.write_bytes(&parts.next().content(&b"second"[..]))?;
+/// assert_eq!(writer.count(), 2);
+///
+/// # use nififf3::FlowFiles;
+/// let parsed: Vec<_> = FlowFiles::new(out.as_slice()).collect::<Result<_, _>>()?;
+/// assert_eq!(parsed.len(), 2);
+/// # Ok::<(), nififf3::Error>(())
+/// ```
+#[derive(Debug)]
+pub struct FlowFilesWriter<W> {
+    writer: W,
+    count: u64,
+}
+
+impl<W: Write> FlowFilesWriter<W> {
+    /// Write flow files to `writer`.
+    pub fn new(writer: W) -> Self {
+        Self { writer, count: 0 }
+    }
+
+    /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
+    /// from its content reader. Returns the number of content bytes copied.
+    ///
+    /// A content reader that ends early is an [`Error::SizeMismatch`], by
+    /// which point a truncated flow file has already been written — see
+    /// [`FlowFile::write_to`], which this delegates to.
+    pub fn write<R: Read>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
+        let copied = flow_file.write_to(&mut self.writer)?;
+        self.count += 1;
+        Ok(copied)
+    }
+
+    /// Append an in-memory flow file, whose size is known to be correct.
+    pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> Result<u64> {
+        self.writer.write_all(&flow_file.to_bytes())?;
+        self.count += 1;
+        Ok(flow_file.size)
+    }
+
+    /// The number of flow files written so far.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// A mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Consume the writer, returning the underlying one.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

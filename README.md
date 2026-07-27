@@ -128,7 +128,9 @@ let flow_file = FlowFile::builder().tempfile_async(reader).await?; // + `tokio`
 
 Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
 `write_to` for `std::io::Write`, and `write_to_async` for
-`tokio::io::AsyncWrite`.
+`tokio::io::AsyncWrite`. To write several flow files back-to-back, use
+`FlowFilesWriter` (or `FlowFilesWriterAsync`), the counterpart to the
+`FlowFiles` reader.
 
 ## Deriving flow files from flow files
 

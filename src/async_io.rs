@@ -230,6 +230,71 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
     }
 }
 
+/// Async equivalent of [`FlowFilesWriter`](crate::FlowFilesWriter): writes a
+/// stream of concatenated flow files to an [`AsyncWrite`].
+///
+/// ```
+/// use nififf3::{FlowFile, FlowFilesAsync, FlowFilesWriterAsync};
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
+/// let mut parts = parent.fragments().with_count(2);
+///
+/// let mut out = Vec::new();
+/// let mut writer = FlowFilesWriterAsync::new(&mut out);
+/// writer.write_bytes(&parts.next().content(&b"first"[..])).await.unwrap();
+/// writer.write_bytes(&parts.next().content(&b"second"[..])).await.unwrap();
+/// assert_eq!(writer.count(), 2);
+///
+/// let mut parsed = FlowFilesAsync::new(out.as_slice());
+/// assert_eq!(parsed.next().await.unwrap().unwrap().into_content(), b"first");
+/// # });
+/// ```
+#[derive(Debug)]
+pub struct FlowFilesWriterAsync<W> {
+    writer: W,
+    count: u64,
+}
+
+impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
+    /// Write flow files to `writer`.
+    pub fn new(writer: W) -> Self {
+        Self { writer, count: 0 }
+    }
+
+    /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
+    /// from its content reader. Returns the number of content bytes copied.
+    ///
+    /// The content is never buffered, so a part may be arbitrarily large.
+    pub async fn write<R: AsyncRead + Unpin>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
+        let copied = flow_file.write_to_async(&mut self.writer).await?;
+        self.count += 1;
+        Ok(copied)
+    }
+
+    /// Append an in-memory flow file, whose size is known to be correct.
+    pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> Result<u64> {
+        self.writer.write_all(&flow_file.to_bytes()).await?;
+        self.count += 1;
+        Ok(flow_file.size)
+    }
+
+    /// The number of flow files written so far.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// A mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Consume the writer, returning the underlying one.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
 impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// Async version of [`FlowFile::write_to`]: serialize the flow file to a
     /// writer, reading exactly [`size`](FlowFile::size) bytes from the
