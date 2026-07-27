@@ -12,7 +12,15 @@ all-features = true
 default = []
 tokio = ["dep:tokio"]
 tempfile = ["dep:tempfile"]
-axum = ["tokio", "dep:axum", "dep:tokio-util", "dep:bytes", "dep:futures-core"]
+axum = [
+    "tokio",
+    "tokio/rt",
+    "dep:axum",
+    "dep:tokio-util",
+    "tokio-util/io-util",
+    "dep:bytes",
+    "dep:futures-core",
+]
 serde = ["dep:serde", "dep:base64"]
 cli = ["dep:clap", "dep:serde_json", "serde"]
 
@@ -37,6 +45,9 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 assert_cmd = "2"
 predicates = "3"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+astral-tokio-tar = "0.6"
+tokio-stream = "0.1"
 
 [[bin]]
 name = "nififf3"

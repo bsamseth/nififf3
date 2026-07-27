@@ -29,7 +29,10 @@ pub use sync::{FlowFiles, FlowFilesWriter};
 pub use async_io::{FlowFilesAsync, FlowFilesWriterAsync};
 
 #[cfg(feature = "axum")]
-pub use axum_support::{FlowFileBody, FlowFileRequest, StrictFlowFileRequest, StrictRejection};
+pub use axum_support::{
+    BlockingResponseSink, FlowFileBody, FlowFileRequest, FlowFilesResponse, ResponseSink,
+    StrictFlowFileRequest, StrictRejection,
+};
 
 /// Convenience alias for results produced by this crate.
 pub type Result<T> = std::result::Result<T, Error>;

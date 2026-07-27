@@ -104,6 +104,20 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   request-size knob was skipped: content is streamed, never allocated, and
   axum's `DefaultBodyLimit` already covers total body size.)
 
+- [x] First-class 1-to-many support (one flow file in, many out — unpacking
+  an archive, splitting a batch). `FlowFilesWriter`/`FlowFilesWriterAsync` as
+  the writing counterpart to `FlowFiles`/`FlowFilesAsync`; `FlowFile::derive`
+  (attributes copied, fresh `uuid`), `derive_keep_uuid`, and
+  `FlowFile::fragments` producing NiFi's `fragment.*` attributes with
+  configurable keys; `FlowFilesResponse` (axum) streaming parts from an async
+  producer closure, with `blocking`/`from_stream`/`from_vec` variants.
+  Returning the response is the commitment to a 2xx, so per-part failures are
+  reported as attributes on their own flow file. Note the format constraint:
+  `write` declares a part's size before reading it, so only failures found
+  *before* a part is written can be reported that way — buffer a part
+  (`write_bytes`) to vouch for its content. `tests/unpack.rs` covers both
+  against a real `.tar.gz`.
+
 ### May be later
 - [ ] Fuzzing (`cargo-fuzz`) and property-based round-trip tests for the
   parser; interop tests against files produced by a real NiFi instance.
