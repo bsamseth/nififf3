@@ -1,0 +1,5 @@
+# Product and format names, not code identifiers: "NiFi" and "FlowFile V3"
+# read as prose, so `doc_markdown` should not ask for backticks around them.
+# Java class names (`FlowFilePackagerV3`, `MergeContent`) are identifiers and
+# stay backticked. `..` keeps clippy's own default list.
+doc-valid-idents = ["NiFi", "FlowFile", "FlowFiles", ".."]

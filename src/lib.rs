@@ -56,6 +56,7 @@ pub struct FlowFile<R> {
 
 impl FlowFile<()> {
     /// Start building a flow file. See [`FlowFileBuilder`].
+    #[must_use]
     pub fn builder() -> FlowFileBuilder {
         FlowFileBuilder::new()
     }
@@ -220,6 +221,12 @@ impl FlowFile<Vec<u8>> {
     /// assert_eq!(flow_file.attributes()["filename"], "greeting.txt");
     /// assert_eq!(flow_file.content().as_slice(), b"hello");
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidMagic`] or [`Error::InvalidAttribute`] for a malformed
+    /// header, [`Error::SizeMismatch`] if fewer content bytes are present than
+    /// the header declares, and [`Error::TrailingData`] if more.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = bytes;
         let (attributes, size) = sync::parse_header(&mut reader, None, &Limits::UNLIMITED)?;
@@ -245,6 +252,7 @@ impl FlowFile<Vec<u8>> {
     /// assert!(bytes.starts_with(b"NiFiFF3"));
     /// assert!(bytes.ends_with(b"hi"));
     /// ```
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = format::encode_header(&self.attributes, self.content.len() as u64);
         buf.extend_from_slice(&self.content);

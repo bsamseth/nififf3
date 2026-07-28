@@ -372,9 +372,10 @@ impl FlowFilesResponse {
     ///
     /// assert!(response.headers().contains_key(header::CONTENT_LENGTH));
     /// ```
+    #[must_use]
     pub fn from_vec(parts: Vec<FlowFile<Vec<u8>>>) -> Self {
         let mut bytes = Vec::new();
-        for part in &parts {
+        for part in parts {
             bytes.extend_from_slice(&part.to_bytes());
         }
         Self {
@@ -386,6 +387,7 @@ impl FlowFilesResponse {
     /// Set how many serialized bytes may be in flight between the producer
     /// and the socket. Defaults to 64 KiB; ignored by
     /// [`from_vec`](Self::from_vec).
+    #[must_use]
     pub fn buffer_size(mut self, bytes: usize) -> Self {
         self.buffer_size = bytes;
         self

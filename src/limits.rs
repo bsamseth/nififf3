@@ -38,17 +38,20 @@ impl Limits {
 
     /// The default limits: at most 4096 attributes, each key and value at
     /// most 1 MiB.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the maximum number of attributes.
+    #[must_use]
     pub fn max_attributes(mut self, limit: usize) -> Self {
         self.max_attributes = Some(limit);
         self
     }
 
     /// Set the maximum byte length of each attribute key and value.
+    #[must_use]
     pub fn max_attribute_len(mut self, limit: usize) -> Self {
         self.max_attribute_len = Some(limit);
         self

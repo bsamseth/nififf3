@@ -91,6 +91,7 @@ impl Fragments {
 
     /// Use `identifier` instead of the randomly generated fragment
     /// identifier.
+    #[must_use]
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = identifier.into();
         self
@@ -98,6 +99,7 @@ impl Fragments {
 
     /// Record the total number of fragments, enabling the
     /// [`fragment.count`](attr::FRAGMENT_COUNT) attribute.
+    #[must_use]
     pub fn with_count(mut self, count: u64) -> Self {
         self.count = Some(count);
         self
@@ -105,6 +107,7 @@ impl Fragments {
 
     /// Use `filename` as the original filename instead of the parent's
     /// [`filename`](attr::FILENAME) attribute.
+    #[must_use]
     pub fn with_original_filename(mut self, filename: impl Into<String>) -> Self {
         self.original_filename = Some(filename.into());
         self
@@ -112,6 +115,7 @@ impl Fragments {
 
     /// Write the fragment identifier under `key` instead of
     /// [`fragment.identifier`](attr::FRAGMENT_ID).
+    #[must_use]
     pub fn identifier_attribute(mut self, key: impl Into<String>) -> Self {
         self.keys.identifier = key.into();
         self
@@ -119,6 +123,7 @@ impl Fragments {
 
     /// Write the fragment index under `key` instead of
     /// [`fragment.index`](attr::FRAGMENT_INDEX).
+    #[must_use]
     pub fn index_attribute(mut self, key: impl Into<String>) -> Self {
         self.keys.index = key.into();
         self
@@ -126,6 +131,7 @@ impl Fragments {
 
     /// Write the fragment count under `key` instead of
     /// [`fragment.count`](attr::FRAGMENT_COUNT).
+    #[must_use]
     pub fn count_attribute(mut self, key: impl Into<String>) -> Self {
         self.keys.count = key.into();
         self
@@ -133,18 +139,21 @@ impl Fragments {
 
     /// Write the original filename under `key` instead of
     /// [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME).
+    #[must_use]
     pub fn original_filename_attribute(mut self, key: impl Into<String>) -> Self {
         self.keys.original_filename = key.into();
         self
     }
 
     /// The identifier shared by every fragment in this set.
+    #[must_use]
     pub fn identifier(&self) -> &str {
         &self.identifier
     }
 
     /// The number of fragments produced so far, which is also the
     /// [`fragment.index`](attr::FRAGMENT_INDEX) of the most recent one.
+    #[must_use]
     pub fn produced(&self) -> u64 {
         self.index
     }
@@ -155,7 +164,11 @@ impl Fragments {
     /// there win over the inherited and fragment ones, and
     /// [`without_attribute`](FlowFileBuilder::without_attribute) drops any of
     /// them.
-    #[allow(clippy::should_implement_trait)]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "`Iterator` would have to yield builders forever, with no way \
+                  to stop; `parts.next()` is still the right name at the call site"
+    )]
     pub fn next(&mut self) -> FlowFileBuilder {
         self.index += 1;
         let mut builder = FlowFileBuilder::new()

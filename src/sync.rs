@@ -94,6 +94,13 @@ impl<R: Read> FlowFile<io::Take<R>> {
     /// assert_eq!(flow_file.content().as_slice(), b"hello");
     /// ```
     ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidMagic`] if the input does not begin with `NiFiFF3`,
+    /// [`Error::InvalidAttribute`] for an attribute that is not UTF-8, or
+    /// [`Error::Io`] if the header ends early. Nothing here depends on the
+    /// content, which has not been read yet.
+    ///
     /// [`size`]: FlowFile::size
     pub fn parse(reader: R) -> Result<Self> {
         Self::parse_with_limits(reader, &Limits::UNLIMITED)
@@ -102,6 +109,11 @@ impl<R: Read> FlowFile<io::Take<R>> {
     /// Like [`parse`](Self::parse), but enforcing [`Limits`] on the header.
     ///
     /// Use this for untrusted input; see [`Limits`] for the threat model.
+    ///
+    /// # Errors
+    ///
+    /// As [`parse`](Self::parse), plus [`Error::TooManyAttributes`] or
+    /// [`Error::AttributeTooLong`] when the header exceeds `limits`.
     pub fn parse_with_limits(mut reader: R, limits: &Limits) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None, limits)?;
         Ok(FlowFile::from_raw_parts(
@@ -133,19 +145,30 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// }
     /// assert_eq!(count, 2);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::parse`]. Note that a stream ending part-way through a
+    /// header is [`Error::Io`], not `Ok(None)` — only a clean boundary ends
+    /// the iteration.
     pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
         Self::parse_next_with_limits(reader, &Limits::UNLIMITED)
     }
 
     /// Like [`parse_next`](Self::parse_next), but enforcing [`Limits`] on
     /// the header. Use this for untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// As [`parse_next`](Self::parse_next), plus [`Error::TooManyAttributes`]
+    /// or [`Error::AttributeTooLong`] when a header exceeds `limits`.
     pub fn parse_next_with_limits(reader: &'r mut R, limits: &Limits) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
             match reader.read(&mut first) {
                 Ok(0) => return Ok(None),
                 Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {} // retry
                 Err(e) => return Err(e.into()),
             }
         }
@@ -162,9 +185,7 @@ impl<R: Read> FlowFile<R> {
     /// Serialize the flow file to a writer, reading exactly [`size`] bytes
     /// from the content reader.
     ///
-    /// Returns the number of content bytes copied. If the content reader
-    /// ends before `size` bytes were read, an [`Error::SizeMismatch`] is
-    /// returned (with the writer left partially written).
+    /// Returns the number of content bytes copied.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -176,6 +197,12 @@ impl<R: Read> FlowFile<R> {
     /// flow_file.write_to(&mut out).unwrap();
     /// assert_eq!(FlowFile::from_bytes(&out).unwrap().size(), 5);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SizeMismatch`] if the content reader ends before `size` bytes,
+    /// or [`Error::Io`] from the writer. Either way the header — and whatever
+    /// content was copied before the failure — has already been written.
     ///
     /// [`size`]: FlowFile::size
     pub fn write_to<W: Write>(&mut self, writer: &mut W) -> Result<u64> {
@@ -193,6 +220,11 @@ impl<R: Read> FlowFile<R> {
     /// Read the content to completion, producing an in-memory flow file.
     ///
     /// Validates that exactly [`size`] bytes of content were available.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SizeMismatch`] if the content was truncated, or [`Error::Io`]
+    /// from the reader.
     ///
     /// [`size`]: FlowFile::size
     pub fn into_bytes(mut self) -> Result<FlowFile<Vec<u8>>> {
@@ -315,10 +347,12 @@ impl<W: Write> FlowFilesWriter<W> {
     /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
     /// from its content reader. Returns the number of content bytes copied.
     ///
-    /// A content reader that ends early is an [`Error::SizeMismatch`], by
-    /// which point a truncated flow file has already been written. Use
-    /// [`write_bytes`](Self::write_bytes) for content whose length must be
-    /// verified before anything is committed.
+    /// # Errors
+    ///
+    /// [`Error::SizeMismatch`] if the content reader ends early, by which
+    /// point a truncated flow file has already been written, or [`Error::Io`]
+    /// from the writer. Use [`write_bytes`](Self::write_bytes) for content
+    /// whose length must be verified before anything is committed.
     pub fn write<R: Read>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
         let copied = flow_file.write_to(&mut self.writer)?;
         self.count += 1;
@@ -326,6 +360,10 @@ impl<W: Write> FlowFilesWriter<W> {
     }
 
     /// Append an in-memory flow file, whose size is known to be correct.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] from the writer.
     pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> Result<u64> {
         self.writer.write_all(&flow_file.to_bytes())?;
         self.count += 1;

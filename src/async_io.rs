@@ -96,12 +96,20 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// assert_eq!(flow_file.content().as_slice(), b"hello");
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::parse`].
     pub async fn parse_async(reader: R) -> Result<Self> {
         Self::parse_async_with_limits(reader, &Limits::UNLIMITED).await
     }
 
     /// Like [`parse_async`](Self::parse_async), but enforcing [`Limits`] on
     /// the header. Use this for untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::parse_with_limits`].
     pub async fn parse_async_with_limits(mut reader: R, limits: &Limits) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None, limits).await?;
         Ok(FlowFile::from_raw_parts(
@@ -136,12 +144,20 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// assert_eq!(count, 2);
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::parse_next`].
     pub async fn parse_next_async(reader: &'r mut R) -> Result<Option<Self>> {
         Self::parse_next_async_with_limits(reader, &Limits::UNLIMITED).await
     }
 
     /// Like [`parse_next_async`](Self::parse_next_async), but enforcing
     /// [`Limits`] on the header. Use this for untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::parse_next_with_limits`].
     pub async fn parse_next_async_with_limits(
         reader: &'r mut R,
         limits: &Limits,
@@ -151,7 +167,7 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
             match reader.read(&mut first).await {
                 Ok(0) => return Ok(None),
                 Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} // retry
                 Err(e) => return Err(e.into()),
             }
         }
@@ -265,11 +281,14 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
     /// from its content reader. Returns the number of content bytes copied.
     ///
-    /// The content is never buffered, so a part may be arbitrarily large. A
-    /// reader that ends early is an [`Error::SizeMismatch`], by which point a
-    /// truncated flow file has already been written; use
-    /// [`write_bytes`](Self::write_bytes) for content whose length must be
-    /// verified before anything is committed.
+    /// The content is never buffered, so a part may be arbitrarily large.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SizeMismatch`] if the content reader ends early, by which
+    /// point a truncated flow file has already been written, or [`Error::Io`]
+    /// from the writer. Use [`write_bytes`](Self::write_bytes) for content
+    /// whose length must be verified before anything is committed.
     pub async fn write<R: AsyncRead + Unpin>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
         let copied = flow_file.write_to_async(&mut self.writer).await?;
         self.count += 1;
@@ -277,6 +296,10 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     }
 
     /// Append an in-memory flow file, whose size is known to be correct.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] from the writer.
     pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> Result<u64> {
         self.writer.write_all(&flow_file.to_bytes()).await?;
         self.count += 1;
@@ -316,6 +339,10 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// assert_eq!(FlowFile::from_bytes(&out).unwrap().size(), 5);
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::write_to`].
     pub async fn write_to_async<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<u64> {
         writer.write_all(&self.header_bytes()).await?;
         let copied = tokio::io::copy(&mut (&mut self.content).take(self.size), writer).await?;
@@ -330,6 +357,10 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
 
     /// Async version of [`FlowFile::into_bytes`]: reads the content to
     /// completion and validates its length against the declared size.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::into_bytes`].
     pub async fn into_bytes_async(mut self) -> Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = (&mut self.content)

@@ -21,17 +21,20 @@ pub struct FlowFileBuilder {
 
 impl FlowFileBuilder {
     /// Create an empty builder. Equivalent to [`FlowFile::builder`].
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add a single attribute, replacing any previous value for the key.
+    #[must_use]
     pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.attributes.insert(key.into(), value.into());
         self
     }
 
     /// Add all attributes from an iterator of key-value pairs.
+    #[must_use]
     pub fn attributes<K, V>(mut self, attributes: impl IntoIterator<Item = (K, V)>) -> Self
     where
         K: Into<String>,
@@ -58,6 +61,7 @@ impl FlowFileBuilder {
     /// let child = parent.derive().without_attribute("filename").content(Vec::new());
     /// assert!(!child.attributes().contains_key("filename"));
     /// ```
+    #[must_use]
     pub fn without_attribute(mut self, key: &str) -> Self {
         self.attributes.remove(key);
         self
@@ -104,6 +108,10 @@ impl FlowFileBuilder {
     /// let flow_file = FlowFile::builder().buffered(reader).unwrap();
     /// assert_eq!(flow_file.size(), 28);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Any error from reading `content` to the end.
     pub fn buffered(self, mut content: impl std::io::Read) -> std::io::Result<FlowFile<Vec<u8>>> {
         let mut buf = Vec::new();
         content.read_to_end(&mut buf)?;
@@ -126,6 +134,11 @@ impl FlowFileBuilder {
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Any error from creating the temporary file, or from copying `content`
+    /// into it.
     #[cfg(feature = "tempfile")]
     pub fn tempfile(
         self,
@@ -157,6 +170,11 @@ impl FlowFileBuilder {
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Any error from copying `content` into the spool, including creating
+    /// the temporary file once `max_memory` is exceeded.
     #[cfg(feature = "tempfile")]
     pub fn spooled(
         self,
@@ -183,6 +201,10 @@ impl FlowFileBuilder {
     /// assert_eq!(flow_file.size(), 5);
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Any error from reading `content` to the end.
     #[cfg(feature = "tokio")]
     pub async fn buffered_async(
         self,
@@ -207,6 +229,11 @@ impl FlowFileBuilder {
     /// assert_eq!(flow_file.size(), 15);
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Any error from creating the temporary file, or from copying `content`
+    /// into it.
     #[cfg(all(feature = "tokio", feature = "tempfile"))]
     pub async fn tempfile_async(
         self,

@@ -18,8 +18,10 @@ pub(crate) const MAGIC: [u8; 7] = *b"NiFiFF3";
 pub(crate) const MAX_VALUE_2_BYTES: usize = 0xFFFF;
 
 pub(crate) fn write_field_len(buf: &mut Vec<u8>, len: usize) {
-    if len < MAX_VALUE_2_BYTES {
-        buf.extend_from_slice(&(len as u16).to_be_bytes());
+    if let Ok(short) = u16::try_from(len)
+        && len < MAX_VALUE_2_BYTES
+    {
+        buf.extend_from_slice(&short.to_be_bytes());
     } else {
         let len = u32::try_from(len).expect("field length exceeds u32::MAX");
         buf.extend_from_slice(&[0xFF, 0xFF]);

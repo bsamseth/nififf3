@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 [package.metadata.docs.rs]
 all-features = true
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
 [features]
 default = []
 tokio = ["dep:tokio"]
