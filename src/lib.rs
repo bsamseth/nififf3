@@ -30,7 +30,7 @@ pub use async_io::{FlowFilesAsync, FlowFilesWriterAsync};
 
 #[cfg(feature = "axum")]
 pub use axum_support::{
-    BlockingResponseSink, FlowFileBody, FlowFileRequest, FlowFilesResponse, ResponseSink,
+    BlockingResponseSink, BoxError, FlowFileBody, FlowFileRequest, FlowFilesResponse, ResponseSink,
     StrictFlowFileRequest, StrictRejection,
 };
 

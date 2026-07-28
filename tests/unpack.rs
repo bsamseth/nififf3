@@ -7,6 +7,8 @@
 
 #![cfg(feature = "axum")]
 
+use std::io;
+
 use async_compression::tokio::bufread::GzipDecoder;
 use async_compression::tokio::write::GzipEncoder;
 use axum::body::Body;
@@ -377,7 +379,8 @@ async fn a_producer_error_truncates_the_body_rather_than_ending_it_cleanly() {
         writer
             .write_bytes(&FlowFile::builder().content(&b"delivered"[..]))
             .await?;
-        Err(Error::TrailingData(1))
+        // Any error will do; this one has nothing to do with flow files.
+        Err(io::Error::other("the source went away").into())
     })
     .into_response();
 
@@ -385,6 +388,37 @@ async fn a_producer_error_truncates_the_body_rather_than_ending_it_cleanly() {
     // The bytes written before the failure are still sent, but the body ends
     // in an error instead of a clean EOF.
     assert!(response.into_body().collect().await.is_err());
+}
+
+/// A producer mixes errors from its decoder, from plain I/O and from this
+/// crate. None of them should need converting to a common type by hand.
+#[tokio::test]
+async fn a_producer_may_mix_error_types_without_converting_them() {
+    fn parse_port(text: &str) -> Result<u16, std::num::ParseIntError> {
+        text.parse()
+    }
+
+    let response = FlowFilesResponse::new(|mut writer| async move {
+        let port = parse_port("8443")?; // ParseIntError
+        std::str::from_utf8(b"ok")?; // Utf8Error
+        io::Result::Ok(())?; // io::Error
+        let parent = FlowFile::from_bytes(&parent_flow_file(Vec::new()))?; // nififf3::Error
+
+        writer
+            .write_bytes(
+                &parent
+                    .derive()
+                    .attribute("port", port.to_string())
+                    .content(Vec::new()),
+            )
+            .await?; // nififf3::Error
+        Ok(())
+    })
+    .into_response();
+
+    let parts = collect(response).await;
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].attributes()["port"], "8443");
 }
 
 #[tokio::test]

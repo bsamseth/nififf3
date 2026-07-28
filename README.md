@@ -254,6 +254,10 @@ async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
 }
 ```
 
+The producer reports failure as a boxed error, so `?` works directly on
+whatever the decoder, plain I/O or this crate hands back — no converting
+between error types to satisfy the signature.
+
 Returning the response is the commitment to a 2xx, so validate before it and
 report a problem with an individual part *as a part* — a flow file whose
 attributes say what went wrong — leaving the good parts to arrive. The type's

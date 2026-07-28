@@ -208,11 +208,21 @@ impl IntoResponse for Error {
 /// before writes start waiting.
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 
-type BoxFuture = Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>;
+/// Any error, boxed: what a [`FlowFilesResponse`] producer reports failure
+/// with.
+///
+/// The same alias as [`axum::BoxError`], and the same type the response body
+/// would erase a producer's error to in any case. Because every
+/// `std::error::Error` converts into it, a producer can use `?` on whatever
+/// its decoder, its I/O or this crate hands it without converting between
+/// error types first.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+type BoxFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
 
 enum Source {
     Producer(Box<dyn FnOnce(FlowFilesWriterAsync<ResponseSink>) -> BoxFuture + Send>),
-    Blocking(Box<dyn FnOnce(FlowFilesWriter<BlockingResponseSink>) -> crate::Result<()> + Send>),
+    Blocking(Box<dyn FnOnce(FlowFilesWriter<BlockingResponseSink>) -> Result<(), BoxError> + Send>),
     Bytes(Vec<u8>),
 }
 
@@ -268,6 +278,12 @@ impl FlowFilesResponse {
     /// a slow client applies backpressure instead of filling memory, and
     /// writing a part from a reader never buffers its content.
     ///
+    /// Failure is reported as a [`BoxError`], so `?` works directly on
+    /// whatever a decoder, plain I/O or this crate returns — a producer never
+    /// has to convert between error types to satisfy this signature. A
+    /// producer that already has its own error type can adapt with
+    /// `.map_err(Into::into)`.
+    ///
     /// ```
     /// use axum::response::IntoResponse;
     /// use http_body_util::BodyExt;
@@ -303,7 +319,7 @@ impl FlowFilesResponse {
     pub fn new<F, Fut>(producer: F) -> Self
     where
         F: FnOnce(FlowFilesWriterAsync<ResponseSink>) -> Fut + Send + 'static,
-        Fut: Future<Output = crate::Result<()>> + Send + 'static,
+        Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     {
         Self {
             source: Source::Producer(Box::new(move |writer| Box::pin(producer(writer)))),
@@ -324,7 +340,7 @@ impl FlowFilesResponse {
     /// decoder.
     pub fn blocking<F>(producer: F) -> Self
     where
-        F: FnOnce(FlowFilesWriter<BlockingResponseSink>) -> crate::Result<()> + Send + 'static,
+        F: FnOnce(FlowFilesWriter<BlockingResponseSink>) -> Result<(), BoxError> + Send + 'static,
     {
         Self {
             source: Source::Blocking(Box::new(producer)),
@@ -334,17 +350,19 @@ impl FlowFilesResponse {
 
     /// Stream flow files from a [`Stream`] of in-memory parts.
     ///
-    /// A convenience for producers that already yield whole flow files. A
-    /// `Stream` error ends the response the same way an error from
-    /// [`new`](Self::new)'s producer does.
-    pub fn from_stream<S>(parts: S) -> Self
+    /// A convenience for producers that already yield whole flow files. The
+    /// stream's error type is free — it only has to convert into a
+    /// [`BoxError`] — and a `Stream` error ends the response the same way an
+    /// error from [`new`](Self::new)'s producer does.
+    pub fn from_stream<S, E>(parts: S) -> Self
     where
-        S: Stream<Item = crate::Result<FlowFile<Vec<u8>>>> + Send + 'static,
+        S: Stream<Item = Result<FlowFile<Vec<u8>>, E>> + Send + 'static,
+        E: Into<BoxError> + Send,
     {
         Self::new(move |mut writer| async move {
             let mut parts = Box::pin(parts);
             while let Some(part) = std::future::poll_fn(|cx| parts.as_mut().poll_next(cx)).await {
-                writer.write_bytes(&part?).await?;
+                writer.write_bytes(&part.map_err(Into::into)?).await?;
             }
             Ok(())
         })
@@ -427,7 +445,7 @@ impl IntoResponse for FlowFilesResponse {
     }
 }
 
-fn streamed(body: DuplexStream, producer: JoinHandle<crate::Result<()>>) -> Response {
+fn streamed(body: DuplexStream, producer: JoinHandle<Result<(), BoxError>>) -> Response {
     let stream = ProducerStream {
         inner: ReaderStream::new(body),
         producer: Some(producer),
@@ -447,11 +465,11 @@ fn streamed(body: DuplexStream, producer: JoinHandle<crate::Result<()>>) -> Resp
 /// so that the client sees a truncated body rather than a plausible one.
 struct ProducerStream {
     inner: ReaderStream<DuplexStream>,
-    producer: Option<JoinHandle<crate::Result<()>>>,
+    producer: Option<JoinHandle<Result<(), BoxError>>>,
 }
 
 impl Stream for ProducerStream {
-    type Item = crate::Result<Bytes>;
+    type Item = Result<Bytes, BoxError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -470,7 +488,7 @@ impl Stream for ProducerStream {
                 Poll::Ready(match outcome {
                     Ok(Ok(())) => None,
                     Ok(Err(err)) => Some(Err(err)),
-                    Err(join) => Some(Err(io::Error::other(join).into())),
+                    Err(join) => Some(Err(join.into())),
                 })
             }
         }
