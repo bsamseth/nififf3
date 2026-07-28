@@ -123,6 +123,13 @@ big-endian. Multiple flow files may be concatenated back-to-back in one stream.
   output, so running it is the check; `cargo test` compiles them all, but only
   CI running them would catch a behaviour change.
 
+- [x] Narrow error types: only the parsing entry points return `Error`;
+  `write_to`/`into_bytes`/the writers and their async twins return
+  `io::Result`, since after the header is parsed nothing else can be
+  malformed. Truncated content is `UnexpectedEof` carrying an
+  `Error::SizeMismatch`, so the detail survives a `downcast_ref`.
+  `FlowFilesResponse` producers report failure as a `BoxError`.
+
 ### May be later
 - [ ] Fuzzing (`cargo-fuzz`) and property-based round-trip tests for the
   parser; interop tests against files produced by a real NiFi instance.

@@ -1,3 +1,12 @@
+/// The content ran out before the declared size, as an [`std::io::Error`]
+/// carrying the structured [`Error::SizeMismatch`] as its payload.
+pub(crate) fn truncated(expected: u64, actual: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        Error::SizeMismatch { expected, actual },
+    )
+}
+
 /// Errors produced when parsing or serializing flow files.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -16,6 +25,14 @@ pub enum Error {
     InvalidAttribute(#[from] std::string::FromUtf8Error),
 
     /// The content length does not match the size declared in the header.
+    ///
+    /// Returned directly by [`FlowFile::from_bytes`](crate::FlowFile::from_bytes),
+    /// which validates a whole buffer. The operations that merely move content
+    /// around — `write_to`, `into_bytes` and their async twins — report the
+    /// same condition as an [`std::io::Error`] of kind
+    /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying this
+    /// value, so it can still be recovered with
+    /// [`io::Error::get_ref`](std::io::Error::get_ref) and `downcast_ref`.
     #[error("content size mismatch: header declares {expected} bytes, got {actual}")]
     SizeMismatch {
         /// The content size declared in the flow file header.

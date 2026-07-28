@@ -132,6 +132,13 @@ Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
 `FlowFilesWriter` (or `FlowFilesWriterAsync`), the counterpart to the
 `FlowFiles` reader.
 
+Parsing is the only thing that produces this crate's `Error`. Everything that
+just moves bytes — `write_to`, `into_bytes`, the writers, and their async
+twins — returns `std::io::Result`, so handling them does not mean matching on
+flow-file failures that cannot occur. Content that ends before its declared
+size is `ErrorKind::UnexpectedEof` carrying an `Error::SizeMismatch`, which
+`io::Error::get_ref` and `downcast_ref` recover if the detail is wanted.
+
 ## Deriving flow files from flow files
 
 `derive` starts a builder carrying another flow file's attributes, which is

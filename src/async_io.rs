@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::format::{MAGIC, MAX_VALUE_2_BYTES};
 use crate::{Error, FlowFile, Limits, Result};
 
-async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> Result<usize> {
+async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<usize> {
     let mut buf = [0u8; 2];
     reader.read_exact(&mut buf).await?;
     let len = u16::from_be_bytes(buf) as usize;
@@ -233,12 +233,13 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         if self.done {
             return None;
         }
-        let result =
-            match FlowFile::parse_next_async_with_limits(&mut self.reader, &self.limits).await {
-                Ok(None) => None,
-                Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await),
-                Err(err) => Some(Err(err)),
-            };
+        let result = match FlowFile::parse_next_async_with_limits(&mut self.reader, &self.limits)
+            .await
+        {
+            Ok(None) => None,
+            Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await.map_err(Error::from)),
+            Err(err) => Some(Err(err)),
+        };
         if !matches!(result, Some(Ok(_))) {
             self.done = true;
         }
@@ -285,11 +286,14 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// # Errors
     ///
-    /// [`Error::SizeMismatch`] if the content reader ends early, by which
-    /// point a truncated flow file has already been written, or [`Error::Io`]
-    /// from the writer. Use [`write_bytes`](Self::write_bytes) for content
-    /// whose length must be verified before anything is committed.
-    pub async fn write<R: AsyncRead + Unpin>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
+    /// As [`FlowFile::write_to_async`]: a content reader that ends early
+    /// leaves a truncated flow file behind. Use
+    /// [`write_bytes`](Self::write_bytes) for content whose length must be
+    /// verified before anything is committed.
+    pub async fn write<R: AsyncRead + Unpin>(
+        &mut self,
+        mut flow_file: FlowFile<R>,
+    ) -> std::io::Result<u64> {
         let copied = flow_file.write_to_async(&mut self.writer).await?;
         self.count += 1;
         Ok(copied)
@@ -299,8 +303,8 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] from the writer.
-    pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> Result<u64> {
+    /// Only whatever the writer returns.
+    pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> std::io::Result<u64> {
         self.writer.write_all(&flow_file.to_bytes()).await?;
         self.count += 1;
         Ok(flow_file.size)
@@ -343,14 +347,14 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`FlowFile::write_to`].
-    pub async fn write_to_async<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<u64> {
+    pub async fn write_to_async<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<u64> {
         writer.write_all(&self.header_bytes()).await?;
         let copied = tokio::io::copy(&mut (&mut self.content).take(self.size), writer).await?;
         if copied != self.size {
-            return Err(Error::SizeMismatch {
-                expected: self.size,
-                actual: copied,
-            });
+            return Err(crate::error::truncated(self.size, copied));
         }
         Ok(copied)
     }
@@ -361,17 +365,14 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`FlowFile::into_bytes`].
-    pub async fn into_bytes_async(mut self) -> Result<FlowFile<Vec<u8>>> {
+    pub async fn into_bytes_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = (&mut self.content)
             .take(self.size)
             .read_to_end(&mut content)
             .await? as u64;
         if read != self.size {
-            return Err(Error::SizeMismatch {
-                expected: self.size,
-                actual: read,
-            });
+            return Err(crate::error::truncated(self.size, read));
         }
         Ok(FlowFile::from_raw_parts(
             self.size,
@@ -446,9 +447,11 @@ mod tests {
         let bytes = sample().to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
         let parsed = FlowFile::parse_async(truncated).await.unwrap();
+        let err = parsed.into_bytes_async().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(matches!(
-            parsed.into_bytes_async().await,
-            Err(Error::SizeMismatch {
+            err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+            Some(Error::SizeMismatch {
                 expected: 5,
                 actual: 3
             })

@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use crate::format::{MAGIC, MAX_VALUE_2_BYTES};
 use crate::{Error, FlowFile, Limits, Result};
 
-fn read_field_len(reader: &mut impl Read) -> Result<usize> {
+fn read_field_len(reader: &mut impl Read) -> io::Result<usize> {
     let mut buf = [0u8; 2];
     reader.read_exact(&mut buf)?;
     let len = u16::from_be_bytes(buf) as usize;
@@ -200,19 +200,19 @@ impl<R: Read> FlowFile<R> {
     ///
     /// # Errors
     ///
-    /// [`Error::SizeMismatch`] if the content reader ends before `size` bytes,
-    /// or [`Error::Io`] from the writer. Either way the header — and whatever
-    /// content was copied before the failure — has already been written.
+    /// Only I/O: nothing here inspects the flow file's structure. A content
+    /// reader that ends before `size` bytes is
+    /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
+    /// [`Error::SizeMismatch`]; anything else comes from the writer. Either
+    /// way the header — and whatever content was copied before the failure —
+    /// has already been written.
     ///
     /// [`size`]: FlowFile::size
-    pub fn write_to<W: Write>(&mut self, writer: &mut W) -> Result<u64> {
+    pub fn write_to<W: Write>(&mut self, writer: &mut W) -> io::Result<u64> {
         writer.write_all(&self.header_bytes())?;
         let copied = io::copy(&mut (&mut self.content).take(self.size), writer)?;
         if copied != self.size {
-            return Err(Error::SizeMismatch {
-                expected: self.size,
-                actual: copied,
-            });
+            return Err(crate::error::truncated(self.size, copied));
         }
         Ok(copied)
     }
@@ -223,20 +223,19 @@ impl<R: Read> FlowFile<R> {
     ///
     /// # Errors
     ///
-    /// [`Error::SizeMismatch`] if the content was truncated, or [`Error::Io`]
-    /// from the reader.
+    /// Only I/O; the header was already validated by whatever produced this
+    /// flow file. Content that ends early is
+    /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
+    /// [`Error::SizeMismatch`].
     ///
     /// [`size`]: FlowFile::size
-    pub fn into_bytes(mut self) -> Result<FlowFile<Vec<u8>>> {
+    pub fn into_bytes(mut self) -> io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = (&mut self.content)
             .take(self.size)
             .read_to_end(&mut content)? as u64;
         if read != self.size {
-            return Err(Error::SizeMismatch {
-                expected: self.size,
-                actual: read,
-            });
+            return Err(crate::error::truncated(self.size, read));
         }
         Ok(FlowFile::from_raw_parts(
             self.size,
@@ -300,7 +299,7 @@ impl<R: Read> Iterator for FlowFiles<R> {
         }
         let result = match FlowFile::parse_next_with_limits(&mut self.reader, &self.limits) {
             Ok(None) => None,
-            Ok(Some(flow_file)) => Some(flow_file.into_bytes()),
+            Ok(Some(flow_file)) => Some(flow_file.into_bytes().map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {
@@ -349,11 +348,10 @@ impl<W: Write> FlowFilesWriter<W> {
     ///
     /// # Errors
     ///
-    /// [`Error::SizeMismatch`] if the content reader ends early, by which
-    /// point a truncated flow file has already been written, or [`Error::Io`]
-    /// from the writer. Use [`write_bytes`](Self::write_bytes) for content
-    /// whose length must be verified before anything is committed.
-    pub fn write<R: Read>(&mut self, mut flow_file: FlowFile<R>) -> Result<u64> {
+    /// As [`FlowFile::write_to`]: a content reader that ends early leaves a
+    /// truncated flow file behind. Use [`write_bytes`](Self::write_bytes) for
+    /// content whose length must be verified before anything is committed.
+    pub fn write<R: Read>(&mut self, mut flow_file: FlowFile<R>) -> io::Result<u64> {
         let copied = flow_file.write_to(&mut self.writer)?;
         self.count += 1;
         Ok(copied)
@@ -363,8 +361,8 @@ impl<W: Write> FlowFilesWriter<W> {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] from the writer.
-    pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> Result<u64> {
+    /// Only whatever the writer returns.
+    pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> io::Result<u64> {
         self.writer.write_all(&flow_file.to_bytes())?;
         self.count += 1;
         Ok(flow_file.size)
@@ -493,10 +491,14 @@ mod tests {
                 actual: 3
             })
         ));
+        // `into_bytes` parses nothing, so it reports the same condition as an
+        // io error — with the structured error still recoverable from it.
         let parsed = FlowFile::parse(truncated).unwrap();
+        let err = parsed.into_bytes().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(matches!(
-            parsed.into_bytes(),
-            Err(Error::SizeMismatch {
+            err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+            Some(Error::SizeMismatch {
                 expected: 5,
                 actual: 3
             })
