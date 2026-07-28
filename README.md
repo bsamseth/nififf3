@@ -87,6 +87,14 @@ let err = FlowFile::parse_with_limits(bytes.as_slice(), &limits).unwrap_err();
 assert!(matches!(err, Error::AttributeTooLong { .. }));
 ```
 
+`max_content_len` caps the content size a header may declare, failing with
+`Error::ContentTooLarge` before any content is read. It is off by default,
+because parsing streams the content rather than buffering it — set it when
+the caller will go on to `into_bytes` the result and would rather learn the
+size is unacceptable up front. It bounds what the header *claims*; bounding
+what actually arrives is the transport's job (over HTTP, axum's
+`DefaultBodyLimit` — see below).
+
 ## Creating flow files
 
 Flow files are created with a builder: add attributes, then supply the
@@ -128,16 +136,33 @@ let flow_file = FlowFile::builder().tempfile_async(reader).await?; // + `tokio`
 
 Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
 `write_to` for `std::io::Write`, and `write_to_async` for
-`tokio::io::AsyncWrite`. To write several flow files back-to-back, use
+`tokio::io::AsyncWrite`. The last two consume the flow file, since they leave
+its content reader exhausted. To write several flow files back-to-back, use
 `FlowFilesWriter` (or `FlowFilesWriterAsync`), the counterpart to the
 `FlowFiles` reader.
+
+A write that fails part-way leaves a truncated flow file in the stream, so the
+writers refuse everything after one, the way `FlowFiles` stops reading after an
+error. Appending to a stream that is mid-record would hide the problem rather
+than report it: the next flow file's header would be read back as the
+truncated one's content, yielding a plausible flow file with the wrong bytes.
+`is_poisoned` reports the state; `into_inner` still returns the writer, for
+discarding or truncating what was produced.
 
 Parsing is the only thing that produces this crate's `Error`. Everything that
 just moves bytes — `write_to`, `into_bytes`, the writers, and their async
 twins — returns `std::io::Result`, so handling them does not mean matching on
-flow-file failures that cannot occur. Content that ends before its declared
-size is `ErrorKind::UnexpectedEof` carrying an `Error::SizeMismatch`, which
-`io::Error::get_ref` and `downcast_ref` recover if the detail is wanted.
+flow-file failures that cannot occur. In those, content that ends before its
+declared size is `ErrorKind::UnexpectedEof` carrying an `Error::SizeMismatch`,
+which `io::Error::get_ref` and `downcast_ref` recover if the detail is wanted.
+Anything returning this crate's `Error` — `from_bytes`, `FlowFiles`,
+`FlowFilesAsync` — reports that case as `Error::SizeMismatch` directly.
+
+The declared `size()` is what every serializer writes and every reader-based
+operation consumes, and each of the constructors above keeps it in step with
+the content. `map_content` is the exception: it swaps the container while
+carrying the size across, so a transform that *changes* the length —
+decompressing, re-encoding — has to declare the new one with `with_size`.
 
 ## Deriving flow files from flow files
 
@@ -204,7 +229,6 @@ let flow_file = FlowFile::parse_async(file).await?;
 println!("{} bytes: {:?}", flow_file.size(), flow_file.attributes());
 
 // Stream the content somewhere without buffering it...
-let mut flow_file = flow_file;
 flow_file.write_to_async(&mut tokio::io::stdout()).await?;
 ```
 
@@ -213,7 +237,23 @@ flow_file.write_to_async(&mut tokio::io::stdout()).await?;
 Handlers can take a `FlowFileRequest` extractor, which parses the flow file
 header from the request body (applying `Limits::default()`, since request
 bodies are untrusted) and streams the content incrementally — arbitrarily
-large flow files never need to be in memory. `StrictFlowFileRequest`
+large flow files never need to be in memory.
+
+The body is read through axum's `DefaultBodyLimit`, as any other extractor's
+is, so it is capped at 2 MiB unless the router raises or disables it:
+
+```rust,ignore
+Router::new()
+    .route("/large", post(handler))
+    .layer(DefaultBodyLimit::disable()); // or ::max(bytes)
+```
+
+That cap is on the bytes the client actually sends, which is the only bound
+worth trusting — the size in the header is a claim, and `Limits` governs the
+header alone. Exceeding either is a `413 Payload Too Large`, keeping "too big"
+distinct from the `400` that a malformed flow file gets.
+
+`StrictFlowFileRequest`
 additionally rejects requests without a `application/flowfile-v3` content
 type with `415 Unsupported Media Type`. Flow files with
 `AsyncRead` content implement `IntoResponse` (streaming, with

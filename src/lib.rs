@@ -76,6 +76,13 @@ impl<R> FlowFile<R> {
     }
 
     /// The length of the content in bytes, as declared in the header.
+    ///
+    /// This is the single source of truth for how many content bytes every
+    /// serializer writes and every reader-based operation consumes. Every
+    /// constructor in this crate keeps it in step with the content; the one
+    /// way to break that is [`map_content`](Self::map_content) with a
+    /// function that changes the length, which is what
+    /// [`with_size`](Self::with_size) is for.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -95,6 +102,32 @@ impl<R> FlowFile<R> {
         &self.content
     }
 
+    /// Mutable access to the content container.
+    ///
+    /// The way to read a reader-backed flow file's content incrementally
+    /// while keeping the flow file — and so its attributes — around;
+    /// [`into_content`](Self::into_content) gives up the latter.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    /// use std::io::Read;
+    ///
+    /// let bytes = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..])
+    ///     .to_bytes();
+    ///
+    /// let mut flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
+    /// let mut head = [0u8; 2];
+    /// flow_file.content_mut().read_exact(&mut head).unwrap();
+    ///
+    /// assert_eq!(&head, b"he");
+    /// assert_eq!(flow_file.attributes()["filename"], "greeting.txt");
+    /// ```
+    pub fn content_mut(&mut self) -> &mut R {
+        &mut self.content
+    }
+
     /// Consume the flow file, returning the content container.
     pub fn into_content(self) -> R {
         self.content
@@ -107,8 +140,9 @@ impl<R> FlowFile<R> {
 
     /// Transform the content container, keeping size and attributes.
     ///
-    /// The declared [`size`](Self::size) is carried over unchanged, so the
-    /// new container should hold (or produce) the same content.
+    /// The declared [`size`](Self::size) is carried over unchanged, so `f`
+    /// must produce a container holding the same *number of bytes* — wrapping
+    /// one reader in another, as `Cursor::new` or `BufReader::new` do.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -117,12 +151,41 @@ impl<R> FlowFile<R> {
     /// let flow_file = flow_file.map_content(std::io::Cursor::new);
     /// assert_eq!(flow_file.size(), 2);
     /// ```
+    ///
+    /// For a transform that changes the length — a decoder, a decompressor —
+    /// chain [`with_size`](Self::with_size), since the format needs the new
+    /// size before it can write any of the new content:
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder().content(&b"hi"[..]);
+    /// let flow_file = flow_file
+    ///     .map_content(|content| content.repeat(3))
+    ///     .with_size(6);
+    /// assert_eq!(flow_file.size(), 6);
+    /// ```
+    #[must_use]
     pub fn map_content<T>(self, f: impl FnOnce(R) -> T) -> FlowFile<T> {
         FlowFile {
             size: self.size,
             attributes: self.attributes,
             content: f(self.content),
         }
+    }
+
+    /// Declare a different content [`size`](Self::size), keeping attributes
+    /// and content.
+    ///
+    /// Needed after a [`map_content`](Self::map_content) that changed the
+    /// content's length, and only then: everything else in this crate keeps
+    /// the size correct on its own. Declaring a size the content does not
+    /// match is how a flow file is corrupted, so `size` must be the exact
+    /// number of bytes the new container yields.
+    #[must_use]
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = size;
+        self
     }
 
     /// Start building a new flow file carrying this one's attributes.
@@ -228,8 +291,26 @@ impl FlowFile<Vec<u8>> {
     /// header, [`Error::SizeMismatch`] if fewer content bytes are present than
     /// the header declares, and [`Error::TrailingData`] if more.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_limits(bytes, &Limits::UNLIMITED)
+    }
+
+    /// Like [`from_bytes`](Self::from_bytes), but enforcing [`Limits`] on the
+    /// header. Use this for untrusted input.
+    ///
+    /// The buffer already bounds how much there is to read, so this matters
+    /// less here than for the streaming parsers — but a 1 KiB buffer can
+    /// still declare tens of thousands of attributes, and
+    /// [`max_content_len`](Limits::max_content_len) rejects an oversized
+    /// declared size without walking the header first.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_bytes`](Self::from_bytes), plus [`Error::TooManyAttributes`],
+    /// [`Error::AttributeTooLong`] or [`Error::ContentTooLarge`] when the
+    /// header exceeds `limits`.
+    pub fn from_bytes_with_limits(bytes: &[u8], limits: &Limits) -> Result<Self> {
         let mut reader = bytes;
-        let (attributes, size) = sync::parse_header(&mut reader, None, &Limits::UNLIMITED)?;
+        let (attributes, size) = sync::parse_header(&mut reader, None, limits)?;
         let actual = reader.len() as u64;
         if actual < size {
             return Err(Error::SizeMismatch {
@@ -245,6 +326,9 @@ impl FlowFile<Vec<u8>> {
 
     /// Serialize the flow file to the binary V3 format.
     ///
+    /// Declares [`size`](Self::size) bytes of content, the same value
+    /// [`write_to`](Self::write_to) would stream.
+    ///
     /// ```
     /// use nififf3::FlowFile;
     ///
@@ -252,9 +336,21 @@ impl FlowFile<Vec<u8>> {
     /// assert!(bytes.starts_with(b"NiFiFF3"));
     /// assert!(bytes.ends_with(b"hi"));
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if `size` disagrees with the content's actual length
+    /// — only reachable by breaking [`map_content`](Self::map_content)'s
+    /// contract. In release builds the mismatch is written out as declared,
+    /// where [`from_bytes`](Self::from_bytes) will reject it.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = format::encode_header(&self.attributes, self.content.len() as u64);
+        debug_assert_eq!(
+            self.size,
+            self.content.len() as u64,
+            "declared size does not match the content; see FlowFile::with_size"
+        );
+        let mut buf = format::encode_header(&self.attributes, self.size);
         buf.extend_from_slice(&self.content);
         buf
     }
@@ -268,11 +364,62 @@ impl FlowFile<Vec<u8>> {
     /// ```
     /// use nififf3::FlowFile;
     ///
-    /// let mut flow_file = FlowFile::builder().content(&b"hi"[..]).into_reader();
+    /// let flow_file = FlowFile::builder().content(&b"hi"[..]).into_reader();
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap(); // reader-based serialization
     /// ```
     pub fn into_reader(self) -> FlowFile<std::io::Cursor<Vec<u8>>> {
         self.map_content(std::io::Cursor::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A length-changing `map_content` needs `with_size`; once it has one,
+    /// every serializer agrees on how much content there is.
+    #[test]
+    fn with_size_keeps_the_serializers_in_step() {
+        let flow_file = FlowFile::builder()
+            .attribute("k", "v")
+            .content(&b"hi"[..])
+            .map_content(|content| content.repeat(3))
+            .with_size(6);
+
+        assert_eq!(flow_file.size(), 6);
+
+        let buffered = flow_file.to_bytes();
+        let mut streamed = Vec::new();
+        flow_file
+            .clone()
+            .into_reader()
+            .write_to(&mut streamed)
+            .unwrap();
+        assert_eq!(buffered, streamed);
+
+        let parsed = FlowFile::from_bytes(&buffered).unwrap();
+        assert_eq!(parsed.size(), 6);
+        assert_eq!(parsed.content().as_slice(), b"hihihi");
+    }
+
+    #[test]
+    fn to_bytes_declares_the_size_write_to_would_stream() {
+        let flow_file = FlowFile::builder().content(&b"hello"[..]);
+        let mut streamed = Vec::new();
+        flow_file
+            .clone()
+            .into_reader()
+            .write_to(&mut streamed)
+            .unwrap();
+        assert_eq!(flow_file.to_bytes(), streamed);
+    }
+
+    /// `map_content` is for containers that hold the same bytes, and carries
+    /// the size across untouched.
+    #[test]
+    fn map_content_preserves_the_size() {
+        let flow_file = FlowFile::builder().content(&b"hi"[..]);
+        assert_eq!(flow_file.map_content(std::io::Cursor::new).size(), 2);
     }
 }

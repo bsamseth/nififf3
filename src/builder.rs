@@ -87,7 +87,7 @@ impl FlowFileBuilder {
     /// use nififf3::FlowFile;
     ///
     /// let content = &b"hello"[..]; // any `impl Read`
-    /// let mut flow_file = FlowFile::builder().reader(content, 5);
+    /// let flow_file = FlowFile::builder().reader(content, 5);
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
     /// ```
@@ -129,7 +129,7 @@ impl FlowFileBuilder {
     /// use nififf3::FlowFile;
     ///
     /// let reader = &b"spooled to disk"[..];
-    /// let mut flow_file = FlowFile::builder().tempfile(reader).unwrap();
+    /// let flow_file = FlowFile::builder().tempfile(reader).unwrap();
     /// assert_eq!(flow_file.size(), 15);
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
@@ -165,7 +165,7 @@ impl FlowFileBuilder {
     /// use nififf3::FlowFile;
     ///
     /// let reader = &b"stays in memory"[..];
-    /// let mut flow_file = FlowFile::builder().spooled(reader, 64 * 1024).unwrap();
+    /// let flow_file = FlowFile::builder().spooled(reader, 64 * 1024).unwrap();
     /// assert_eq!(flow_file.size(), 15);
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
@@ -266,7 +266,7 @@ mod tests {
     #[cfg(feature = "tempfile")]
     #[test]
     fn tempfile_spools_content_and_sets_size() {
-        let mut flow_file = FlowFile::builder()
+        let flow_file = FlowFile::builder()
             .attribute("k", "v")
             .tempfile(&b"hello"[..])
             .unwrap();
@@ -287,7 +287,7 @@ mod tests {
         assert!(!small.content().is_rolled());
 
         let big_content = vec![7u8; 4096];
-        let mut big = FlowFile::builder()
+        let big = FlowFile::builder()
             .spooled(big_content.as_slice(), 1024)
             .unwrap();
         assert_eq!(big.size(), 4096);
@@ -313,7 +313,7 @@ mod tests {
     #[cfg(all(feature = "tokio", feature = "tempfile"))]
     #[tokio::test]
     async fn tempfile_async_spools_content_and_sets_size() {
-        let mut flow_file = FlowFile::builder()
+        let flow_file = FlowFile::builder()
             .attribute("k", "v")
             .tempfile_async(&b"hello"[..])
             .await

@@ -74,7 +74,13 @@ pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
     }
     let mut size = [0u8; 8];
     reader.read_exact(&mut size).await?;
-    Ok((attributes, u64::from_be_bytes(size)))
+    let size = u64::from_be_bytes(size);
+    if let Some(limit) = limits.max_content_len
+        && size > limit
+    {
+        return Err(Error::ContentTooLarge { size, limit });
+    }
+    Ok((attributes, size))
 }
 
 impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
@@ -187,6 +193,10 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
 /// call [`next`](Self::next) in a loop instead. After an error, `next` keeps
 /// returning `None`, since the stream position is no longer trustworthy.
 ///
+/// As with [`FlowFiles`](crate::FlowFiles), a content that ends before its
+/// declared size is reported as [`Error::SizeMismatch`] directly, not wrapped
+/// in [`Error::Io`].
+///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesAsync};
 ///
@@ -237,7 +247,12 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
             .await
         {
             Ok(None) => None,
-            Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await.map_err(Error::from)),
+            Ok(Some(flow_file)) => Some(
+                flow_file
+                    .into_bytes_async()
+                    .await
+                    .map_err(crate::error::unwrap_io),
+            ),
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {
@@ -249,6 +264,9 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
 
 /// Async equivalent of [`FlowFilesWriter`](crate::FlowFilesWriter): writes a
 /// stream of concatenated flow files to an [`AsyncWrite`].
+///
+/// As there, a failed write poisons the writer, since the stream is left
+/// mid-flow-file and appending to it would bury the failure.
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesAsync, FlowFilesWriterAsync};
@@ -271,12 +289,17 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
 pub struct FlowFilesWriterAsync<W> {
     writer: W,
     count: u64,
+    poisoned: bool,
 }
 
 impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// Write flow files to `writer`.
     pub fn new(writer: W) -> Self {
-        Self { writer, count: 0 }
+        Self {
+            writer,
+            count: 0,
+            poisoned: false,
+        }
     }
 
     /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
@@ -287,14 +310,16 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// # Errors
     ///
     /// As [`FlowFile::write_to_async`]: a content reader that ends early
-    /// leaves a truncated flow file behind. Use
+    /// leaves a truncated flow file behind, and poisons the writer. Use
     /// [`write_bytes`](Self::write_bytes) for content whose length must be
     /// verified before anything is committed.
     pub async fn write<R: AsyncRead + Unpin>(
         &mut self,
-        mut flow_file: FlowFile<R>,
+        flow_file: FlowFile<R>,
     ) -> std::io::Result<u64> {
-        let copied = flow_file.write_to_async(&mut self.writer).await?;
+        self.guard()?;
+        let result = flow_file.write_to_async(&mut self.writer).await;
+        let copied = self.poison_on_err(result)?;
         self.count += 1;
         Ok(copied)
     }
@@ -303,14 +328,39 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// # Errors
     ///
-    /// Only whatever the writer returns.
+    /// Whatever the writer returns — which, since it may have accepted part
+    /// of the flow file first, also poisons the writer.
     pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> std::io::Result<u64> {
-        self.writer.write_all(&flow_file.to_bytes()).await?;
+        self.guard()?;
+        let bytes = flow_file.to_bytes();
+        let result = self.writer.write_all(&bytes).await;
+        self.poison_on_err(result)?;
         self.count += 1;
         Ok(flow_file.size)
     }
 
-    /// The number of flow files written so far.
+    fn guard(&self) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(crate::error::poisoned());
+        }
+        Ok(())
+    }
+
+    fn poison_on_err<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Whether a write has failed, leaving the stream mid-flow-file. See
+    /// [`FlowFilesWriter::is_poisoned`](crate::FlowFilesWriter::is_poisoned).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// The number of flow files written so far, counting only the complete
+    /// ones.
     pub fn count(&self) -> u64 {
         self.count
     }
@@ -329,14 +379,15 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
 impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// Async version of [`FlowFile::write_to`]: serialize the flow file to a
     /// writer, reading exactly [`size`](FlowFile::size) bytes from the
-    /// content reader. Returns the number of content bytes copied.
+    /// content reader. Returns the number of content bytes copied, and
+    /// consumes the flow file for the same reason.
     ///
     /// ```
     /// use nififf3::FlowFile;
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let content = &b"hello"[..]; // any `impl AsyncRead + Unpin`
-    /// let mut flow_file = FlowFile::builder().reader(content, 5);
+    /// let flow_file = FlowFile::builder().reader(content, 5);
     ///
     /// let mut out = Vec::new();
     /// flow_file.write_to_async(&mut out).await.unwrap();
@@ -348,7 +399,7 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     ///
     /// As [`FlowFile::write_to`].
     pub async fn write_to_async<W: AsyncWrite + Unpin>(
-        &mut self,
+        mut self,
         writer: &mut W,
     ) -> std::io::Result<u64> {
         writer.write_all(&self.header_bytes()).await?;
@@ -440,6 +491,56 @@ mod tests {
             FlowFile::parse_async_with_limits(bytes.as_slice(), &limits).await,
             Err(Error::AttributeTooLong { limit: 8, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn async_limits_reject_an_oversized_declared_content_size() {
+        let bytes = sample().to_bytes();
+        let limits = Limits::default().max_content_len(4);
+
+        assert!(matches!(
+            FlowFile::parse_async_with_limits(bytes.as_slice(), &limits).await,
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_readers_report_truncation_as_a_size_mismatch() {
+        let bytes = sample().to_bytes();
+        let truncated = &bytes[..bytes.len() - 2];
+
+        let err = FlowFilesAsync::new(truncated).next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::SizeMismatch {
+                    expected: 5,
+                    actual: 3
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_poisons_the_async_writer() {
+        // Declares 10 bytes but the reader holds 6, so the write truncates.
+        let mut out = Vec::new();
+        let mut writer = FlowFilesWriterAsync::new(&mut out);
+
+        let err = writer
+            .write(FlowFile::builder().reader(&b"short"[..], 10))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(writer.is_poisoned());
+
+        let err = writer
+            .write_bytes(&FlowFile::builder().content(&b"ok"[..]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"));
+        assert_eq!(writer.count(), 0);
     }
 
     #[tokio::test]

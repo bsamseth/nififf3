@@ -40,8 +40,10 @@ impl Default for Keys {
 /// - [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) — the
 ///   parent's [`filename`](attr::FILENAME), if it had one.
 ///
-/// Fragment attributes on the parent are dropped rather than inherited, since
-/// a new split supersedes the old one.
+/// All four are dropped from the inherited attributes rather than carried
+/// over, since a new split supersedes the old one — including
+/// `segment.original.filename`, so that a parent with no `filename` of its
+/// own yields parts with no original filename rather than a grandparent's.
 ///
 /// ```
 /// use nififf3::FlowFile;
@@ -74,9 +76,17 @@ impl Fragments {
     pub(crate) fn new(attributes: &HashMap<String, String>) -> Self {
         let keys = Keys::default();
         let original_filename = attributes.get(attr::FILENAME).cloned();
-        // A fresh split supersedes any the parent was itself part of.
+        // A fresh split supersedes any the parent was itself part of. The
+        // original filename goes too: it names *this* parent, and is set from
+        // the parent's own `filename` below, so a value inherited from a
+        // grandparent would otherwise outlive the split that produced it.
         let mut attributes = attributes.clone();
-        for key in [&keys.identifier, &keys.index, &keys.count] {
+        for key in [
+            &keys.identifier,
+            &keys.index,
+            &keys.count,
+            &keys.original_filename,
+        ] {
             attributes.remove(key.as_str());
         }
         Self {
@@ -164,6 +174,13 @@ impl Fragments {
     /// there win over the inherited and fragment ones, and
     /// [`without_attribute`](FlowFileBuilder::without_attribute) drops any of
     /// them.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if more fragments are produced than
+    /// [`with_count`](Self::with_count) declared — NiFi's `MergeContent`
+    /// bins on `fragment.count`, so an index past it describes a set that
+    /// cannot be reassembled. Release builds number past the count.
     #[expect(
         clippy::should_implement_trait,
         reason = "`Iterator` would have to yield builders forever, with no way \
@@ -171,6 +188,12 @@ impl Fragments {
     )]
     pub fn next(&mut self) -> FlowFileBuilder {
         self.index += 1;
+        debug_assert!(
+            self.count.is_none_or(|count| self.index <= count),
+            "fragment {} of a set declared to hold {:?}",
+            self.index,
+            self.count
+        );
         let mut builder = FlowFileBuilder::new()
             .attributes(self.attributes.clone())
             .attribute(attr::UUID, uuid::Uuid::new_v4().to_string())
@@ -260,6 +283,65 @@ mod tests {
         assert_ne!(child.attributes()["fragment.identifier"], "old");
         assert_eq!(child.attributes()["fragment.index"], "1");
         assert!(!child.attributes().contains_key("fragment.count"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "fragment 3 of a set declared to hold Some(2)")]
+    fn producing_more_fragments_than_declared_is_caught() {
+        let mut parts = parent().fragments().with_count(2);
+        for _ in 0..3 {
+            let _ = parts.next();
+        }
+    }
+
+    #[test]
+    fn an_undeclared_count_never_runs_out() {
+        let mut parts = parent().fragments();
+        for _ in 0..3 {
+            let _ = parts.next();
+        }
+        assert_eq!(parts.produced(), 3);
+    }
+
+    #[test]
+    fn a_new_split_replaces_the_parents_original_filename() {
+        // A part of an earlier split, re-split. It has no `filename` of its
+        // own, so there is no original filename to record for this split.
+        let parent = FlowFile::builder()
+            .attribute("segment.original.filename", "grandparent.tar")
+            .attribute("fragment.index", "3")
+            .content(Vec::new());
+        let child = parent.fragments().next().content(Vec::new());
+
+        assert_eq!(child.attributes()["fragment.index"], "1");
+        assert!(
+            !child
+                .attributes()
+                .contains_key("segment.original.filename"),
+            "the grandparent's filename must not outlive the split it named"
+        );
+    }
+
+    #[test]
+    fn a_custom_original_filename_key_leaves_no_default_behind() {
+        let parent = FlowFile::builder()
+            .attribute("filename", "a.tar")
+            .attribute("segment.original.filename", "old.tar")
+            .content(Vec::new());
+        let child = parent
+            .fragments()
+            .original_filename_attribute("split.parent")
+            .next()
+            .content(Vec::new());
+
+        assert_eq!(child.attributes()["split.parent"], "a.tar");
+        assert!(
+            !child
+                .attributes()
+                .contains_key("segment.original.filename"),
+            "one original filename per part, under the requested key"
+        );
     }
 
     #[test]

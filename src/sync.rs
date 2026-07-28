@@ -68,7 +68,13 @@ pub(crate) fn parse_header(
     }
     let mut size = [0u8; 8];
     reader.read_exact(&mut size)?;
-    Ok((attributes, u64::from_be_bytes(size)))
+    let size = u64::from_be_bytes(size);
+    if let Some(limit) = limits.max_content_len
+        && size > limit
+    {
+        return Err(Error::ContentTooLarge { size, limit });
+    }
+    Ok((attributes, size))
 }
 
 impl<R: Read> FlowFile<io::Take<R>> {
@@ -185,13 +191,17 @@ impl<R: Read> FlowFile<R> {
     /// Serialize the flow file to a writer, reading exactly [`size`] bytes
     /// from the content reader.
     ///
-    /// Returns the number of content bytes copied.
+    /// Returns the number of content bytes copied. This consumes the flow
+    /// file, because it is a one-shot: the content reader is left exhausted,
+    /// so a second call would write a second header and then fail — after
+    /// committing those bytes to the stream. Read whatever you need from
+    /// [`attributes`](FlowFile::attributes) first.
     ///
     /// ```
     /// use nififf3::FlowFile;
     ///
     /// let content = &b"hello"[..]; // any `impl Read`
-    /// let mut flow_file = FlowFile::builder().reader(content, 5);
+    /// let flow_file = FlowFile::builder().reader(content, 5);
     ///
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
@@ -208,7 +218,7 @@ impl<R: Read> FlowFile<R> {
     /// has already been written.
     ///
     /// [`size`]: FlowFile::size
-    pub fn write_to<W: Write>(&mut self, writer: &mut W) -> io::Result<u64> {
+    pub fn write_to<W: Write>(mut self, writer: &mut W) -> io::Result<u64> {
         writer.write_all(&self.header_bytes())?;
         let copied = io::copy(&mut (&mut self.content).take(self.size), writer)?;
         if copied != self.size {
@@ -251,6 +261,10 @@ impl<R: Read> FlowFile<R> {
 /// clean end of input. After an error the iterator is fused (keeps returning
 /// `None`), since the stream position is no longer trustworthy. To stream
 /// contents instead of buffering them, use [`FlowFile::parse_next`] directly.
+///
+/// Because this buffers, it reports a content that ends before its declared
+/// size as [`Error::SizeMismatch`] directly, the way
+/// [`FlowFile::from_bytes`] does — not wrapped in [`Error::Io`].
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFiles};
@@ -299,7 +313,9 @@ impl<R: Read> Iterator for FlowFiles<R> {
         }
         let result = match FlowFile::parse_next_with_limits(&mut self.reader, &self.limits) {
             Ok(None) => None,
-            Ok(Some(flow_file)) => Some(flow_file.into_bytes().map_err(Error::from)),
+            Ok(Some(flow_file)) => {
+                Some(flow_file.into_bytes().map_err(crate::error::unwrap_io))
+            }
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {
@@ -313,6 +329,13 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 
 /// Writes a stream of concatenated flow files, the counterpart to
 /// [`FlowFiles`].
+///
+/// A failed write leaves a partial flow file in the stream, so the writer
+/// refuses every write after one, the way [`FlowFiles`] stops reading after an
+/// error — appending to a stream that is mid-record would bury the failure
+/// rather than report it, since the next record's header is indistinguishable
+/// from the content the truncated one still expects. See
+/// [`is_poisoned`](Self::is_poisoned).
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesWriter};
@@ -335,12 +358,17 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 pub struct FlowFilesWriter<W> {
     writer: W,
     count: u64,
+    poisoned: bool,
 }
 
 impl<W: Write> FlowFilesWriter<W> {
     /// Write flow files to `writer`.
     pub fn new(writer: W) -> Self {
-        Self { writer, count: 0 }
+        Self {
+            writer,
+            count: 0,
+            poisoned: false,
+        }
     }
 
     /// Append a flow file, streaming exactly [`size`](FlowFile::size) bytes
@@ -349,10 +377,13 @@ impl<W: Write> FlowFilesWriter<W> {
     /// # Errors
     ///
     /// As [`FlowFile::write_to`]: a content reader that ends early leaves a
-    /// truncated flow file behind. Use [`write_bytes`](Self::write_bytes) for
-    /// content whose length must be verified before anything is committed.
-    pub fn write<R: Read>(&mut self, mut flow_file: FlowFile<R>) -> io::Result<u64> {
-        let copied = flow_file.write_to(&mut self.writer)?;
+    /// truncated flow file behind, and poisons the writer. Use
+    /// [`write_bytes`](Self::write_bytes) for content whose length must be
+    /// verified before anything is committed.
+    pub fn write<R: Read>(&mut self, flow_file: FlowFile<R>) -> io::Result<u64> {
+        self.guard()?;
+        let result = flow_file.write_to(&mut self.writer);
+        let copied = self.poison_on_err(result)?;
         self.count += 1;
         Ok(copied)
     }
@@ -361,14 +392,42 @@ impl<W: Write> FlowFilesWriter<W> {
     ///
     /// # Errors
     ///
-    /// Only whatever the writer returns.
+    /// Whatever the writer returns — which, since it may have accepted part
+    /// of the flow file first, also poisons the writer.
     pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> io::Result<u64> {
-        self.writer.write_all(&flow_file.to_bytes())?;
+        self.guard()?;
+        let bytes = flow_file.to_bytes();
+        let result = self.writer.write_all(&bytes);
+        self.poison_on_err(result)?;
         self.count += 1;
         Ok(flow_file.size)
     }
 
-    /// The number of flow files written so far.
+    fn guard(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(crate::error::poisoned());
+        }
+        Ok(())
+    }
+
+    fn poison_on_err<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Whether a write has failed, leaving the stream mid-flow-file.
+    ///
+    /// Once this is true every further write fails without touching the
+    /// underlying writer. [`into_inner`](Self::into_inner) still hands it
+    /// back, for a caller that wants to discard or truncate the output.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// The number of flow files written so far, counting only the complete
+    /// ones.
     pub fn count(&self) -> u64 {
         self.count
     }
@@ -438,7 +497,7 @@ mod tests {
 
     #[test]
     fn write_to_matches_to_bytes() {
-        let mut flow_file = sample_flow_file().into_reader();
+        let flow_file = sample_flow_file().into_reader();
         let mut out = Vec::new();
         let copied = flow_file.write_to(&mut out).unwrap();
         assert_eq!(copied, 5);
@@ -503,6 +562,154 @@ mod tests {
                 actual: 3
             })
         ));
+    }
+
+    #[test]
+    fn readers_report_truncation_the_same_way_from_bytes_does() {
+        let bytes = sample_bytes();
+        let truncated = &bytes[..bytes.len() - 2];
+
+        // Both entry points yield the structured error, not `Io` wrapping it.
+        for err in [
+            FlowFile::from_bytes(truncated).unwrap_err(),
+            FlowFiles::new(truncated).next().unwrap().unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Error::SizeMismatch {
+                        expected: 5,
+                        actual: 3
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn readers_still_report_plain_io_errors_as_io() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "gone"))
+            }
+        }
+
+        let err = FlowFiles::new(Failing).next().unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::ConnectionReset),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn limits_reject_an_oversized_declared_content_size() {
+        let bytes = sample_flow_file().to_bytes();
+        let limits = Limits::default().max_content_len(4);
+
+        assert!(matches!(
+            FlowFile::parse_with_limits(bytes.as_slice(), &limits),
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
+        // The check is on the declared size, so it fires before any content
+        // is read — a header alone is enough to trip it.
+        let header_only = &bytes[..bytes.len() - 5];
+        assert!(matches!(
+            FlowFile::parse_with_limits(header_only, &limits),
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), &Limits::default()).is_ok());
+    }
+
+    /// A reader that yields `available` bytes and then ends, so a flow file
+    /// declaring more than that is truncated part-way through its content.
+    struct Short(usize);
+
+    impl Read for Short {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.min(buf.len());
+            self.0 -= n;
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_failed_write_poisons_the_writer() {
+        let mut out = Vec::new();
+        let mut writer = FlowFilesWriter::new(&mut out);
+
+        let err = writer
+            .write(FlowFile::builder().attribute("n", "1").reader(Short(3), 10))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(writer.is_poisoned());
+        assert_eq!(writer.count(), 0, "the failed one does not count");
+
+        // Appending here would let the next header be read as the truncated
+        // record's content, producing a plausible but wrong flow file.
+        let err = writer
+            .write_bytes(&FlowFile::builder().attribute("n", "2").content(&b"ok"[..]))
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"));
+        assert_eq!(writer.count(), 0);
+
+        // Nothing was appended after the failure: the header plus the 3
+        // bytes the reader did produce, and not a byte more.
+        let stream = writer.into_inner();
+        assert_eq!(
+            stream.len(),
+            FlowFile::builder().attribute("n", "1").content(Vec::new()).to_bytes().len() + 3
+        );
+    }
+
+    #[test]
+    fn a_healthy_writer_is_never_poisoned() {
+        let mut out = Vec::new();
+        let mut writer = FlowFilesWriter::new(&mut out);
+        writer
+            .write_bytes(&FlowFile::builder().content(&b"first"[..]))
+            .unwrap();
+        writer
+            .write(FlowFile::builder().reader(&b"second"[..], 6))
+            .unwrap();
+
+        assert!(!writer.is_poisoned());
+        assert_eq!(writer.count(), 2);
+        assert_eq!(FlowFiles::new(out.as_slice()).count(), 2);
+    }
+
+    #[test]
+    fn from_bytes_limits_apply_to_the_header() {
+        let bytes = sample_flow_file().to_bytes();
+
+        assert!(matches!(
+            FlowFile::from_bytes_with_limits(&bytes, &Limits::default().max_attributes(1)),
+            Err(Error::TooManyAttributes { count: 2, limit: 1 })
+        ));
+        assert!(matches!(
+            FlowFile::from_bytes_with_limits(&bytes, &Limits::default().max_content_len(4)),
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
+        assert!(FlowFile::from_bytes_with_limits(&bytes, &Limits::default()).is_ok());
+    }
+
+    #[test]
+    fn content_mut_reads_incrementally_and_keeps_the_attributes() {
+        let bytes = sample_bytes();
+        let mut flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
+
+        let mut head = [0u8; 2];
+        flow_file.content_mut().read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"he");
+        assert_eq!(flow_file.attributes()["path"], "x");
+
+        // The rest is still there, and the flow file still knows its size.
+        assert_eq!(flow_file.size(), 5);
+        let mut rest = Vec::new();
+        flow_file.content_mut().read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"llo");
     }
 
     #[test]

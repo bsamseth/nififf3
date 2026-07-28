@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+use axum::RequestExt;
 use axum::body::{Body, BodyDataStream};
 use axum::extract::{FromRequest, Request};
 use axum::http::{StatusCode, header};
@@ -29,6 +30,27 @@ use crate::{Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDI
 /// [`Limits::default`]. To use different limits, extract the raw
 /// [`axum::body::Body`] and call
 /// [`FlowFile::parse_async_with_limits`] on a reader over it.
+///
+/// # Body size
+///
+/// The body is read through axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit), like any other
+/// extractor's — so it is capped at 2 MiB unless the router says otherwise.
+/// That cap is on the bytes the client actually sends, which is the only
+/// bound that means anything for a server: [`Limits`] governs the header,
+/// and the header's declared content size is a claim, not a promise.
+///
+/// Streaming a flow file larger than the limit therefore has to say so:
+///
+/// ```
+/// use axum::extract::DefaultBodyLimit;
+/// use axum::{Router, routing::post};
+/// # async fn handler(_: nififf3::FlowFileRequest) {}
+///
+/// let app: Router = Router::new()
+///     .route("/large", post(handler))
+///     .layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)); // or ::disable()
+/// ```
 ///
 /// ```no_run
 /// use nififf3::FlowFileRequest;
@@ -79,8 +101,10 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
     type Rejection = Error;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        // `with_limited_body` is what applies `DefaultBodyLimit`; reading
+        // `req.into_body()` directly would silently opt out of it.
         let body = FlowFileBody {
-            stream: req.into_body().into_data_stream(),
+            stream: req.with_limited_body().into_body().into_data_stream(),
             chunk: Bytes::new(),
         };
         FlowFile::parse_async_with_limits(body, &Limits::default()).await
@@ -197,10 +221,36 @@ where
     }
 }
 
-/// Respond with `400 Bad Request` and the error message as the body.
+/// Whether `err`, or anything in its source chain, is axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) being hit.
+///
+/// The limit is enforced by the body, several layers below the reader this
+/// crate parses from, so it arrives as an opaque [`io::Error`] like any other
+/// transport failure. Only the chain distinguishes it.
+fn is_body_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    // Matches `io::Error::get_ref`; the chain itself drops the auto traits.
+    let err: &(dyn std::error::Error + 'static) = err;
+    std::iter::successors(Some(err), |err| err.source())
+        .any(<dyn std::error::Error + 'static>::is::<http_body_util::LengthLimitError>)
+}
+
+/// Respond with the error message as the body, under `400 Bad Request` —
+/// except for the size failures, which are `413 Payload Too Large`, since the
+/// input was well-formed and merely too big. Those are the [`Limits`] ones,
+/// plus a body that ran past axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit).
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+        let status = match self {
+            Error::TooManyAttributes { .. }
+            | Error::AttributeTooLong { .. }
+            | Error::ContentTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Error::Io(ref err) if err.get_ref().is_some_and(is_body_limit) => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, self.to_string()).into_response()
     }
 }
 

@@ -24,7 +24,7 @@ impl Serialize for FlowFile<Vec<u8>> {
         }
 
         Repr {
-            size: self.content.len() as u64,
+            size: self.size,
             attributes: self
                 .attributes
                 .iter()

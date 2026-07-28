@@ -7,6 +7,33 @@ pub(crate) fn truncated(expected: u64, actual: u64) -> std::io::Error {
     )
 }
 
+/// The inverse of [`truncated`]: recover the structured error an
+/// [`std::io::Error`] carries, so that an API returning [`Error`] reports
+/// e.g. a truncation as [`Error::SizeMismatch`] rather than burying it one
+/// level down in [`Error::Io`].
+pub(crate) fn unwrap_io(err: std::io::Error) -> Error {
+    if !matches!(err.get_ref(), Some(inner) if inner.is::<Error>()) {
+        return Error::Io(err);
+    }
+    let kind = err.kind();
+    match err.into_inner() {
+        Some(inner) => match inner.downcast::<Error>() {
+            Ok(err) => *err,
+            // Unreachable given the check above, but not worth a panic.
+            Err(inner) => Error::Io(std::io::Error::new(kind, inner)),
+        },
+        None => Error::Io(kind.into()),
+    }
+}
+
+/// A write was attempted on a writer whose stream is already mid-flow-file.
+pub(crate) fn poisoned() -> std::io::Error {
+    std::io::Error::other(
+        "flow file writer is poisoned: an earlier write left a truncated \
+         flow file in the stream",
+    )
+}
+
 /// Errors produced when parsing or serializing flow files.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -26,13 +53,18 @@ pub enum Error {
 
     /// The content length does not match the size declared in the header.
     ///
-    /// Returned directly by [`FlowFile::from_bytes`](crate::FlowFile::from_bytes),
-    /// which validates a whole buffer. The operations that merely move content
-    /// around — `write_to`, `into_bytes` and their async twins — report the
-    /// same condition as an [`std::io::Error`] of kind
+    /// Returned directly by everything that yields this crate's [`Error`]:
+    /// [`FlowFile::from_bytes`](crate::FlowFile::from_bytes), which validates
+    /// a whole buffer, and the [`FlowFiles`](crate::FlowFiles) /
+    /// [`FlowFilesAsync`](crate::FlowFilesAsync) readers.
+    ///
+    /// The operations that merely move content around — `write_to`,
+    /// `into_bytes` and their async twins — return [`std::io::Result`] and so
+    /// report the same condition as an [`std::io::Error`] of kind
     /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying this
-    /// value, so it can still be recovered with
-    /// [`io::Error::get_ref`](std::io::Error::get_ref) and `downcast_ref`.
+    /// value, which
+    /// [`io::Error::get_ref`](std::io::Error::get_ref) and `downcast_ref`
+    /// recover.
     #[error("content size mismatch: header declares {expected} bytes, got {actual}")]
     SizeMismatch {
         /// The content size declared in the flow file header.
@@ -64,5 +96,17 @@ pub enum Error {
         len: usize,
         /// The configured maximum.
         limit: usize,
+    },
+
+    /// The header declares more content than the configured
+    /// [`Limits`](crate::Limits) allow.
+    ///
+    /// Raised from the declared size alone, before any content is read.
+    #[error("content size {size} exceeds the limit of {limit} bytes")]
+    ContentTooLarge {
+        /// The content size declared in the flow file header.
+        size: u64,
+        /// The configured maximum.
+        limit: u64,
     },
 }
