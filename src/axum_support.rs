@@ -107,7 +107,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
             stream: req.with_limited_body().into_body().into_data_stream(),
             chunk: Bytes::new(),
         };
-        FlowFile::parse_async_with_limits(body, &Limits::default()).await
+        FlowFile::parse_async_with_limits(body, Limits::default()).await
     }
 }
 
@@ -201,6 +201,21 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
 /// Sets `Content-Type: application/flowfile-v3` and a `Content-Length`
 /// computed from the header and the declared content size. Exactly
 /// [`size`](FlowFile::size) bytes are read from the content reader.
+///
+/// The bound is on the *content*, so this covers every reader-backed flow
+/// file but not an in-memory `FlowFile<Vec<u8>>`, since `Vec<u8>` is not an
+/// [`AsyncRead`] (and coherence forbids a second impl for it). Call
+/// [`into_reader`](FlowFile::into_reader) on those — it wraps the content in
+/// a [`std::io::Cursor`], which is one:
+///
+/// ```
+/// use axum::response::IntoResponse;
+/// use nififf3::FlowFile;
+///
+/// let flow_file = FlowFile::builder().content(&b"hi"[..]);
+/// let response = flow_file.into_reader().into_response();
+/// # let _ = response;
+/// ```
 impl<R> IntoResponse for FlowFile<R>
 where
     R: AsyncRead + Send + 'static,
@@ -306,6 +321,13 @@ enum Source {
 /// [`write_bytes`](FlowFilesWriterAsync::write_bytes) instead, which learns of
 /// the failure before committing to anything. That is worth deciding per part:
 /// stream the large ones, buffer the ones whose integrity matters.
+///
+/// # Panics
+///
+/// Turning one of the streaming variants into a response spawns the producer,
+/// so it must happen inside a tokio runtime — which an axum handler always is.
+/// Converting one by hand outside a runtime panics.
+/// [`from_vec`](Self::from_vec) spawns nothing and is fine anywhere.
 pub struct FlowFilesResponse {
     source: Source,
     buffer_size: usize,

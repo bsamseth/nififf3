@@ -222,7 +222,7 @@ async fn a_declared_content_size_over_the_limit_is_rejected_before_the_content()
     let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
     let limits = Limits::default().max_content_len(4);
 
-    let err = FlowFile::parse_with_limits(bytes.as_slice(), &limits).unwrap_err();
+    let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
     assert!(matches!(
         err,
         nififf3::Error::ContentTooLarge { size: 5, limit: 4 }

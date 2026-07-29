@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
+#![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 
@@ -258,6 +259,13 @@ impl<R> FlowFile<R> {
     }
 
     /// The serialized header (everything up to the content) for this flow file.
+    ///
+    /// # Panics
+    ///
+    /// If an attribute key or value is longer than `u32::MAX` bytes. A field
+    /// length in this format is at most 4 bytes, so such an attribute cannot
+    /// be written at all — the builder accepts any `String`, and this is
+    /// where the format's ceiling is enforced.
     pub(crate) fn header_bytes(&self) -> Vec<u8> {
         format::encode_header(&self.attributes, self.size)
     }
@@ -291,7 +299,7 @@ impl FlowFile<Vec<u8>> {
     /// header, [`Error::SizeMismatch`] if fewer content bytes are present than
     /// the header declares, and [`Error::TrailingData`] if more.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::from_bytes_with_limits(bytes, &Limits::UNLIMITED)
+        Self::from_bytes_with_limits(bytes, Limits::UNLIMITED)
     }
 
     /// Like [`from_bytes`](Self::from_bytes), but enforcing [`Limits`] on the
@@ -308,7 +316,7 @@ impl FlowFile<Vec<u8>> {
     /// As [`from_bytes`](Self::from_bytes), plus [`Error::TooManyAttributes`],
     /// [`Error::AttributeTooLong`] or [`Error::ContentTooLarge`] when the
     /// header exceeds `limits`.
-    pub fn from_bytes_with_limits(bytes: &[u8], limits: &Limits) -> Result<Self> {
+    pub fn from_bytes_with_limits(bytes: &[u8], limits: Limits) -> Result<Self> {
         let mut reader = bytes;
         let (attributes, size) = sync::parse_header(&mut reader, None, limits)?;
         let actual = reader.len() as u64;
@@ -339,10 +347,15 @@ impl FlowFile<Vec<u8>> {
     ///
     /// # Panics
     ///
-    /// In debug builds, if `size` disagrees with the content's actual length
-    /// — only reachable by breaking [`map_content`](Self::map_content)'s
-    /// contract. In release builds the mismatch is written out as declared,
-    /// where [`from_bytes`](Self::from_bytes) will reject it.
+    /// If an attribute key or value exceeds `u32::MAX` bytes: a field length
+    /// in this format is at most 4 bytes, so such an attribute cannot be
+    /// written at all.
+    ///
+    /// In debug builds, also if `size` disagrees with the content's actual
+    /// length — only reachable by breaking
+    /// [`map_content`](Self::map_content)'s contract. In release builds the
+    /// mismatch is written out as declared, where
+    /// [`from_bytes`](Self::from_bytes) will reject it.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         debug_assert_eq!(

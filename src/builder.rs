@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::FlowFile;
+use crate::{FlowFile, attr};
 
 /// Builder for [`FlowFile`]s.
 ///
@@ -64,6 +64,50 @@ impl FlowFileBuilder {
     #[must_use]
     pub fn without_attribute(mut self, key: &str) -> Self {
         self.attributes.remove(key);
+        self
+    }
+
+    /// Undo what [`Fragments`](crate::Fragments) added: drop the fragment
+    /// attributes and restore [`filename`](crate::attr::FILENAME) from
+    /// [`segment.original.filename`](crate::attr::SEGMENT_ORIGINAL_FILENAME).
+    ///
+    /// The tail of a merge. Having reassembled the content of a fragment set,
+    /// build the result from any one part — the parts carry the parent's
+    /// attributes — and call this to make it look like the flow file the
+    /// split started from, the way NiFi's `MergeContent` does in `defragment`
+    /// mode.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "records.csv")
+    ///     .attribute("source", "upload")
+    ///     .content(&b"a\nb"[..]);
+    ///
+    /// let mut parts = parent.fragments().with_count(2);
+    /// let first = parts.next().attribute("filename", "record-0").content(&b"a"[..]);
+    ///
+    /// let merged = first.derive().defragment().content(&b"a\nb"[..]);
+    ///
+    /// assert_eq!(merged.attributes()["filename"], "records.csv");
+    /// assert_eq!(merged.attributes()["source"], "upload"); // still inherited
+    /// assert!(!merged.attributes().contains_key("fragment.index"));
+    /// assert!(!merged.attributes().contains_key("segment.original.filename"));
+    /// ```
+    ///
+    /// This handles the default attribute keys. A split that used custom ones
+    /// (see [`Fragments::identifier_attribute`](crate::Fragments::identifier_attribute)
+    /// and friends) needs [`without_attribute`](Self::without_attribute)
+    /// instead.
+    #[must_use]
+    pub fn defragment(mut self) -> Self {
+        if let Some(filename) = self.attributes.remove(attr::SEGMENT_ORIGINAL_FILENAME) {
+            self.attributes.insert(attr::FILENAME.to_string(), filename);
+        }
+        for key in [attr::FRAGMENT_ID, attr::FRAGMENT_INDEX, attr::FRAGMENT_COUNT] {
+            self.attributes.remove(key);
+        }
         self
     }
 
@@ -251,6 +295,42 @@ impl FlowFileBuilder {
 #[cfg(test)]
 mod tests {
     use crate::FlowFile;
+
+    #[test]
+    fn defragment_undoes_what_fragments_added() {
+        let parent = FlowFile::builder()
+            .attribute("filename", "records.csv")
+            .attribute("source", "upload")
+            .content(&b"a\nb"[..]);
+
+        let mut parts = parent.fragments().with_count(2);
+        let part = parts.next().attribute("filename", "record-0").content(&b"a"[..]);
+
+        let merged = part.derive().defragment().content(&b"a\nb"[..]);
+        let attributes = merged.attributes();
+
+        assert_eq!(attributes["filename"], "records.csv", "restored");
+        assert_eq!(attributes["source"], "upload", "still inherited");
+        for key in [
+            "fragment.identifier",
+            "fragment.index",
+            "fragment.count",
+            "segment.original.filename",
+        ] {
+            assert!(!attributes.contains_key(key), "{key} should be gone");
+        }
+    }
+
+    #[test]
+    fn defragment_leaves_a_filename_alone_when_there_was_no_split() {
+        let merged = FlowFile::builder()
+            .attribute("filename", "plain.txt")
+            .content(Vec::new())
+            .derive()
+            .defragment()
+            .content(Vec::new());
+        assert_eq!(merged.attributes()["filename"], "plain.txt");
+    }
 
     #[test]
     fn buffered_reads_content_and_sets_size() {

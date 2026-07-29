@@ -32,7 +32,7 @@
 ///     .to_bytes();
 ///
 /// let limits = Limits::default().max_attribute_len(10);
-/// let err = FlowFile::parse_with_limits(bytes.as_slice(), &limits).unwrap_err();
+/// let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
 /// assert!(matches!(err, Error::AttributeTooLong { .. }));
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -90,7 +90,7 @@ impl Limits {
     /// let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
     /// let limits = Limits::default().max_content_len(4);
     ///
-    /// let err = FlowFile::parse_with_limits(bytes.as_slice(), &limits).unwrap_err();
+    /// let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
     /// assert!(matches!(err, Error::ContentTooLarge { size: 5, limit: 4 }));
     /// ```
     #[must_use]

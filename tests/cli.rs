@@ -165,6 +165,35 @@ fn from_json_rejects_size_mismatch() {
 }
 
 #[test]
+fn limit_flags_reject_oversized_headers() {
+    let many = FlowFile::builder()
+        .attributes((0..50).map(|i| (format!("k{i}"), "v")))
+        .content(Vec::new())
+        .to_bytes();
+
+    nififf3()
+        .args(["attrs", "--max-attributes", "10"])
+        .write_stdin(many.clone())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("attribute count"));
+
+    nififf3()
+        .args(["content", "--max-content-len", "2"])
+        .write_stdin(sample_bytes())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("content size"));
+
+    // Unset means no cap, as before.
+    nififf3()
+        .arg("attrs")
+        .write_stdin(many)
+        .assert()
+        .success();
+}
+
+#[test]
 fn to_json_rejects_garbage() {
     nififf3()
         .arg("to-json")

@@ -41,7 +41,7 @@ fn read_string(reader: &mut impl Read, max_len: Option<usize>) -> Result<String>
 pub(crate) fn parse_header(
     reader: &mut impl Read,
     first_byte: Option<u8>,
-    limits: &Limits,
+    limits: Limits,
 ) -> Result<(HashMap<String, String>, u64)> {
     let mut magic = [0u8; 7];
     match first_byte {
@@ -109,7 +109,7 @@ impl<R: Read> FlowFile<io::Take<R>> {
     ///
     /// [`size`]: FlowFile::size
     pub fn parse(reader: R) -> Result<Self> {
-        Self::parse_with_limits(reader, &Limits::UNLIMITED)
+        Self::parse_with_limits(reader, Limits::UNLIMITED)
     }
 
     /// Like [`parse`](Self::parse), but enforcing [`Limits`] on the header.
@@ -120,7 +120,7 @@ impl<R: Read> FlowFile<io::Take<R>> {
     ///
     /// As [`parse`](Self::parse), plus [`Error::TooManyAttributes`] or
     /// [`Error::AttributeTooLong`] when the header exceeds `limits`.
-    pub fn parse_with_limits(mut reader: R, limits: &Limits) -> Result<Self> {
+    pub fn parse_with_limits(mut reader: R, limits: Limits) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None, limits)?;
         Ok(FlowFile::from_raw_parts(
             size,
@@ -158,7 +158,7 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// header is [`Error::Io`], not `Ok(None)` — only a clean boundary ends
     /// the iteration.
     pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
-        Self::parse_next_with_limits(reader, &Limits::UNLIMITED)
+        Self::parse_next_with_limits(reader, Limits::UNLIMITED)
     }
 
     /// Like [`parse_next`](Self::parse_next), but enforcing [`Limits`] on
@@ -168,7 +168,7 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     ///
     /// As [`parse_next`](Self::parse_next), plus [`Error::TooManyAttributes`]
     /// or [`Error::AttributeTooLong`] when a header exceeds `limits`.
-    pub fn parse_next_with_limits(reader: &'r mut R, limits: &Limits) -> Result<Option<Self>> {
+    pub fn parse_next_with_limits(reader: &'r mut R, limits: Limits) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
             match reader.read(&mut first) {
@@ -216,6 +216,11 @@ impl<R: Read> FlowFile<R> {
     /// [`Error::SizeMismatch`]; anything else comes from the writer. Either
     /// way the header — and whatever content was copied before the failure —
     /// has already been written.
+    ///
+    /// # Panics
+    ///
+    /// If an attribute key or value is longer than `u32::MAX` bytes, which
+    /// the wire format cannot express. As [`FlowFile::to_bytes`].
     ///
     /// [`size`]: FlowFile::size
     pub fn write_to<W: Write>(mut self, writer: &mut W) -> io::Result<u64> {
@@ -311,7 +316,7 @@ impl<R: Read> Iterator for FlowFiles<R> {
         if self.done {
             return None;
         }
-        let result = match FlowFile::parse_next_with_limits(&mut self.reader, &self.limits) {
+        let result = match FlowFile::parse_next_with_limits(&mut self.reader, self.limits) {
             Ok(None) => None,
             Ok(Some(flow_file)) => {
                 Some(flow_file.into_bytes().map_err(crate::error::unwrap_io))
@@ -609,17 +614,17 @@ mod tests {
         let limits = Limits::default().max_content_len(4);
 
         assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), &limits),
+            FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
         // The check is on the declared size, so it fires before any content
         // is read — a header alone is enough to trip it.
         let header_only = &bytes[..bytes.len() - 5];
         assert!(matches!(
-            FlowFile::parse_with_limits(header_only, &limits),
+            FlowFile::parse_with_limits(header_only, limits),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), &Limits::default()).is_ok());
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::default()).is_ok());
     }
 
     /// A reader that yields `available` bytes and then ends, so a flow file
@@ -685,14 +690,14 @@ mod tests {
         let bytes = sample_flow_file().to_bytes();
 
         assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, &Limits::default().max_attributes(1)),
+            FlowFile::from_bytes_with_limits(&bytes, Limits::default().max_attributes(1)),
             Err(Error::TooManyAttributes { count: 2, limit: 1 })
         ));
         assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, &Limits::default().max_content_len(4)),
+            FlowFile::from_bytes_with_limits(&bytes, Limits::default().max_content_len(4)),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
-        assert!(FlowFile::from_bytes_with_limits(&bytes, &Limits::default()).is_ok());
+        assert!(FlowFile::from_bytes_with_limits(&bytes, Limits::default()).is_ok());
     }
 
     #[test]
@@ -740,13 +745,13 @@ mod tests {
 
         let limits = Limits::default().max_attributes(5);
         assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), &limits),
+            FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::TooManyAttributes {
                 count: 10,
                 limit: 5
             })
         ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), &Limits::default()).is_ok());
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::default()).is_ok());
     }
 
     #[test]
@@ -758,7 +763,7 @@ mod tests {
 
         let limits = Limits::default().max_attribute_len(8);
         assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), &limits),
+            FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::AttributeTooLong { limit: 8, .. })
         ));
     }

@@ -45,7 +45,7 @@ async fn read_string<R: AsyncRead + Unpin>(
 pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
     reader: &mut R,
     first_byte: Option<u8>,
-    limits: &Limits,
+    limits: Limits,
 ) -> Result<(HashMap<String, String>, u64)> {
     let mut magic = [0u8; 7];
     match first_byte {
@@ -107,7 +107,7 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     ///
     /// As [`FlowFile::parse`].
     pub async fn parse_async(reader: R) -> Result<Self> {
-        Self::parse_async_with_limits(reader, &Limits::UNLIMITED).await
+        Self::parse_async_with_limits(reader, Limits::UNLIMITED).await
     }
 
     /// Like [`parse_async`](Self::parse_async), but enforcing [`Limits`] on
@@ -116,7 +116,7 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// # Errors
     ///
     /// As [`FlowFile::parse_with_limits`].
-    pub async fn parse_async_with_limits(mut reader: R, limits: &Limits) -> Result<Self> {
+    pub async fn parse_async_with_limits(mut reader: R, limits: Limits) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None, limits).await?;
         Ok(FlowFile::from_raw_parts(
             size,
@@ -155,7 +155,7 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     ///
     /// As [`FlowFile::parse_next`].
     pub async fn parse_next_async(reader: &'r mut R) -> Result<Option<Self>> {
-        Self::parse_next_async_with_limits(reader, &Limits::UNLIMITED).await
+        Self::parse_next_async_with_limits(reader, Limits::UNLIMITED).await
     }
 
     /// Like [`parse_next_async`](Self::parse_next_async), but enforcing
@@ -166,7 +166,7 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// As [`FlowFile::parse_next_with_limits`].
     pub async fn parse_next_async_with_limits(
         reader: &'r mut R,
-        limits: &Limits,
+        limits: Limits,
     ) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
@@ -189,9 +189,12 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
 /// Async equivalent of [`FlowFiles`](crate::FlowFiles): reads concatenated
 /// flow files one at a time, buffering each content in memory.
 ///
-/// This is not a [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html);
-/// call [`next`](Self::next) in a loop instead. After an error, `next` keeps
-/// returning `None`, since the stream position is no longer trustworthy.
+/// [`next`](Self::next) is an inherent async method rather than a
+/// [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
+/// impl, so the base type needs no extra dependency; with the `stream`
+/// feature, [`into_stream`](Self::into_stream) adapts it into one. After an
+/// error, `next` keeps returning `None`, since the stream position is no
+/// longer trustworthy.
 ///
 /// As with [`FlowFiles`](crate::FlowFiles), a content that ends before its
 /// declared size is reported as [`Error::SizeMismatch`] directly, not wrapped
@@ -238,12 +241,50 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         }
     }
 
+    /// Adapt into a [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
+    /// of flow files, for composing with `StreamExt` and anything that takes
+    /// a stream.
+    ///
+    /// Requires the `stream` feature (implied by `axum`). The stream ends the
+    /// same way [`next`](Self::next) does: `None` at a clean end of input, and
+    /// nothing further after an error.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, FlowFilesAsync};
+    /// use tokio_stream::StreamExt as _;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+    /// bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
+    ///
+    /// let sizes: Vec<_> = FlowFilesAsync::new(bytes.as_slice())
+    ///     .into_stream()
+    ///     .map(|flow_file| flow_file.unwrap().size())
+    ///     .collect()
+    ///     .await;
+    /// assert_eq!(sizes, [5, 6]);
+    /// # });
+    /// ```
+    #[cfg(feature = "stream")]
+    pub fn into_stream(self) -> impl futures_core::Stream<Item = Result<FlowFile<Vec<u8>>>>
+    where
+        R: Send,
+    {
+        // `next` borrows `self`, so the future cannot be stored beside it.
+        // Passing ownership through each step keeps the state machine flat,
+        // at one boxed future per flow file — noise next to buffering one.
+        futures_unfold(self, |mut reader| async move {
+            let item = reader.next().await?;
+            Some((item, reader))
+        })
+    }
+
     /// The next flow file, or `None` at the end of the input.
     pub async fn next(&mut self) -> Option<Result<FlowFile<Vec<u8>>>> {
         if self.done {
             return None;
         }
-        let result = match FlowFile::parse_next_async_with_limits(&mut self.reader, &self.limits)
+        let result = match FlowFile::parse_next_async_with_limits(&mut self.reader, self.limits)
             .await
         {
             Ok(None) => None,
@@ -259,6 +300,66 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
             self.done = true;
         }
         result
+    }
+}
+
+/// A minimal `stream::unfold`, so that [`FlowFilesAsync::into_stream`] does
+/// not pull in `futures-util` for one combinator.
+#[cfg(feature = "stream")]
+fn futures_unfold<T, F, Fut, I>(init: T, step: F) -> impl futures_core::Stream<Item = I>
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = Option<(I, T)>> + Send,
+{
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Unfold<T, F, Fut, I> {
+        state: Option<T>,
+        pending: Option<Pin<Box<Fut>>>,
+        step: F,
+        _item: std::marker::PhantomData<fn() -> I>,
+    }
+
+    // Nothing here is structurally pinned: the in-flight future is boxed, so
+    // its address is stable no matter where the stream itself lives, and
+    // every other field is moved in and out by value.
+    impl<T, F, Fut, I> Unpin for Unfold<T, F, Fut, I> {}
+
+    impl<T, F, Fut, I> futures_core::Stream for Unfold<T, F, Fut, I>
+    where
+        F: FnMut(T) -> Fut,
+        Fut: std::future::Future<Output = Option<(I, T)>> + Send,
+    {
+        type Item = I;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<I>> {
+            let this = self.get_mut();
+            loop {
+                if let Some(pending) = this.pending.as_mut() {
+                    let done = std::task::ready!(pending.as_mut().poll(cx));
+                    this.pending = None;
+                    return Poll::Ready(match done {
+                        Some((item, state)) => {
+                            this.state = Some(state);
+                            Some(item)
+                        }
+                        None => None,
+                    });
+                }
+                let Some(state) = this.state.take() else {
+                    return Poll::Ready(None);
+                };
+                this.pending = Some(Box::pin((this.step)(state)));
+            }
+        }
+    }
+
+    Unfold {
+        state: Some(init),
+        pending: None,
+        step,
+        _item: std::marker::PhantomData,
     }
 }
 
@@ -398,6 +499,11 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`FlowFile::write_to`].
+    ///
+    /// # Panics
+    ///
+    /// As [`FlowFile::write_to`]: an attribute longer than `u32::MAX` bytes
+    /// cannot be expressed in the wire format.
     pub async fn write_to_async<W: AsyncWrite + Unpin>(
         mut self,
         writer: &mut W,
@@ -488,7 +594,7 @@ mod tests {
 
         let limits = Limits::default().max_attribute_len(8);
         assert!(matches!(
-            FlowFile::parse_async_with_limits(bytes.as_slice(), &limits).await,
+            FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
             Err(Error::AttributeTooLong { limit: 8, .. })
         ));
     }
@@ -499,7 +605,7 @@ mod tests {
         let limits = Limits::default().max_content_len(4);
 
         assert!(matches!(
-            FlowFile::parse_async_with_limits(bytes.as_slice(), &limits).await,
+            FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
     }
@@ -520,6 +626,41 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn into_stream_yields_every_flow_file_then_ends() {
+        use tokio_stream::StreamExt as _;
+
+        let mut bytes = sample().to_bytes();
+        bytes.extend(sample().to_bytes());
+
+        let collected: Vec<_> = FlowFilesAsync::new(bytes.as_slice())
+            .into_stream()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(collected.len(), 2);
+        for flow_file in collected {
+            assert_eq!(flow_file.unwrap().content().as_slice(), b"hello");
+        }
+    }
+
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn into_stream_stops_after_an_error() {
+        use tokio_stream::StreamExt as _;
+
+        let mut bytes = sample().to_bytes();
+        bytes.extend_from_slice(b"garbage");
+
+        let collected: Vec<_> = FlowFilesAsync::new(bytes.as_slice())
+            .into_stream()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(collected.len(), 2, "one flow file, then the error");
+        assert!(collected[0].is_ok());
+        assert!(matches!(collected[1], Err(Error::InvalidMagic(_))));
     }
 
     #[tokio::test]

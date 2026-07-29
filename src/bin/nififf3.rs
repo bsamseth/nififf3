@@ -4,14 +4,54 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use nififf3::{Error, FlowFile};
+use clap::{Args, Parser, Subcommand};
+use nififf3::{Error, FlowFile, Limits};
 
 #[derive(Parser)]
 #[command(name = "nififf3", version, about = "Work with NiFi FlowFile V3 files")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    #[command(flatten)]
+    limits: LimitArgs,
+}
+
+/// Caps on what a flow file header may declare. Unset means no cap, matching
+/// NiFi's own unpackager; set them when reading input you do not trust.
+#[derive(Args)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives the `--max-*` flag names from these fields"
+)]
+struct LimitArgs {
+    /// Reject headers declaring more than this many attributes.
+    #[arg(long, global = true, value_name = "N")]
+    max_attributes: Option<usize>,
+
+    /// Reject attribute keys or values longer than this, in bytes.
+    #[arg(long, global = true, value_name = "BYTES")]
+    max_attribute_len: Option<usize>,
+
+    /// Reject headers declaring more content than this, in bytes.
+    #[arg(long, global = true, value_name = "BYTES")]
+    max_content_len: Option<u64>,
+}
+
+impl From<LimitArgs> for Limits {
+    fn from(args: LimitArgs) -> Self {
+        let mut limits = Limits::UNLIMITED;
+        if let Some(n) = args.max_attributes {
+            limits = limits.max_attributes(n);
+        }
+        if let Some(n) = args.max_attribute_len {
+            limits = limits.max_attribute_len(n);
+        }
+        if let Some(n) = args.max_content_len {
+            limits = limits.max_content_len(n);
+        }
+        limits
+    }
 }
 
 #[derive(Subcommand)]
@@ -58,11 +98,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    match Cli::parse().command {
-        Command::ToJson { path } => to_json(open_input(path.as_deref())?),
+    let cli = Cli::parse();
+    let limits = Limits::from(cli.limits);
+    match cli.command {
+        Command::ToJson { path } => to_json(open_input(path.as_deref())?, limits),
         Command::FromJson { path } => from_json(open_input(path.as_deref())?),
-        Command::Attrs { path } => attrs(open_input(path.as_deref())?),
-        Command::Content { path } => content(open_input(path.as_deref())?),
+        Command::Attrs { path } => attrs(open_input(path.as_deref())?, limits),
+        Command::Content { path } => content(open_input(path.as_deref())?, limits),
         Command::Create { attributes } => create(&attributes),
     }
 }
@@ -76,9 +118,9 @@ fn open_input(path: Option<&Path>) -> io::Result<Box<dyn BufRead>> {
     }
 }
 
-fn to_json(mut reader: Box<dyn BufRead>) -> Result<()> {
+fn to_json(mut reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    while let Some(flow_file) = FlowFile::parse_next(&mut reader)? {
+    while let Some(flow_file) = FlowFile::parse_next_with_limits(&mut reader, limits)? {
         serde_json::to_writer(&mut stdout, &flow_file.into_bytes()?)?;
         writeln!(stdout)?;
     }
@@ -94,9 +136,9 @@ fn from_json(reader: Box<dyn BufRead>) -> Result<()> {
     Ok(())
 }
 
-fn attrs(mut reader: Box<dyn BufRead>) -> Result<()> {
+fn attrs(mut reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    while let Some(flow_file) = FlowFile::parse_next(&mut reader)? {
+    while let Some(flow_file) = FlowFile::parse_next_with_limits(&mut reader, limits)? {
         let attributes: BTreeMap<_, _> = flow_file.attributes().iter().collect();
         let line = serde_json::json!({
             "size": flow_file.size(),
@@ -109,9 +151,9 @@ fn attrs(mut reader: Box<dyn BufRead>) -> Result<()> {
     Ok(())
 }
 
-fn content(mut reader: Box<dyn BufRead>) -> Result<()> {
+fn content(mut reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    while let Some(flow_file) = FlowFile::parse_next(&mut reader)? {
+    while let Some(flow_file) = FlowFile::parse_next_with_limits(&mut reader, limits)? {
         copy_content(flow_file, &mut stdout)?;
     }
     Ok(())

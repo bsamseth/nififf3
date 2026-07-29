@@ -11,8 +11,20 @@ pub const UUID: &str = "uuid";
 /// The name of the file the content came from.
 pub const FILENAME: &str = "filename";
 
-/// The directory the file came from.
+/// The directory the file came from, relative to the ingest root.
 pub const PATH: &str = "path";
+
+/// The absolute directory the file came from, as NiFi's `GetFile` and
+/// `ListFile` set it.
+pub const ABSOLUTE_PATH: &str = "absolute.path";
+
+/// The media type of the content. NiFi's record and format-detecting
+/// processors both set and read this.
+pub const MIME_TYPE: &str = "mime.type";
+
+/// The number of records in the content, as NiFi's record-oriented
+/// processors set it.
+pub const RECORD_COUNT: &str = "record.count";
 
 /// Shared by every flow file produced from the same parent, so that NiFi's
 /// `MergeContent` can bin them back together.

@@ -49,15 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Rebuild from the first part: its inherited attributes are the parent's.
-    let original_filename = parts[0].attributes()[attr::SEGMENT_ORIGINAL_FILENAME].clone();
-    let merged = parts[0]
-        .derive()
-        .attribute(attr::FILENAME, original_filename)
-        .without_attribute(attr::FRAGMENT_ID)
-        .without_attribute(attr::FRAGMENT_INDEX)
-        .without_attribute(attr::FRAGMENT_COUNT)
-        .without_attribute(attr::SEGMENT_ORIGINAL_FILENAME)
-        .content(content);
+    // `defragment` drops the fragment attributes and puts the original
+    // filename back, undoing exactly what `fragments` added in `split.rs`.
+    let merged = parts[0].derive().defragment().content(content);
 
     println!(
         "out: {} bytes, filename={}",

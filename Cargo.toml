@@ -15,9 +15,11 @@ pedantic = { level = "warn", priority = -1 }
 default = []
 tokio = ["dep:tokio"]
 tempfile = ["dep:tempfile"]
+stream = ["tokio", "dep:futures-core"]
 axum = [
     "tokio",
     "tokio/rt",
+    "stream",
     "dep:axum",
     "dep:tokio-util",
     "tokio-util/io-util",

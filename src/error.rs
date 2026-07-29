@@ -110,3 +110,90 @@ pub enum Error {
         limit: u64,
     },
 }
+
+/// The counterpart to the [`Error::Io`] conversion, so `?` on a parsing
+/// function works inside a function returning [`std::io::Result`] too.
+///
+/// [`Error::Io`] unwraps back to the error it carries; everything else
+/// becomes a payload on an [`std::io::Error`], under the kind the rest of the
+/// crate uses for it — [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof)
+/// for a truncation, [`InvalidData`](std::io::ErrorKind::InvalidData)
+/// otherwise. Round-trips: converting back recovers the original variant.
+///
+/// ```
+/// use nififf3::{Error, FlowFile};
+///
+/// fn read(bytes: &[u8]) -> std::io::Result<FlowFile<Vec<u8>>> {
+///     Ok(FlowFile::from_bytes(bytes)?) // `?` on a `nififf3::Result`
+/// }
+///
+/// let err = read(b"not a flow file").unwrap_err();
+/// assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+/// assert!(matches!(
+///     err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+///     Some(Error::InvalidMagic(_))
+/// ));
+/// ```
+impl From<Error> for std::io::Error {
+    fn from(err: Error) -> Self {
+        use std::io::ErrorKind;
+
+        match err {
+            Error::Io(err) => err,
+            err => {
+                let kind = match err {
+                    Error::SizeMismatch { .. } => ErrorKind::UnexpectedEof,
+                    _ => ErrorKind::InvalidData,
+                };
+                std::io::Error::new(kind, err)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn error_round_trips_through_io_error() {
+        for (err, kind) in [
+            (
+                Error::SizeMismatch {
+                    expected: 5,
+                    actual: 3,
+                },
+                ErrorKind::UnexpectedEof,
+            ),
+            (Error::InvalidMagic([0; 7]), ErrorKind::InvalidData),
+            (Error::TrailingData(2), ErrorKind::InvalidData),
+        ] {
+            let text = err.to_string();
+            let io: std::io::Error = err.into();
+            assert_eq!(io.kind(), kind);
+            // `unwrap_io` is what the readers use to undo this.
+            assert_eq!(unwrap_io(io).to_string(), text);
+        }
+    }
+
+    #[test]
+    fn an_io_error_survives_a_trip_through_error() {
+        let io = std::io::Error::new(ErrorKind::ConnectionReset, "gone");
+        let back: std::io::Error = Error::Io(io).into();
+        assert_eq!(back.kind(), ErrorKind::ConnectionReset);
+        assert_eq!(back.to_string(), "gone");
+    }
+
+    #[test]
+    fn truncated_and_unwrap_io_are_inverses() {
+        let err = unwrap_io(truncated(9, 4));
+        assert!(matches!(
+            err,
+            Error::SizeMismatch {
+                expected: 9,
+                actual: 4
+            }
+        ));
+    }
+}

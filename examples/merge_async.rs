@@ -45,15 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         content.extend_from_slice(part.content());
     }
 
-    let original_filename = parts[0].attributes()[attr::SEGMENT_ORIGINAL_FILENAME].clone();
-    let merged = parts[0]
-        .derive()
-        .attribute(attr::FILENAME, original_filename)
-        .without_attribute(attr::FRAGMENT_ID)
-        .without_attribute(attr::FRAGMENT_INDEX)
-        .without_attribute(attr::FRAGMENT_COUNT)
-        .without_attribute(attr::SEGMENT_ORIGINAL_FILENAME)
-        .content(content);
+    // Undoes what `fragments` added in `split_async.rs`.
+    let merged = parts[0].derive().defragment().content(content);
 
     let mut out = Vec::new();
     merged.into_reader().write_to_async(&mut out).await?;

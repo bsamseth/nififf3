@@ -83,7 +83,7 @@ let bytes = FlowFile::builder()
 
 // Defaults: at most 4096 attributes, 1 MiB per attribute key/value.
 let limits = Limits::default().max_attribute_len(10);
-let err = FlowFile::parse_with_limits(bytes.as_slice(), &limits).unwrap_err();
+let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
 assert!(matches!(err, Error::AttributeTooLong { .. }));
 ```
 
@@ -214,6 +214,23 @@ assert_eq!(children[0].attributes()["segment.original.filename"], "pair.txt");
 Each part also gets its own `uuid` and a `fragment.identifier` shared across
 the set. The attribute keys are configurable if you need different ones.
 
+`defragment` is the inverse, for the far end of a merge: it drops the fragment
+attributes and restores `filename` from `segment.original.filename`, so the
+reassembled flow file looks like the one the split started from.
+
+```rust
+use nififf3::FlowFile;
+
+let parent = FlowFile::builder()
+    .attribute("filename", "pair.txt")
+    .content(&b"first\nsecond"[..]);
+let part = parent.fragments().next().content(&b"first"[..]);
+
+let merged = part.derive().defragment().content(&b"first\nsecond"[..]);
+assert_eq!(merged.attributes()["filename"], "pair.txt");
+assert!(!merged.attributes().contains_key("fragment.index"));
+```
+
 ## Async I/O (`tokio` feature)
 
 The async API mirrors the sync one: `parse_async` reads only the header and
@@ -342,6 +359,14 @@ process flow files one at a time, so streams larger than memory are fine
 (except for `to-json`/`from-json`, which buffer one flow file at a time to
 base64 its content).
 
+Headers are trusted by default, as NiFi's own unpackager trusts them. For
+input you have not vetted, `--max-attributes`, `--max-attribute-len` and
+`--max-content-len` apply the corresponding `Limits` to every flow file read:
+
+```console
+$ nififf3 attrs --max-attributes 4096 --max-content-len 1073741824 untrusted.ff3
+```
+
 ## Examples
 
 `examples/` holds runnable programs, each self-contained and asserting its own
@@ -364,7 +389,9 @@ does in `defragment` mode.
 No features are enabled by default; the sync API is always available.
 
 - `tokio` — async parsing and serialization over `AsyncRead`/`AsyncWrite`.
-- `axum` — request extractor and response types (implies `tokio`).
+- `stream` — `FlowFilesAsync::into_stream`, for composing with `StreamExt`
+  (implies `tokio`).
+- `axum` — request extractor and response types (implies `stream`).
 - `tempfile` — spool content of unknown length to a temporary file.
 - `serde` — `Serialize`/`Deserialize` for in-memory flow files, with the
   content base64 encoded; this is the JSON shape the CLI uses.
