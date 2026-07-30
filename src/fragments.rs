@@ -13,6 +13,18 @@ struct Keys {
     original_filename: String,
 }
 
+impl Keys {
+    /// Every key this set writes, for dropping the parent's values under them.
+    fn all(&self) -> [&String; 4] {
+        [
+            &self.identifier,
+            &self.index,
+            &self.count,
+            &self.original_filename,
+        ]
+    }
+}
+
 impl Default for Keys {
     fn default() -> Self {
         Self {
@@ -93,17 +105,11 @@ impl Fragments {
     pub(crate) fn new(attributes: &HashMap<String, String>) -> Self {
         let keys = Keys::default();
         let original_filename = attributes.get(attr::FILENAME).cloned();
-        // A fresh split supersedes any the parent was itself part of. The
-        // original filename goes too: it names *this* parent, and is set from
-        // the parent's own `filename` below, so a value inherited from a
-        // grandparent would otherwise outlive the split that produced it.
+        // A fresh split supersedes any the parent was itself part of, under
+        // the default keys. The configured keys are not known yet — they are
+        // set on the returned counter — so `part` drops those as well.
         let mut attributes = attributes.clone();
-        for key in [
-            &keys.identifier,
-            &keys.index,
-            &keys.count,
-            &keys.original_filename,
-        ] {
+        for key in keys.all() {
             attributes.remove(key.as_str());
         }
         Self {
@@ -291,8 +297,16 @@ impl Fragments {
     /// The attributes every flow file in the set carries, at `index` and with
     /// `count` if it is to declare one.
     fn part(&self, index: u64, count: Option<u64>) -> FlowFileBuilder {
-        let mut builder = FlowFileBuilder::new()
-            .attributes(self.attributes.clone())
+        let mut builder = FlowFileBuilder::new().attributes(self.attributes.clone());
+        // The parent's values under *these* keys, which `Fragments::new` could
+        // not know. Dropping them first rather than relying on the writes
+        // below matters for the two that are conditional: a set that declares
+        // no count, or a parent with no filename, must not leave the
+        // grandparent's answer standing in for the one this split would give.
+        for key in self.keys.all() {
+            builder = builder.without_attribute(key);
+        }
+        builder = builder
             .attribute(attr::UUID, uuid::Uuid::new_v4().to_string())
             .attribute(self.keys.identifier.as_str(), self.identifier.as_str())
             .attribute(self.keys.index.as_str(), index.to_string());
@@ -497,6 +511,80 @@ mod tests {
                 .contains_key("segment.original.filename"),
             "the grandparent's filename must not outlive the split it named"
         );
+    }
+
+    /// The custom keys are configured *after* the counter is created, so the
+    /// inherited values under them can only be dropped where the parts are
+    /// built. A part must never inherit a fragment attribute that does not
+    /// describe the split it belongs to.
+    #[test]
+    fn a_new_split_replaces_the_parents_custom_fragment_attributes() {
+        let parent = FlowFile::builder()
+            .attribute("split.id", "old")
+            .attribute("split.n", "3")
+            .attribute("split.total", "9")
+            .attribute("split.parent", "grandparent.tar")
+            .content(Vec::new());
+
+        let child = custom_keys(parent.fragments()).next().content(Vec::new());
+
+        assert_ne!(child.attributes()["split.id"], "old");
+        assert_eq!(child.attributes()["split.n"], "1");
+        // This split declared no count, and the parent has no `filename`, so
+        // neither attribute applies to it — the parent's values must not stand
+        // in for the ones this split would have written.
+        assert!(
+            !child.attributes().contains_key("split.total"),
+            "a stale count describes a bundle that cannot be reassembled"
+        );
+        assert!(
+            !child.attributes().contains_key("split.parent"),
+            "the grandparent's filename must not outlive the split it named"
+        );
+    }
+
+    /// The same, for the terminator: it goes through the same attribute path.
+    #[test]
+    fn a_terminator_replaces_the_parents_custom_fragment_attributes() {
+        let parent = FlowFile::builder()
+            .attribute("split.parent", "grandparent.tar")
+            .content(Vec::new());
+
+        let terminator = custom_keys(parent.fragments()).terminate();
+
+        assert_eq!(terminator.attributes()["split.total"], "1");
+        assert!(!terminator.attributes().contains_key("split.parent"));
+    }
+
+    /// Configuring custom keys must not stop the default ones being dropped:
+    /// a part carrying a parent's `fragment.count` is just as unmergeable.
+    #[test]
+    fn custom_keys_still_drop_the_default_fragment_attributes() {
+        let parent = FlowFile::builder()
+            .attribute("fragment.identifier", "old")
+            .attribute("fragment.index", "3")
+            .attribute("fragment.count", "9")
+            .attribute("segment.original.filename", "grandparent.tar")
+            .content(Vec::new());
+
+        let child = custom_keys(parent.fragments()).next().content(Vec::new());
+
+        for key in [
+            "fragment.identifier",
+            "fragment.index",
+            "fragment.count",
+            "segment.original.filename",
+        ] {
+            assert!(!child.attributes().contains_key(key), "{key} should be gone");
+        }
+    }
+
+    fn custom_keys(fragments: crate::Fragments) -> crate::Fragments {
+        fragments
+            .identifier_attribute("split.id")
+            .index_attribute("split.n")
+            .count_attribute("split.total")
+            .original_filename_attribute("split.parent")
     }
 
     #[test]
