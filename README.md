@@ -68,10 +68,12 @@ assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
 ### Untrusted input
 
 A crafted header can declare millions of attributes or multi-gigabyte
-attribute values. The plain parsing functions trust their input (matching
-NiFi's own unpackager, and never allocating more than the input actually
-provides); for untrusted input the `*_with_limits` variants enforce caps on
-the header:
+attribute values. The plain parsing functions trust their input, matching
+NiFi's own unpackager: an attribute buffer grows as bytes arrive rather than to
+the length the header declares, so a header claiming a 4 GiB key over a short
+input fails without allocating for it, and only the attribute map is sized from
+the header at all (capped at 1024 entries). For untrusted input the
+`*_with_limits` variants enforce caps on the header:
 
 ```rust
 use nififf3::{Error, FlowFile, Limits};
@@ -481,3 +483,12 @@ A *field length* is 2 bytes big-endian; values of `0xFFFF` and above are
 written as the marker `0xFF 0xFF` followed by the value as 4 bytes
 big-endian. Attributes are serialized in sorted key order so output is
 deterministic (NiFi accepts any order).
+
+Two limits are worth knowing. The extended field length encodes a `u32`, but
+NiFi reads it into a Java `int`, so an attribute of 2 GiB or more is writable
+here and unreadable there; this crate panics only at `u32::MAX`, where the
+format itself runs out. And a header may repeat a key — attributes parse into a
+map, so the last value wins and re-serializing emits a shorter header than it
+read. NiFi collapses duplicates the same way, but it does mean parse-then-
+serialize is not byte-preserving for input built to exploit it, which matters
+if you hash or sign the encoded form.

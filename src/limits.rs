@@ -8,8 +8,11 @@
 /// their input and apply [`Limits::UNLIMITED`]; the `*_with_limits` variants
 /// take explicit limits, and the axum extractors apply `Limits::default()`.
 ///
-/// Regardless of limits, the parser never allocates more than the input
-/// actually provides, so unlimited parsing of a short input stays cheap.
+/// Regardless of limits, an attribute buffer grows as bytes arrive rather than
+/// to the length the header declares, so a header claiming a 4 GiB key over a
+/// short input fails without allocating for it. The one thing sized from the
+/// header alone is the attribute map, capped at 1024 entries however many the
+/// header claims — so unlimited parsing of a short input stays cheap.
 ///
 /// # Content size
 ///

@@ -442,9 +442,11 @@ impl FlowFilesResponse {
     ///
     /// `producer` is handed a [`FlowFilesWriterAsync`] and writes parts to it
     /// in whatever shape it likes; the response ends when the future
-    /// completes. Each write resolves once the part has reached the socket, so
-    /// a slow client applies backpressure instead of filling memory, and
-    /// writing a part from a reader never buffers its content.
+    /// completes. A write resolves once its bytes are in the response body,
+    /// which runs at most [`buffer_size`](Self::buffer_size) ahead of the
+    /// socket — so a slow client applies backpressure within a buffer rather
+    /// than filling memory, and writing a part from a reader never buffers its
+    /// content.
     ///
     /// Failure is reported as a [`BoxError`], so `?` works directly on
     /// whatever a decoder, plain I/O or this crate returns — a producer never

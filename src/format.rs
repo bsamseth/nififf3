@@ -11,6 +11,12 @@
 //!
 //! A *field length* is 2 bytes big-endian; values >= 0xFFFF are written as
 //! the marker `0xFF 0xFF` followed by the value as 4 bytes big-endian.
+//!
+//! The extended form encodes a `u32`, but NiFi reads it into a Java `int`, so
+//! a length at or above `i32::MAX` comes back negative there and fails on the
+//! array allocation. The interoperable ceiling is half the encodable one —
+//! which matters to nobody with a sane attribute, and is worth knowing before
+//! trusting the 4 GiB the format appears to offer.
 
 use std::collections::HashMap;
 
