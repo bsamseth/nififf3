@@ -548,7 +548,10 @@ impl FlowFilesResponse {
     ///
     /// Unlike the streaming constructors this knows the total length up
     /// front, so the response carries an exact `Content-Length` instead of
-    /// being chunked.
+    /// being chunked. That is what it costs: every part is serialized into one
+    /// buffer before the response starts, so the whole body sits in memory at
+    /// once. Use [`new`](Self::new) or [`from_stream`](Self::from_stream) when
+    /// that is not a trade worth making.
     ///
     /// ```
     /// use axum::http::header;

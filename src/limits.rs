@@ -8,6 +8,16 @@
 /// their input and apply [`Limits::UNLIMITED`]; the `*_with_limits` variants
 /// take explicit limits, and the axum extractors apply `Limits::default()`.
 ///
+/// # What the defaults add up to
+///
+/// The two attribute limits are per-attribute, and apply to keys and values
+/// separately, so the defaults permit 4096 × 2 × 1 MiB — around 8 GiB of
+/// header. There is no aggregate cap, so what actually bounds a request is the
+/// transport: over HTTP, axum's `DefaultBodyLimit`. Raise or disable that to
+/// accept large *content* and the header budget rises with it, since neither
+/// limit tells the two apart. Set the attribute limits to what your flows
+/// really use rather than trusting the defaults to be small.
+///
 /// Regardless of limits, an attribute buffer grows as bytes arrive rather than
 /// to the length the header declares, so a header claiming a 4 GiB key over a
 /// short input fails without allocating for it. The one thing sized from the
@@ -59,6 +69,16 @@ impl Limits {
 
     /// The default limits: at most 4096 attributes, each key and value at
     /// most 1 MiB, and no cap on the content size.
+    ///
+    /// Not a neutral starting point, despite the name — this is
+    /// [`Default::default`], caps and all, so `Limits::new().max_attributes(10)`
+    /// still carries the 1 MiB attribute length. Start from
+    /// [`UNLIMITED`](Self::UNLIMITED) to build a set of limits up from nothing.
+    ///
+    /// Nor are these the limits the plain parsers apply:
+    /// [`FlowFile::parse`](crate::FlowFile::parse) and friends use
+    /// [`UNLIMITED`](Self::UNLIMITED), matching NiFi. `Default` here means the
+    /// sensible caps for untrusted input, not the crate's default behaviour.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
