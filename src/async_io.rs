@@ -266,6 +266,10 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
     /// same way [`next`](Self::next) does: `None` at a clean end of input, and
     /// nothing further after an error.
     ///
+    /// The result is [`Send`] exactly when the reader is, so it composes with
+    /// `axum` and `tokio::spawn` without either side saying so, and a
+    /// single-threaded runtime can still use a reader that is not.
+    ///
     /// ```
     /// use nififf3::{FlowFile, FlowFilesAsync};
     /// use tokio_stream::StreamExt as _;
@@ -283,10 +287,7 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
     /// # });
     /// ```
     #[cfg(feature = "stream")]
-    pub fn into_stream(self) -> impl futures_core::Stream<Item = Result<FlowFile<Vec<u8>>>>
-    where
-        R: Send,
-    {
+    pub fn into_stream(self) -> impl futures_core::Stream<Item = Result<FlowFile<Vec<u8>>>> {
         // `next` borrows `self`, so the future cannot be stored beside it.
         // Passing ownership through each step keeps the state machine flat,
         // at one boxed future per flow file — noise next to buffering one.
@@ -322,7 +323,7 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
 fn futures_unfold<T, F, Fut, I>(init: T, step: F) -> impl futures_core::Stream<Item = I>
 where
     F: FnMut(T) -> Fut,
-    Fut: std::future::Future<Output = Option<(I, T)>> + Send,
+    Fut: std::future::Future<Output = Option<(I, T)>>,
 {
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -342,7 +343,7 @@ where
     impl<T, F, Fut, I> futures_core::Stream for Unfold<T, F, Fut, I>
     where
         F: FnMut(T) -> Fut,
-        Fut: std::future::Future<Output = Option<(I, T)>> + Send,
+        Fut: std::future::Future<Output = Option<(I, T)>>,
     {
         type Item = I;
 
@@ -744,6 +745,44 @@ mod tests {
         for flow_file in collected {
             assert_eq!(flow_file.unwrap().content().as_slice(), b"hello");
         }
+    }
+
+    /// The stream inherits `Send` from the reader rather than demanding it, so
+    /// a single-threaded runtime can use a reader that is not `Send` while
+    /// `axum` and `tokio::spawn` still get a `Send` stream from one that is.
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn into_stream_follows_the_reader_on_send() {
+        use tokio_stream::StreamExt as _;
+
+        struct NotSend {
+            bytes: std::io::Cursor<Vec<u8>>,
+            _not_send: std::rc::Rc<()>,
+        }
+
+        fn assert_send<T: Send>(_: &T) {}
+
+        impl AsyncRead for NotSend {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.bytes).poll_read(cx, buf)
+            }
+        }
+
+        let collected: Vec<_> = FlowFilesAsync::new(NotSend {
+            bytes: std::io::Cursor::new(sample().to_bytes()),
+            _not_send: std::rc::Rc::new(()),
+        })
+        .into_stream()
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].as_ref().unwrap().content().as_slice(), b"hello");
+
+        assert_send(&FlowFilesAsync::new(std::io::Cursor::new(Vec::new())).into_stream());
     }
 
     #[cfg(feature = "stream")]

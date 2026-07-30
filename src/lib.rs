@@ -34,6 +34,13 @@ pub use sync::{FlowFiles, FlowFilesWriter};
 #[cfg(feature = "tokio")]
 pub use async_io::{FlowFilesAsync, FlowFilesWriterAsync};
 
+/// The [`Stream`](futures_core::Stream) trait
+/// [`FlowFilesAsync::into_stream`] returns, re-exported so that naming the
+/// bound does not mean adding a `futures-core` dependency of your own — and
+/// one whose version has to match this crate's.
+#[cfg(feature = "stream")]
+pub use futures_core::Stream;
+
 #[cfg(feature = "axum")]
 pub use axum_support::{
     BlockingResponseSink, BoxError, FlowFileBody, FlowFileRequest, FlowFilesResponse, ResponseSink,
