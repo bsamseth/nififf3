@@ -56,6 +56,20 @@ jobs:
       - name: Doc tests
         run: cargo test --all-features --locked --doc
 
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Kept in step with `rust-version` in Cargo.toml by hand — the action
+      # cannot read it from the manifest. Raising one means raising the other;
+      # code that needs a newer toolchain than the manifest promises fails here.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features --all-targets --locked
+
   examples:
     name: Examples
     runs-on: ubuntu-latest
@@ -83,7 +97,7 @@ jobs:
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [clippy, test, examples]
+    needs: [clippy, test, msrv, examples]
     runs-on: ubuntu-latest
     # Trusted publishing: crates.io issues a short-lived token in exchange for
     # GitHub's OIDC token, so there is no registry credential to store here.

@@ -2,6 +2,10 @@
 name = "nififf3"
 version = "0.2.0"
 edition = "2024"
+# Let-chains, which this crate uses throughout its parsing code, are stable
+# from 1.88 in edition 2024. Verified: 1.88 builds all features against the
+# locked dependency set, 1.87 rejects every let-chain.
+rust-version = "1.88"
 description = "Utilities for working with NiFi FlowFile V3 files: parsing, serialization, CLI and axum integration."
 license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/nififf3"
