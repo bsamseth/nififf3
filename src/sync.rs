@@ -318,9 +318,9 @@ impl<R: Read> Iterator for FlowFiles<R> {
         }
         let result = match FlowFile::parse_next_with_limits(&mut self.reader, self.limits) {
             Ok(None) => None,
-            Ok(Some(flow_file)) => {
-                Some(flow_file.into_bytes().map_err(crate::error::unwrap_io))
-            }
+            // The conversion recovers a truncation as `SizeMismatch`, so
+            // buffering here reports it the way `from_bytes` does.
+            Ok(Some(flow_file)) => Some(flow_file.into_bytes().map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {

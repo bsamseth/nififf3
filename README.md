@@ -164,7 +164,11 @@ flow-file failures that cannot occur. In those, content that ends before its
 declared size is `ErrorKind::UnexpectedEof` carrying an `Error::SizeMismatch`,
 which `io::Error::get_ref` and `downcast_ref` recover if the detail is wanted.
 Anything returning this crate's `Error` — `from_bytes`, `FlowFiles`,
-`FlowFilesAsync` — reports that case as `Error::SizeMismatch` directly.
+`FlowFilesAsync` — reports that case as `Error::SizeMismatch` directly, and so
+does `?`: converting an `io::Error` into this crate's `Error` recovers a
+truncation rather than burying it under `Error::Io`, so both routes to the same
+condition match the same way. Only a truncation is recovered — any other
+`io::Error` stays `Error::Io`, payload and all.
 
 The declared `size()` is what every serializer writes and every reader-based
 operation consumes, and each of the constructors above keeps it in step with

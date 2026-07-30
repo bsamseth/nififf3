@@ -7,22 +7,30 @@ pub(crate) fn truncated(expected: u64, actual: u64) -> std::io::Error {
     )
 }
 
-/// The inverse of [`truncated`]: recover the structured error an
-/// [`std::io::Error`] carries, so that an API returning [`Error`] reports
-/// e.g. a truncation as [`Error::SizeMismatch`] rather than burying it one
-/// level down in [`Error::Io`].
+/// The inverse of [`truncated`], and the whole of `From<io::Error> for Error`:
+/// recover the structured error an [`std::io::Error`] carries, so that an API
+/// returning [`Error`] reports a truncation as [`Error::SizeMismatch`] rather
+/// than burying it one level down in [`Error::Io`].
+///
+/// Deliberately narrow: only the exact shape [`truncated`] produces — an
+/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying a
+/// [`SizeMismatch`](Error::SizeMismatch) — is unwrapped. Any other carried
+/// [`Error`] stays inside [`Error::Io`], because it came from somewhere else:
+/// readers compose, and one flow-file stream nested inside another must not
+/// report the inner stream's `InvalidMagic` as if it were its own.
 pub(crate) fn unwrap_io(err: std::io::Error) -> Error {
-    if !matches!(err.get_ref(), Some(inner) if inner.is::<Error>()) {
+    let is_truncation = err.kind() == std::io::ErrorKind::UnexpectedEof
+        && matches!(
+            err.get_ref().and_then(|inner| inner.downcast_ref::<Error>()),
+            Some(Error::SizeMismatch { .. })
+        );
+    if !is_truncation {
         return Error::Io(err);
     }
-    let kind = err.kind();
-    match err.into_inner() {
-        Some(inner) => match inner.downcast::<Error>() {
-            Ok(err) => *err,
-            // Unreachable given the check above, but not worth a panic.
-            Err(inner) => Error::Io(std::io::Error::new(kind, inner)),
-        },
-        None => Error::Io(kind.into()),
+    match err.into_inner().and_then(|inner| inner.downcast().ok()) {
+        Some(inner) => *inner,
+        // Unreachable given the check above, but not worth a panic.
+        None => Error::Io(std::io::ErrorKind::UnexpectedEof.into()),
     }
 }
 
@@ -40,8 +48,12 @@ pub(crate) fn poisoned() -> std::io::Error {
 pub enum Error {
     /// An underlying I/O error, including unexpected end of input while
     /// parsing the header.
+    ///
+    /// Converting an [`std::io::Error`] into an [`Error`] goes through
+    /// [`From`], which recovers a truncation as
+    /// [`SizeMismatch`](Self::SizeMismatch) instead of wrapping it here.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
 
     /// The input does not start with the `NiFiFF3` magic header.
     #[error("invalid magic header: expected \"NiFiFF3\", got {0:?}")]
@@ -111,14 +123,20 @@ pub enum Error {
     },
 }
 
-/// The counterpart to the [`Error::Io`] conversion, so `?` on a parsing
-/// function works inside a function returning [`std::io::Result`] too.
+/// The counterpart to the [`From<io::Error>`](Error) conversion, so `?` on a
+/// parsing function works inside a function returning [`std::io::Result`] too.
 ///
 /// [`Error::Io`] unwraps back to the error it carries; everything else
 /// becomes a payload on an [`std::io::Error`], under the kind the rest of the
 /// crate uses for it — [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof)
 /// for a truncation, [`InvalidData`](std::io::ErrorKind::InvalidData)
-/// otherwise. Round-trips: converting back recovers the original variant.
+/// otherwise.
+///
+/// [`Error::SizeMismatch`] round-trips: converting back recovers the variant,
+/// which is what lets an [`std::io::Result`] from `into_bytes` or a writer
+/// carry a truncation into an [`Error`]-returning caller intact. The other
+/// variants convert back to [`Error::Io`], since an [`std::io::Error`] this
+/// crate did not build is not one it should take apart.
 ///
 /// ```
 /// use nififf3::{Error, FlowFile};
@@ -134,6 +152,42 @@ pub enum Error {
 ///     Some(Error::InvalidMagic(_))
 /// ));
 /// ```
+/// Recovers a truncation rather than wrapping it: an
+/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying an
+/// [`Error::SizeMismatch`] — which is how `into_bytes`, `write_to` and the
+/// writers report content that ends early — converts back to that variant,
+/// not to [`Error::Io`] around it.
+///
+/// So `?` on an [`std::io::Result`] inside an [`Error`]-returning function
+/// yields the same variant the parsing entry points would have produced for
+/// the same condition:
+///
+/// ```
+/// use nififf3::{Error, FlowFile};
+///
+/// fn buffer(bytes: &[u8]) -> Result<FlowFile<Vec<u8>>, Error> {
+///     Ok(FlowFile::parse(bytes)?.into_bytes()?) // `?` on an `io::Result`
+/// }
+///
+/// let mut truncated = FlowFile::builder().content(&b"hello"[..]).to_bytes();
+/// truncated.truncate(truncated.len() - 2);
+///
+/// assert!(matches!(
+///     buffer(&truncated),
+///     Err(Error::SizeMismatch { expected: 5, actual: 3 })
+/// ));
+/// ```
+///
+/// Every other [`std::io::Error`] becomes [`Error::Io`], including one that
+/// happens to carry some other [`Error`] — that payload belongs to whatever
+/// produced it, which may be an entirely different flow-file stream further
+/// down the reader stack.
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        unwrap_io(err)
+    }
+}
+
 impl From<Error> for std::io::Error {
     fn from(err: Error) -> Self {
         use std::io::ErrorKind;
@@ -156,8 +210,11 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
 
+    /// Every variant converts into an `io::Error` under a sensible kind, and
+    /// keeps its message and its payload — so `downcast_ref` recovers the
+    /// detail whichever variant it was.
     #[test]
-    fn error_round_trips_through_io_error() {
+    fn every_error_converts_into_an_io_error_that_carries_it() {
         for (err, kind) in [
             (
                 Error::SizeMismatch {
@@ -172,8 +229,37 @@ mod tests {
             let text = err.to_string();
             let io: std::io::Error = err.into();
             assert_eq!(io.kind(), kind);
-            // `unwrap_io` is what the readers use to undo this.
-            assert_eq!(unwrap_io(io).to_string(), text);
+            assert_eq!(io.to_string(), text);
+            assert!(io.get_ref().is_some_and(|inner| inner.is::<Error>()));
+        }
+    }
+
+    /// Coming back the other way is deliberately narrower: only a truncation
+    /// is unwrapped, because only a truncation is a condition *this* stream
+    /// can be sure it caused. See [`unwrap_io`].
+    #[test]
+    fn only_a_truncation_round_trips_back_into_its_variant() {
+        let round_tripped = Error::from(std::io::Error::from(Error::SizeMismatch {
+            expected: 5,
+            actual: 3,
+        }));
+        assert!(
+            matches!(
+                round_tripped,
+                Error::SizeMismatch {
+                    expected: 5,
+                    actual: 3
+                }
+            ),
+            "{round_tripped:?}"
+        );
+
+        for err in [Error::InvalidMagic([0; 7]), Error::TrailingData(2)] {
+            let text = err.to_string();
+            let back = Error::from(std::io::Error::from(err));
+            assert!(matches!(back, Error::Io(_)), "{back:?}");
+            // Still legible, and the payload is still there to downcast.
+            assert!(back.to_string().contains(&text));
         }
     }
 
@@ -183,6 +269,40 @@ mod tests {
         let back: std::io::Error = Error::Io(io).into();
         assert_eq!(back.kind(), ErrorKind::ConnectionReset);
         assert_eq!(back.to_string(), "gone");
+    }
+
+    /// The public conversion, not just the private helper: `?` on an
+    /// `io::Result` must land on the same variant the parsers produce.
+    #[test]
+    fn a_truncation_survives_the_public_conversion() {
+        let err = Error::from(truncated(5, 3));
+        assert!(
+            matches!(
+                err,
+                Error::SizeMismatch {
+                    expected: 5,
+                    actual: 3
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The narrow half: any other carried error belongs to whoever built it.
+    /// A flow-file reader wrapping another must not adopt the inner stream's
+    /// failure as its own.
+    #[test]
+    fn an_unrelated_carried_error_stays_io() {
+        for inner in [
+            std::io::Error::new(ErrorKind::InvalidData, Error::InvalidMagic([0; 7])),
+            // Same payload type and the same kind a truncation uses, so only
+            // the variant tells them apart.
+            std::io::Error::new(ErrorKind::UnexpectedEof, Error::InvalidMagic([0; 7])),
+            std::io::Error::new(ErrorKind::UnexpectedEof, Error::TrailingData(2)),
+        ] {
+            let err = Error::from(inner);
+            assert!(matches!(err, Error::Io(_)), "{err:?}");
+        }
     }
 
     #[test]

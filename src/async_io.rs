@@ -288,12 +288,8 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
             .await
         {
             Ok(None) => None,
-            Ok(Some(flow_file)) => Some(
-                flow_file
-                    .into_bytes_async()
-                    .await
-                    .map_err(crate::error::unwrap_io),
-            ),
+            // As in `FlowFiles::next`: the conversion recovers a truncation.
+            Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await.map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {
