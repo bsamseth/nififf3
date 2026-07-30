@@ -14,6 +14,14 @@ use crate::FlowFile;
 /// ```json
 /// {"size":5,"attributes":{"filename":"greeting.txt"},"content":"aGVsbG8="}
 /// ```
+///
+/// # Panics
+///
+/// In debug builds, if `size` disagrees with the content's actual length, as
+/// [`FlowFile::to_bytes`](crate::FlowFile::to_bytes) does — only reachable by
+/// breaking [`map_content`](crate::FlowFile::map_content)'s contract. The check
+/// is here because `Deserialize` rejects that mismatch, so without it a
+/// release build would emit JSON its own reader refuses.
 impl Serialize for FlowFile<Vec<u8>> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -23,6 +31,11 @@ impl Serialize for FlowFile<Vec<u8>> {
             content: String,
         }
 
+        debug_assert_eq!(
+            self.size,
+            self.content.len() as u64,
+            "declared size does not match the content; see FlowFile::with_size"
+        );
         Repr {
             size: self.size,
             attributes: self
@@ -38,7 +51,9 @@ impl Serialize for FlowFile<Vec<u8>> {
 
 /// Deserializes the structure produced by the `Serialize` impl. The `size`
 /// field may be omitted; when present it must match the decoded content
-/// length. Missing `attributes` default to an empty map.
+/// length. Missing `attributes` default to an empty map, and missing `content`
+/// to no content — so `{}` is a valid empty flow file, and every value this
+/// impl can produce round-trips.
 impl<'de> Deserialize<'de> for FlowFile<Vec<u8>> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -47,6 +62,7 @@ impl<'de> Deserialize<'de> for FlowFile<Vec<u8>> {
             size: Option<u64>,
             #[serde(default)]
             attributes: HashMap<String, String>,
+            #[serde(default)]
             content: String,
         }
 
@@ -99,6 +115,23 @@ mod tests {
             assert_eq!(flow_file.size(), 5);
             assert_eq!(flow_file.attributes()["filename"], "greeting.txt");
             assert_eq!(flow_file.content().as_slice(), b"hello");
+        }
+    }
+
+    /// An empty flow file is an ordinary one, so it has to survive the trip.
+    /// `content` is omitted from the shape only when there is none.
+    #[test]
+    fn an_empty_flow_file_round_trips() {
+        let empty = FlowFile::builder().content(Vec::new());
+        let json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(
+            serde_json::from_str::<FlowFile<Vec<u8>>>(&json).unwrap(),
+            empty
+        );
+
+        for json in ["{}", r#"{"attributes":{}}"#, r#"{"size":0}"#] {
+            let flow_file: FlowFile<Vec<u8>> = serde_json::from_str(json).unwrap();
+            assert_eq!(flow_file, empty, "{json}");
         }
     }
 
