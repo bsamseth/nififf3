@@ -241,6 +241,23 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         }
     }
 
+    /// A reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// A mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the reader, returning the underlying one. See
+    /// [`FlowFiles::into_inner`](crate::FlowFiles::into_inner) for what it is
+    /// positioned at.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     /// Adapt into a [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
     /// of flow files, for composing with `StreamExt` and anything that takes
     /// a stream.
@@ -522,6 +539,11 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
         self.count
     }
 
+    /// A reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.writer
+    }
+
     /// A mutable reference to the underlying writer.
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.writer
@@ -644,6 +666,23 @@ mod tests {
             Some(Err(Error::InvalidMagic(_)))
         ));
         assert!(flow_files.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_async_reader_comes_back_out_positioned_after_the_flow_files() {
+        let mut bytes = sample().to_bytes();
+        bytes.extend_from_slice(b"and then something else");
+
+        let mut flow_files = FlowFilesAsync::new(bytes.as_slice());
+        assert!(flow_files.next().await.unwrap().is_ok());
+
+        let mut trailer = Vec::new();
+        flow_files
+            .into_inner()
+            .read_to_end(&mut trailer)
+            .await
+            .unwrap();
+        assert_eq!(trailer, b"and then something else");
     }
 
     #[tokio::test]

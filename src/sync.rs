@@ -307,6 +307,43 @@ impl<R: Read> FlowFiles<R> {
             done: false,
         }
     }
+
+    /// A reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// A mutable reference to the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the iterator, returning the underlying reader.
+    ///
+    /// The reader is left wherever iteration stopped: after a `None` that is
+    /// the end of the flow files and the start of whatever follows them, which
+    /// is what makes this useful — a trailer, or the next section of a
+    /// multiplexed stream. Stopping early instead leaves it part-way through a
+    /// flow file, and after an error the position is not meaningful at all.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, FlowFiles};
+    /// use std::io::Read;
+    ///
+    /// let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+    /// bytes.extend_from_slice(b"and then something else");
+    ///
+    /// let mut flow_files = FlowFiles::new(bytes.as_slice());
+    /// flow_files.next().unwrap()?;
+    ///
+    /// let mut trailer = Vec::new();
+    /// flow_files.into_inner().read_to_end(&mut trailer)?;
+    /// assert_eq!(trailer, b"and then something else");
+    /// # Ok::<(), nififf3::Error>(())
+    /// ```
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
 }
 
 impl<R: Read> Iterator for FlowFiles<R> {
@@ -483,6 +520,11 @@ impl<W: Write> FlowFilesWriter<W> {
         self.count
     }
 
+    /// A reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.writer
+    }
+
     /// A mutable reference to the underlying writer.
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.writer
@@ -583,6 +625,22 @@ mod tests {
         assert!(matches!(iter.next(), Some(Err(Error::InvalidMagic(_)))));
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
+    }
+
+    /// Reading flow files off the front of a stream that holds something else
+    /// afterwards, which is what handing the reader back is for.
+    #[test]
+    fn the_reader_comes_back_out_positioned_after_the_flow_files() {
+        let mut bytes = sample_bytes();
+        bytes.extend_from_slice(b"and then something else");
+
+        let mut flow_files = FlowFiles::new(bytes.as_slice());
+        assert!(flow_files.next().unwrap().is_ok());
+        assert_eq!(flow_files.get_ref().len(), b"and then something else".len());
+
+        let mut trailer = Vec::new();
+        flow_files.into_inner().read_to_end(&mut trailer).unwrap();
+        assert_eq!(trailer, b"and then something else");
     }
 
     #[test]
