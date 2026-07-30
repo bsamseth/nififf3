@@ -1,6 +1,11 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
+// Label feature-gated items in the rendered docs ("Available on crate feature
+// `tokio` only"). `docs.rs` passes `--cfg docsrs`; a plain `cargo doc` on
+// stable does not, so neither attribute is seen there.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg))]
 
 use std::collections::HashMap;
 

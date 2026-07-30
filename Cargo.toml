@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 
 [package.metadata.docs.rs]
 all-features = true
+# Turns on the crate's `doc(auto_cfg)`, so gated items say which feature they
+# need. Without it every item looks unconditionally available.
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
