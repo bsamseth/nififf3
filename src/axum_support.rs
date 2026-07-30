@@ -534,9 +534,14 @@ impl FlowFilesResponse {
     /// Set how many serialized bytes may be in flight between the producer
     /// and the socket. Defaults to 64 KiB; ignored by
     /// [`from_vec`](Self::from_vec).
+    ///
+    /// Rounded up to at least one byte: a buffer of zero can never accept a
+    /// write, so the producer would park on its first one and the response
+    /// would hang rather than fail. One byte is pathological but it makes
+    /// progress; pick a real size for a real response.
     #[must_use]
     pub fn buffer_size(mut self, bytes: usize) -> Self {
-        self.buffer_size = bytes;
+        self.buffer_size = bytes.max(1);
         self
     }
 }

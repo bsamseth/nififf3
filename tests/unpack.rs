@@ -416,6 +416,35 @@ async fn from_vec_sets_a_content_length() {
     assert!(length > 0);
 }
 
+/// A zero-sized buffer would leave the producer's first write parked forever
+/// on a duplex that can never accept a byte, hanging the response with no error
+/// to show for it. The timeout is the assertion: a regression fails the test
+/// instead of wedging the suite.
+#[tokio::test]
+async fn a_zero_buffer_size_still_delivers_the_body() {
+    let response = FlowFilesResponse::new(|mut writer| async move {
+        writer
+            .write_bytes(&FlowFile::builder().content(&b"delivered"[..]))
+            .await?;
+        Ok(())
+    })
+    .buffer_size(0)
+    .into_response();
+
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("a zero buffer size must not hang the response")
+    .unwrap()
+    .to_bytes();
+
+    let mut parts = FlowFilesAsync::new(body.as_ref());
+    let part = parts.next().await.unwrap().unwrap();
+    assert_eq!(part.content().as_slice(), b"delivered");
+}
+
 #[tokio::test]
 async fn a_producer_error_truncates_the_body_rather_than_ending_it_cleanly() {
     let response = FlowFilesResponse::new(|mut writer| async move {
