@@ -50,6 +50,10 @@ async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
                 .reader(record, record.len() as u64);
             writer.write(part).await?;
         }
+        // The parts left as they were found, so the total is only known here.
+        // The terminator declares it for the bundle, which is what lets
+        // `MergeContent` fill its bin downstream.
+        writer.write_bytes(&parts.terminate()).await?;
         Ok(())
     }))
 }
@@ -94,18 +98,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let body = response.into_body().collect().await?.to_bytes();
     let mut flow_files = FlowFilesAsync::new(body.as_ref());
+    let mut declared = None;
     let mut count = 0;
     while let Some(part) = flow_files.next().await {
         let part = part?;
-        println!(
-            "  [{}] {} = {:?}",
-            part.attributes()["fragment.index"],
-            part.attributes()["filename"],
-            String::from_utf8_lossy(part.content()),
-        );
+        // The last flow file is the terminator: no content, and the count for
+        // the whole bundle including itself.
+        match part.attributes().get("fragment.count") {
+            Some(total) => {
+                declared = Some(total.parse::<usize>()?);
+                println!(
+                    "  [{}] terminator, count={total}",
+                    part.attributes()["fragment.index"]
+                );
+            }
+            None => println!(
+                "  [{}] {} = {:?}",
+                part.attributes()["fragment.index"],
+                part.attributes()["filename"],
+                String::from_utf8_lossy(part.content()),
+            ),
+        }
         count += 1;
     }
-    assert_eq!(count, 3);
+    assert_eq!(count, 4, "three records and the terminator");
+    assert_eq!(declared, Some(count), "the bundle declares its own size");
 
     // --- the status codes still available before the body starts -----------
     let response = app

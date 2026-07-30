@@ -99,6 +99,10 @@ async fn unpack(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> 
                 }
             }
         }
+        // How many entries there were is only known now, so the count goes on
+        // a terminator rather than on the parts. Without it `MergeContent`
+        // could never fill the bin and would fail the whole bundle.
+        writer.write_bytes(&parts.terminate()).await?;
         Ok(())
     }))
 }
@@ -152,6 +156,9 @@ async fn unpack_lenient(req: StrictFlowFileRequest) -> Result<FlowFilesResponse,
                 }
             };
         }
+        // As in `unpack`: the bundle declares its own size on the way out, so
+        // what did arrive is still mergeable — the failure report included.
+        writer.write_bytes(&parts.terminate()).await?;
         Ok(())
     }))
 }
@@ -191,6 +198,38 @@ async fn collect(response: axum::response::Response) -> Vec<FlowFile<Vec<u8>>> {
     collected
 }
 
+/// The entry parts of a response, checking that the bundle declares its own
+/// size the way `MergeContent` needs before dropping the terminator.
+///
+/// The handlers do not know how many entries an archive holds until they have
+/// walked it, so the count arrives last, on a flow file that counts itself.
+async fn parts_of(response: axum::response::Response) -> Vec<FlowFile<Vec<u8>>> {
+    let mut bundle = collect(response).await;
+
+    let terminator = bundle.pop().expect("a terminated bundle is never empty");
+    assert_eq!(terminator.size(), 0, "the terminator carries no content");
+    assert_eq!(
+        terminator.attributes()[nififf3::attr::FRAGMENT_COUNT],
+        (bundle.len() + 1).to_string(),
+        "the count covers every flow file in the bundle, terminator included"
+    );
+    assert_eq!(
+        terminator.attributes()[nififf3::attr::FRAGMENT_INDEX],
+        (bundle.len() + 1).to_string(),
+        "and it is the last of them"
+    );
+    for part in &bundle {
+        assert!(
+            !part
+                .attributes()
+                .contains_key(nififf3::attr::FRAGMENT_COUNT),
+            "one flow file declares the count; NiFi asks for no more"
+        );
+    }
+
+    bundle
+}
+
 #[tokio::test]
 async fn unpacks_an_archive_into_one_flow_file_per_entry() {
     let archive = tar_gz(&[
@@ -213,7 +252,7 @@ async fn unpacks_an_archive_into_one_flow_file_per_entry() {
     // Streamed, so the length is not known when the headers go out.
     assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
 
-    let parts = collect(response).await;
+    let parts = parts_of(response).await;
     assert_eq!(parts.len(), 3);
 
     let names: Vec<_> = parts
@@ -289,7 +328,9 @@ async fn a_truncated_entry_is_reported_as_a_part_when_the_handler_buffers() {
         "the flow file itself was valid, so the request succeeded"
     );
 
-    let parts = collect(response).await;
+    // The bundle is still terminated, so what did arrive is mergeable: the
+    // good entry and the failure report bin together and complete.
+    let parts = parts_of(response).await;
     let (ok, broken): (Vec<_>, Vec<_>) = parts
         .iter()
         .partition(|part| !part.attributes().contains_key(ERROR_ATTRIBUTE));
@@ -339,14 +380,16 @@ async fn a_missing_content_type_is_rejected_before_any_unpacking() {
 }
 
 #[tokio::test]
-async fn an_archive_with_no_entries_is_an_empty_body() {
+async fn an_archive_with_no_entries_is_a_bundle_with_no_parts() {
     let response = app()
         .oneshot(request(parent_flow_file(tar_gz(&[]).await)))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(collect(response).await.is_empty());
+    // The terminator is still there, declaring a bundle of one: an empty
+    // archive is a split that produced nothing, not a truncated response.
+    assert!(parts_of(response).await.is_empty());
 }
 
 #[tokio::test]

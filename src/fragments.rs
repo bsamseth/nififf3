@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::{FlowFileBuilder, attr};
+use crate::{FlowFile, FlowFileBuilder, attr};
 
 /// The attribute keys [`Fragments`] writes.
 #[derive(Debug, Clone)]
@@ -37,6 +37,8 @@ impl Default for Keys {
 /// - [`fragment.index`](attr::FRAGMENT_INDEX) — a one-up counter from 1.
 /// - [`fragment.count`](attr::FRAGMENT_COUNT) — only after
 ///   [`with_count`](Self::with_count); the total is rarely known up front.
+///   See *Declaring the count* below, because `MergeContent` cannot reassemble
+///   a bundle that never declares one.
 /// - [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) — the
 ///   parent's [`filename`](attr::FILENAME), if it had one.
 ///
@@ -62,6 +64,21 @@ impl Default for Keys {
 /// assert_eq!(first.attributes()["source"], "upload"); // inherited
 /// assert_eq!(first.attributes()["filename"], "a.txt"); // overridden
 /// ```
+///
+/// # Declaring the count
+///
+/// A bundle has to say how big it is. NiFi's `MergeContent` fills a bin when it
+/// holds as many flow files as the [`fragment.count`](attr::FRAGMENT_COUNT) of
+/// one of them says, and a bundle that never declares a count is not merged at
+/// all — the bin times out and every flow file in it is routed to `failure`.
+/// There are two ways to declare it, and a split uses exactly one:
+///
+/// - The total is known before the parts are built: [`with_count`](Self::with_count),
+///   and every part carries it.
+/// - The total is only known once the input is exhausted — a stream, an
+///   archive, a decoder: [`terminate`](Self::terminate), which ends the set
+///   with an empty flow file carrying the count. Nothing has to be held back
+///   or rewritten, so the parts can be streamed as they are produced.
 #[derive(Debug, Clone)]
 pub struct Fragments {
     attributes: HashMap<String, String>,
@@ -194,12 +211,92 @@ impl Fragments {
             self.index,
             self.count
         );
+        self.part(self.index, self.count)
+    }
+
+    /// Finish the set with a terminator: an empty flow file carrying the
+    /// [`fragment.count`](attr::FRAGMENT_COUNT) the parts could not know.
+    ///
+    /// For a split whose total is only known once the input runs out — the
+    /// streaming case, where the earlier parts are on the wire long before the
+    /// last one is read. NiFi's `MergeContent` needs `fragment.count` on *at
+    /// least one* flow file in the bundle and fills a bin when it holds that
+    /// many flow files, so a final flow file that declares the count
+    /// reassembles correctly: it is one of the flow files in the bin, and
+    /// contributes no content to the merge.
+    ///
+    /// The count therefore includes the terminator itself. After `n` parts the
+    /// terminator carries `fragment.index = fragment.count = n + 1`, and this
+    /// consumes the counter — a part emitted afterwards would put `n + 2` flow
+    /// files in a bin declared to hold `n + 1`, which never fills and, once the
+    /// bin times out, routes the whole set to `MergeContent`'s `failure`
+    /// relationship.
+    ///
+    /// Use this *or* [`with_count`](Self::with_count), not both: when the total
+    /// is known up front the parts can declare it themselves and no terminator
+    /// is needed.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, FlowFiles, FlowFilesWriter};
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "records.txt")
+    ///     .content(&b"alpha\nbeta"[..]);
+    ///
+    /// // A producer that does not know how many parts there will be.
+    /// let mut parts = parent.fragments();
+    /// let mut out = Vec::new();
+    /// let mut writer = FlowFilesWriter::new(&mut out);
+    /// for record in parent.content().split(|byte| *byte == b'\n') {
+    ///     writer.write_bytes(&parts.next().content(record))?;
+    /// }
+    /// writer.write_bytes(&parts.terminate())?;
+    /// writer.finish()?;
+    ///
+    /// let bundle: Vec<_> = FlowFiles::new(out.as_slice()).collect::<Result<_, _>>()?;
+    /// assert_eq!(bundle.len(), 3, "two parts and the terminator");
+    ///
+    /// // Only the terminator declares the count, and it counts itself.
+    /// assert!(!bundle[0].attributes().contains_key("fragment.count"));
+    /// assert_eq!(bundle[2].attributes()["fragment.count"], "3");
+    /// assert_eq!(bundle[2].attributes()["fragment.index"], "3");
+    /// assert_eq!(bundle[2].size(), 0);
+    /// # Ok::<(), nififf3::Error>(())
+    /// ```
+    ///
+    /// A consumer doing its own reassembly can recognize the terminator as the
+    /// part whose index equals the declared count and whose content is empty.
+    /// That is a convention, not a guarantee: an ordinary last part can look
+    /// the same, so a producer that emits empty parts *and* needs them told
+    /// apart should set an attribute of its own here — the returned flow file
+    /// is an ordinary one, and
+    /// [`attributes_mut`](crate::FlowFile::attributes_mut) still works.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if a count was already declared and the terminator
+    /// would not be the flow file that completes it.
+    #[must_use]
+    pub fn terminate(self) -> FlowFile<Vec<u8>> {
+        let index = self.index + 1;
+        debug_assert!(
+            self.count.is_none_or(|count| count == index),
+            "a set declared to hold {:?} cannot be terminated as flow file {index}; \
+             `with_count` already put the count on the parts",
+            self.count
+        );
+        self.part(index, Some(index)).content(Vec::new())
+    }
+
+    /// The attributes every flow file in the set carries, at `index` and with
+    /// `count` if it is to declare one.
+    fn part(&self, index: u64, count: Option<u64>) -> FlowFileBuilder {
         let mut builder = FlowFileBuilder::new()
             .attributes(self.attributes.clone())
             .attribute(attr::UUID, uuid::Uuid::new_v4().to_string())
             .attribute(self.keys.identifier.as_str(), self.identifier.as_str())
-            .attribute(self.keys.index.as_str(), self.index.to_string());
-        if let Some(count) = self.count {
+            .attribute(self.keys.index.as_str(), index.to_string());
+        if let Some(count) = count {
             builder = builder.attribute(self.keys.count.as_str(), count.to_string());
         }
         if let Some(filename) = &self.original_filename {
@@ -251,6 +348,85 @@ mod tests {
             "archive.tar"
         );
         assert_ne!(child.attributes()["uuid"], "parent-uuid");
+    }
+
+    #[test]
+    fn terminate_counts_itself_as_the_last_flow_file() {
+        let parent = parent();
+        let mut parts = parent.fragments();
+        let first = parts.next().content(&b"a"[..]);
+        let second = parts.next().content(&b"b"[..]);
+        let terminator = parts.terminate();
+
+        // NiFi fills the bin when it holds `fragment.count` flow files, and
+        // the terminator is one of them: two parts plus itself.
+        assert_eq!(terminator.attributes()["fragment.count"], "3");
+        assert_eq!(terminator.attributes()["fragment.index"], "3");
+        assert_eq!(terminator.size(), 0, "it contributes nothing to the merge");
+
+        // The count lives on the terminator alone, which is all NiFi asks for.
+        for part in [&first, &second] {
+            assert!(!part.attributes().contains_key("fragment.count"));
+        }
+
+        // And it is a member of the same bundle in every other respect.
+        assert_eq!(
+            terminator.attributes()["fragment.identifier"],
+            first.attributes()["fragment.identifier"]
+        );
+        assert_eq!(
+            terminator.attributes()["segment.original.filename"],
+            "archive.tar"
+        );
+        assert_ne!(terminator.attributes()["uuid"], first.attributes()["uuid"]);
+    }
+
+    #[test]
+    fn terminating_an_empty_split_is_a_bundle_of_one() {
+        let terminator = parent().fragments().terminate();
+        assert_eq!(terminator.attributes()["fragment.count"], "1");
+        assert_eq!(terminator.attributes()["fragment.index"], "1");
+        assert_eq!(terminator.size(), 0);
+    }
+
+    #[test]
+    fn terminate_honours_custom_attribute_keys() {
+        let mut parts = parent().fragments().count_attribute("split.total");
+        let _ = parts.next();
+        let terminator = parts.terminate();
+
+        assert_eq!(terminator.attributes()["split.total"], "2");
+        assert!(!terminator.attributes().contains_key("fragment.count"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "cannot be terminated as flow file 3")]
+    fn terminating_a_set_that_already_declared_its_count_is_caught() {
+        // Two parts of a set declared to hold two: the terminator would be a
+        // third flow file in a bin that fills at two.
+        let mut parts = parent().fragments().with_count(2);
+        let _ = parts.next();
+        let _ = parts.next();
+        let _ = parts.terminate();
+    }
+
+    /// The counted form and the terminated form describe the same bundle
+    /// size, so a consumer can treat them alike.
+    #[test]
+    fn a_terminated_bundle_declares_the_number_of_flow_files_it_contains() {
+        let parent = parent();
+        let mut parts = parent.fragments();
+        let mut bundle: Vec<_> = (0..4).map(|_| parts.next().content(Vec::new())).collect();
+        bundle.push(parts.terminate());
+
+        let declared: usize = bundle
+            .iter()
+            .find_map(|part| part.attributes().get("fragment.count"))
+            .expect("some flow file declares the count")
+            .parse()
+            .unwrap();
+        assert_eq!(declared, bundle.len());
     }
 
     #[test]
