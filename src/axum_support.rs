@@ -216,6 +216,16 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
 /// let response = flow_file.into_reader().into_response();
 /// # let _ = response;
 /// ```
+///
+/// # Truncated content
+///
+/// The `Content-Length` is committed before a content byte has been read, so a
+/// reader that ends before [`size`](FlowFile::size) cannot be reported as a
+/// status — by then the headers are gone. It fails the body instead, the way
+/// [`FlowFilesResponse`] does for a producer error: the client sees an aborted
+/// response rather than a complete one carrying a flow file whose header
+/// declares more content than it holds. A reader with *more* than `size` is
+/// cut to it, as everywhere else in this crate.
 impl<R> IntoResponse for FlowFile<R>
 where
     R: AsyncRead + Send + 'static,
@@ -230,9 +240,56 @@ where
                 (header::CONTENT_TYPE, MEDIA_TYPE.to_string()),
                 (header::CONTENT_LENGTH, total.to_string()),
             ],
-            Body::from_stream(ReaderStream::new(reader)),
+            Body::from_stream(ExactLength {
+                inner: Box::pin(ReaderStream::new(reader)),
+                declared: size,
+                remaining: total,
+                done: false,
+            }),
         )
             .into_response()
+    }
+}
+
+/// Fails the body if the wrapped reader yields fewer bytes than the response
+/// committed to, rather than ending it short of its `Content-Length`.
+///
+/// The header is served from an in-memory cursor and so always arrives whole;
+/// any shortfall is content, which is what the error reports.
+struct ExactLength {
+    inner: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
+    declared: u64,
+    remaining: u64,
+    done: bool,
+}
+
+impl Stream for ExactLength {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match ready!(this.inner.as_mut().poll_next(cx)) {
+            Some(Ok(chunk)) => {
+                this.remaining = this.remaining.saturating_sub(chunk.len() as u64);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Some(Err(err)) => {
+                this.done = true;
+                Poll::Ready(Some(Err(err)))
+            }
+            None => {
+                this.done = true;
+                Poll::Ready(if this.remaining == 0 {
+                    None
+                } else {
+                    let delivered = this.declared - this.remaining;
+                    Some(Err(crate::error::truncated(this.declared, delivered)))
+                })
+            }
+        }
     }
 }
 

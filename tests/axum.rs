@@ -59,6 +59,53 @@ async fn extracts_and_responds_with_flow_files() {
     assert_eq!(body.as_ref(), bytes.as_slice());
 }
 
+/// A response commits to a `Content-Length` computed from the declared size
+/// before a single content byte is read, so a reader that ends early can only
+/// be reported by breaking the body — completing it would hand the client a
+/// flow file whose header declares more content than it carries.
+#[tokio::test]
+async fn a_response_whose_content_reader_ends_early_fails_the_body() {
+    let flow_file = FlowFile::builder()
+        .attribute("filename", "greeting.txt")
+        .reader(std::io::Cursor::new(b"short".to_vec()), 10);
+
+    let response = flow_file.into_response();
+    let declared: usize = response.headers()[header::CONTENT_LENGTH]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let err = response
+        .into_body()
+        .collect()
+        .await
+        .expect_err("a short content reader must not complete the body");
+    assert!(
+        err.to_string().contains("size mismatch"),
+        "expected the truncation to be reported, got {err}"
+    );
+    assert!(declared > 5, "the header committed to the declared size");
+}
+
+/// The complement: a reader with more than the declared size is still cut to
+/// it, and the body completes cleanly at exactly `Content-Length`.
+#[tokio::test]
+async fn a_response_whose_content_reader_runs_long_is_cut_to_the_declared_size() {
+    let flow_file = FlowFile::builder().reader(std::io::Cursor::new(b"way too much".to_vec()), 3);
+
+    let response = flow_file.into_response();
+    let declared: usize = response.headers()[header::CONTENT_LENGTH]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), declared);
+    assert_eq!(FlowFile::from_bytes(&body).unwrap().content().as_slice(), b"way");
+}
+
 #[tokio::test]
 async fn extractor_streams_chunked_bodies() {
     let bytes = sample_bytes();
