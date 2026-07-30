@@ -53,7 +53,7 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 /// [`FlowFile::from_bytes`]) or a lazy variant whose content is a
 /// size-limited reader (via [`FlowFile::parse`] and, with the `tokio`
 /// feature, [`FlowFile::parse_async`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowFile<R> {
     pub(crate) size: u64,
     pub(crate) attributes: HashMap<String, String>,
@@ -93,7 +93,29 @@ impl<R> FlowFile<R> {
         self.size
     }
 
+    /// The value of one attribute, if it is set.
+    ///
+    /// The [`attr`] module names the ones NiFi gives a meaning to.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, attr};
+    ///
+    /// let flow_file = FlowFile::builder()
+    ///     .attribute(attr::FILENAME, "greeting.txt")
+    ///     .content(&b"hello"[..]);
+    ///
+    /// assert_eq!(flow_file.attribute(attr::FILENAME), Some("greeting.txt"));
+    /// assert_eq!(flow_file.attribute(attr::MIME_TYPE), None);
+    /// ```
+    pub fn attribute(&self, key: &str) -> Option<&str> {
+        self.attributes.get(key).map(String::as_str)
+    }
+
     /// The attributes of the flow file.
+    ///
+    /// For a single value, [`attribute`](Self::attribute) says what a missing
+    /// one means instead of panicking; the [`attr`] module names the
+    /// well-known keys.
     pub fn attributes(&self) -> &HashMap<String, String> {
         &self.attributes
     }
@@ -142,6 +164,34 @@ impl<R> FlowFile<R> {
     /// Consume the flow file, returning `(size, attributes, content)`.
     pub fn into_parts(self) -> (u64, HashMap<String, String>, R) {
         (self.size, self.attributes, self.content)
+    }
+
+    /// Build a flow file from the parts [`into_parts`](Self::into_parts)
+    /// yields, for putting one back together after taking it apart.
+    ///
+    /// Like [`FlowFileBuilder::reader`], this takes `size` on trust: it must be
+    /// the number of bytes `content` will yield, since it is what every
+    /// serializer declares and every reader-based operation consumes. Prefer
+    /// [`FlowFile::builder`] when building one from scratch — the builder's
+    /// finishers derive the size rather than asking for it.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..]);
+    ///
+    /// let (size, mut attributes, content) = flow_file.into_parts();
+    /// attributes.insert("seen".to_string(), "true".to_string());
+    /// let flow_file = FlowFile::from_parts(size, attributes, content);
+    ///
+    /// assert_eq!(flow_file.attribute("seen"), Some("true"));
+    /// assert_eq!(flow_file.size(), 5);
+    /// ```
+    #[must_use]
+    pub fn from_parts(size: u64, attributes: HashMap<String, String>, content: R) -> Self {
+        Self::from_raw_parts(size, attributes, content)
     }
 
     /// Transform the content container, keeping size and attributes.
@@ -431,6 +481,43 @@ mod tests {
             .write_to(&mut streamed)
             .unwrap();
         assert_eq!(flow_file.to_bytes(), streamed);
+    }
+
+    #[test]
+    fn parts_round_trip_through_from_parts() {
+        let flow_file = FlowFile::builder()
+            .attribute("filename", "greeting.txt")
+            .content(&b"hello"[..]);
+
+        let (size, attributes, content) = flow_file.clone().into_parts();
+        assert_eq!(FlowFile::from_parts(size, attributes, content), flow_file);
+    }
+
+    #[test]
+    fn flow_files_compare_on_every_part() {
+        let flow_file = FlowFile::builder().attribute("k", "v").content(&b"hi"[..]);
+
+        assert_eq!(flow_file, flow_file.clone());
+        assert_ne!(
+            flow_file,
+            FlowFile::builder().attribute("k", "w").content(&b"hi"[..])
+        );
+        assert_ne!(
+            flow_file,
+            FlowFile::builder().attribute("k", "v").content(&b"no"[..])
+        );
+        // The declared size is part of the identity, not just the content.
+        assert_ne!(flow_file, flow_file.clone().with_size(1));
+    }
+
+    #[test]
+    fn attribute_reports_a_missing_key_rather_than_panicking() {
+        let flow_file = FlowFile::builder()
+            .attribute(attr::FILENAME, "greeting.txt")
+            .content(Vec::new());
+
+        assert_eq!(flow_file.attribute(attr::FILENAME), Some("greeting.txt"));
+        assert_eq!(flow_file.attribute(attr::MIME_TYPE), None);
     }
 
     /// `map_content` is for containers that hold the same bytes, and carries
