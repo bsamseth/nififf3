@@ -450,14 +450,14 @@ impl FlowFile<Vec<u8>> {
     /// in this format is at most 4 bytes, so such an attribute cannot be
     /// written at all.
     ///
-    /// In debug builds, also if `size` disagrees with the content's actual
-    /// length — only reachable by breaking
-    /// [`map_content`](Self::map_content)'s contract. In release builds the
-    /// mismatch is written out as declared, where
-    /// [`from_bytes`](Self::from_bytes) will reject it.
+    /// Also if `size` disagrees with the content's actual length — only
+    /// reachable by breaking [`map_content`](Self::map_content)'s contract,
+    /// and checked in every build rather than only in debug, because the
+    /// alternative is emitting a flow file that only the reader at the far end
+    /// finds to be corrupt.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        debug_assert_eq!(
+        assert_eq!(
             self.size,
             self.content.len() as u64,
             "declared size does not match the content; see FlowFile::with_size"
@@ -525,6 +525,18 @@ mod tests {
             .write_to(&mut streamed)
             .unwrap();
         assert_eq!(flow_file.to_bytes(), streamed);
+    }
+
+    /// Checked in every build, not just debug: a flow file whose declared
+    /// size disagrees with its content serializes to bytes that only the
+    /// reader at the far end discovers to be corrupt.
+    #[test]
+    #[should_panic(expected = "declared size does not match the content")]
+    fn to_bytes_refuses_a_size_that_disagrees_with_the_content() {
+        let _ = FlowFile::builder()
+            .content(&b"hi"[..])
+            .with_size(99)
+            .to_bytes();
     }
 
     #[test]

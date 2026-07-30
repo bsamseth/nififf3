@@ -17,11 +17,11 @@ use crate::FlowFile;
 ///
 /// # Panics
 ///
-/// In debug builds, if `size` disagrees with the content's actual length, as
+/// If `size` disagrees with the content's actual length, as
 /// [`FlowFile::to_bytes`](crate::FlowFile::to_bytes) does — only reachable by
 /// breaking [`map_content`](crate::FlowFile::map_content)'s contract. The check
-/// is here because `Deserialize` rejects that mismatch, so without it a
-/// release build would emit JSON its own reader refuses.
+/// is here because `Deserialize` rejects that mismatch, so without it this
+/// would emit JSON its own reader refuses.
 impl Serialize for FlowFile<Vec<u8>> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -31,7 +31,7 @@ impl Serialize for FlowFile<Vec<u8>> {
             content: String,
         }
 
-        debug_assert_eq!(
+        assert_eq!(
             self.size,
             self.content.len() as u64,
             "declared size does not match the content; see FlowFile::with_size"

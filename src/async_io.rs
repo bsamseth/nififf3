@@ -171,6 +171,9 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
         let mut first = [0u8; 1];
         loop {
             match reader.read(&mut first).await {
+                // A one-byte buffer, so this is the end of the stream: a
+                // reader returning `Ok(0)` with room to fill is buggy, and
+                // retrying one would spin rather than recover.
                 Ok(0) => return Ok(None),
                 Ok(_) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} // retry

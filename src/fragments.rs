@@ -91,7 +91,7 @@ impl Default for Keys {
 ///   archive, a decoder: [`terminate`](Self::terminate), which ends the set
 ///   with an empty flow file carrying the count. Nothing has to be held back
 ///   or rewritten, so the parts can be streamed as they are produced.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Fragments {
     attributes: HashMap<String, String>,
     identifier: String,
@@ -200,10 +200,10 @@ impl Fragments {
     ///
     /// # Panics
     ///
-    /// In debug builds, if more fragments are produced than
-    /// [`with_count`](Self::with_count) declared — NiFi's `MergeContent`
-    /// bins on `fragment.count`, so an index past it describes a set that
-    /// cannot be reassembled. Release builds number past the count.
+    /// If more fragments are produced than [`with_count`](Self::with_count)
+    /// declared. NiFi's `MergeContent` bins on `fragment.count`, so an index
+    /// past it describes a set that cannot be reassembled — a panic is louder
+    /// than shipping a bundle that times out to `failure` in production.
     #[must_use]
     #[expect(
         clippy::should_implement_trait,
@@ -212,7 +212,7 @@ impl Fragments {
     )]
     pub fn next(&mut self) -> FlowFileBuilder {
         self.index += 1;
-        debug_assert!(
+        assert!(
             self.count.is_none_or(|count| self.index <= count),
             "fragment {} of a set declared to hold {:?}",
             self.index,
@@ -281,12 +281,12 @@ impl Fragments {
     ///
     /// # Panics
     ///
-    /// In debug builds, if a count was already declared and the terminator
-    /// would not be the flow file that completes it.
+    /// If a count was already declared and the terminator would not be the
+    /// flow file that completes it.
     #[must_use]
     pub fn terminate(self) -> FlowFile<Vec<u8>> {
         let index = self.index + 1;
-        debug_assert!(
+        assert!(
             self.count.is_none_or(|count| count == index),
             "a set declared to hold {:?} cannot be terminated as flow file {index}; \
              `with_count` already put the count on the parts",
@@ -414,7 +414,6 @@ mod tests {
         assert!(!terminator.attributes().contains_key("fragment.count"));
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "cannot be terminated as flow file 3")]
     fn terminating_a_set_that_already_declared_its_count_is_caught() {
@@ -476,7 +475,6 @@ mod tests {
         assert!(!child.attributes().contains_key("fragment.count"));
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "fragment 3 of a set declared to hold Some(2)")]
     fn producing_more_fragments_than_declared_is_caught() {
