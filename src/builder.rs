@@ -112,6 +112,7 @@ impl FlowFileBuilder {
     }
 
     /// Finish the build with in-memory content; the size is the content length.
+    #[must_use]
     pub fn content(self, content: impl Into<Vec<u8>>) -> FlowFile<Vec<u8>> {
         let content = content.into();
         FlowFile::from_raw_parts(content.len() as u64, self.attributes, content)
@@ -135,6 +136,7 @@ impl FlowFileBuilder {
     /// let mut out = Vec::new();
     /// flow_file.write_to(&mut out).unwrap();
     /// ```
+    #[must_use]
     pub fn reader<R>(self, content: R, size: u64) -> FlowFile<R> {
         FlowFile::from_raw_parts(size, self.attributes, content)
     }

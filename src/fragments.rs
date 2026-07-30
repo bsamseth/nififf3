@@ -204,6 +204,7 @@ impl Fragments {
     /// [`with_count`](Self::with_count) declared — NiFi's `MergeContent`
     /// bins on `fragment.count`, so an index past it describes a set that
     /// cannot be reassembled. Release builds number past the count.
+    #[must_use]
     #[expect(
         clippy::should_implement_trait,
         reason = "`Iterator` would have to yield builders forever, with no way \
