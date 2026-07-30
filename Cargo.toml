@@ -4,6 +4,8 @@ version = "0.2.0"
 edition = "2024"
 description = "Utilities for working with NiFi FlowFile V3 files: parsing, serialization, CLI and axum integration."
 license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/nififf3"
+repository = "https://github.com/bsamseth/nififf3"
 
 [package.metadata.docs.rs]
 all-features = true
