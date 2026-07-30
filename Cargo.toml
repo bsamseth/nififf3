@@ -6,6 +6,8 @@ description = "Utilities for working with NiFi FlowFile V3 files: parsing, seria
 license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/nififf3"
 repository = "https://github.com/bsamseth/nififf3"
+keywords = ["nifi", "flowfile", "apache-nifi", "dataflow", "etl"]
+categories = ["encoding", "parser-implementations", "command-line-utilities"]
 
 [package.metadata.docs.rs]
 all-features = true
