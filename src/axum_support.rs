@@ -66,6 +66,12 @@ pub type FlowFileRequest = FlowFile<tokio::io::Take<FlowFileBody>>;
 pub struct FlowFileBody {
     stream: BodyDataStream,
     chunk: Bytes,
+    /// Whether `stream` has already reported the end of the body. Polling a
+    /// [`Stream`] after it returns `None` is contractually undefined, and a
+    /// reader is free to keep reading past an end it has already been told
+    /// about — a flow file declaring more content than the body carries makes
+    /// that the ordinary case, not a pathological one.
+    ended: bool,
 }
 
 impl std::fmt::Debug for FlowFileBody {
@@ -87,10 +93,19 @@ impl AsyncRead for FlowFileBody {
                 buf.put_slice(&this.chunk.split_to(n));
                 return Poll::Ready(Ok(()));
             }
+            if this.ended {
+                return Poll::Ready(Ok(()));
+            }
             match Pin::new(&mut this.stream).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => this.chunk = chunk,
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(io::Error::other(err))),
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Err(err))) => {
+                    this.ended = true;
+                    return Poll::Ready(Err(io::Error::other(err)));
+                }
+                Poll::Ready(None) => {
+                    this.ended = true;
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -106,6 +121,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
         let body = FlowFileBody {
             stream: req.with_limited_body().into_body().into_data_stream(),
             chunk: Bytes::new(),
+            ended: false,
         };
         FlowFile::parse_async_with_limits(body, Limits::default()).await
     }

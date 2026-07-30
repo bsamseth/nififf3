@@ -122,6 +122,70 @@ async fn extractor_streams_chunked_bodies() {
     assert_eq!(body.as_ref(), bytes.as_slice());
 }
 
+/// Polling a `Stream` after it has returned `None` is contractually undefined,
+/// so the body adapter must not do it however hard it is read.
+///
+/// Driven with a flow file whose header declares more content than the body
+/// carries: reads run past the end of the stream but stay inside the declared
+/// size, so nothing else stops them reaching the adapter.
+#[tokio::test]
+async fn the_body_adapter_never_polls_the_request_stream_after_it_ends() {
+    use axum::extract::FromRequest;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct EndsOnce {
+        chunk: Option<Vec<u8>>,
+        ended: bool,
+        polled_after_end: Arc<AtomicBool>,
+    }
+
+    impl futures_core::Stream for EndsOnce {
+        type Item = Result<Vec<u8>, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.ended {
+                self.polled_after_end.store(true, Ordering::SeqCst);
+            }
+            let Some(chunk) = self.chunk.take() else {
+                self.ended = true;
+                return std::task::Poll::Ready(None);
+            };
+            std::task::Poll::Ready(Some(Ok(chunk)))
+        }
+    }
+
+    // A header declaring ten content bytes, followed by two of them.
+    let mut bytes = FlowFile::builder().content(vec![b'x'; 10]).to_bytes();
+    bytes.truncate(bytes.len() - 8);
+
+    let polled_after_end = Arc::new(AtomicBool::new(false));
+    let body = Body::from_stream(EndsOnce {
+        chunk: Some(bytes),
+        ended: false,
+        polled_after_end: Arc::clone(&polled_after_end),
+    });
+
+    let mut flow_file = FlowFileRequest::from_request(Request::post("/").body(body).unwrap(), &())
+        .await
+        .unwrap();
+    assert_eq!(flow_file.size(), 10);
+
+    // Read well past the end of the body, but inside the declared size.
+    let mut buf = [0u8; 4];
+    for _ in 0..3 {
+        let _ = tokio::io::AsyncReadExt::read(flow_file.content_mut(), &mut buf).await;
+    }
+
+    assert!(
+        !polled_after_end.load(Ordering::SeqCst),
+        "the request body stream was polled after it returned None"
+    );
+}
+
 // Minimal stream over a queue of items, avoiding a futures-util dependency.
 struct IterStream<T>(std::collections::VecDeque<T>);
 
