@@ -234,6 +234,36 @@ async fn strict_extractor_rejects_missing_or_wrong_content_type() {
     }
 }
 
+/// The rejected content type is attacker-controlled, so the 415 body must name
+/// enough of it to debug with and no more — not however much the client sent.
+#[tokio::test]
+async fn strict_extractor_does_not_echo_an_unbounded_content_type() {
+    let long = format!("application/{}", "a".repeat(4000));
+    let response = app()
+        .oneshot(
+            Request::post("/strict")
+                .header(header::CONTENT_TYPE, &long)
+                .body(Body::from(sample_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        body.len() < 256,
+        "the whole header came back: {} bytes",
+        body.len()
+    );
+    // Still enough of it to tell what was sent.
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("application/aaa")
+    );
+}
+
 #[tokio::test]
 async fn strict_extractor_rejects_invalid_body_with_400() {
     let response = app()

@@ -167,12 +167,35 @@ impl std::ops::DerefMut for StrictFlowFileRequest {
     }
 }
 
+/// How much of a rejected `Content-Type` is named in the rejection.
+///
+/// The value comes from the client, and it goes back to the client in an error
+/// body, so it is bounded here: enough to tell what was sent, not however much
+/// was sent.
+const MAX_ECHOED_CONTENT_TYPE: usize = 64;
+
+/// The head of `value`, cut to a character boundary, with an ellipsis if
+/// anything was dropped.
+fn abbreviated(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_CONTENT_TYPE {
+        return value.to_owned();
+    }
+    let mut end = MAX_ECHOED_CONTENT_TYPE;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
 /// Rejection returned by the [`StrictFlowFileRequest`] extractor.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StrictRejection {
     /// The request's `Content-Type` was missing or not
     /// `application/flowfile-v3`; responds with `415 Unsupported Media Type`.
+    ///
+    /// The value carried here is abbreviated to the first 64 bytes, since it
+    /// is reflected into the response body.
     #[error("expected content type \"application/flowfile-v3\", got {0:?}")]
     UnsupportedMediaType(Option<String>),
 
@@ -199,14 +222,14 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
         let content_type = req
             .headers()
             .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        // Compare the media type only, ignoring any parameters.
-        let media_type = content_type
-            .as_deref()
-            .map(|value| value.split(';').next().unwrap_or("").trim());
+            .and_then(|value| value.to_str().ok());
+        // Compare the media type only, ignoring any parameters. The comparison
+        // sees the whole header; only what travels back to the client is cut.
+        let media_type = content_type.map(|value| value.split(';').next().unwrap_or("").trim());
         if !media_type.is_some_and(|value| value.eq_ignore_ascii_case(MEDIA_TYPE)) {
-            return Err(StrictRejection::UnsupportedMediaType(content_type));
+            return Err(StrictRejection::UnsupportedMediaType(
+                content_type.map(abbreviated),
+            ));
         }
         Ok(Self(FlowFileRequest::from_request(req, state).await?))
     }
