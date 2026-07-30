@@ -5,6 +5,15 @@
 //! bytes, so a part may be arbitrarily large without ever being buffered —
 //! which is what makes unpacking an archive over HTTP practical.
 //!
+//! It also shows the other way to declare a bundle's size. `split.rs` counts
+//! the records first and calls `with_count`; here the parts are written as
+//! they are found, so the total is not known until the input runs out. The
+//! set ends with `terminate()`: an empty flow file carrying the count, which
+//! is one of the flow files in the bundle and so counts itself. NiFi's
+//! `MergeContent` needs the count on at least one flow file and fills its bin
+//! when it holds that many, so this reassembles like any other split — see
+//! `merge.rs`, which takes both forms.
+//!
 //!     cargo run --features tokio --example split_async
 
 use nififf3::{FlowFile, FlowFilesAsync, FlowFilesWriterAsync};
@@ -18,19 +27,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         parent.attributes()["filename"],
     );
 
-    let records: Vec<&[u8]> = parent.content().split(|byte| *byte == b'\n').collect();
-    let mut parts = parent.fragments().with_count(records.len() as u64);
+    // No `collect`, so the number of records is not known up front — the
+    // streaming shape, where each part is on the wire before the next is read.
+    let mut parts = parent.fragments();
 
     let mut out = Vec::new();
     let mut writer = FlowFilesWriterAsync::new(&mut out);
-    for (offset, record) in records.iter().enumerate() {
+    for (offset, record) in parent.content().split(|byte| *byte == b'\n').enumerate() {
         // `record` is an `AsyncRead`; its bytes go straight to the writer.
         let part = parts
             .next()
             .attribute("filename", format!("record-{offset}.txt"))
-            .reader(*record, record.len() as u64);
+            .reader(record, record.len() as u64);
         writer.write(part).await?;
     }
+
+    // Now the total is known. The terminator declares it for the whole
+    // bundle, counting itself: three records means a count of four.
+    writer.write_bytes(&parts.terminate()).await?;
     // Finish the stream rather than just dropping the writer. A `Vec` needs
     // nothing, but an `AsyncWrite` that encodes — a compressor, a TLS session
     // — emits its ending only on `shutdown`, and losing it corrupts the lot.
@@ -38,21 +52,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.finish().await?;
     println!("out: {count} flow files, {} bytes total", out.len());
 
+    // Read them back the way a downstream consumer would. Only the last flow
+    // file declares the count, which is all `MergeContent` asks for.
     let mut flow_files = FlowFilesAsync::new(out.as_slice());
+    let mut declared = None;
+    let mut seen = 0;
     while let Some(part) = flow_files.next().await {
         let part = part?;
-        println!(
-            "     [{}/{}] {} = {:?}",
-            part.attributes()["fragment.index"],
-            part.attributes()["fragment.count"],
-            part.attributes()["filename"],
-            String::from_utf8_lossy(part.content()),
-        );
+        let index = &part.attributes()["fragment.index"];
+        match part.attributes().get("fragment.count") {
+            Some(count) => {
+                declared = Some(count.parse::<usize>()?);
+                println!("     [{index}] terminator, count={count}");
+            }
+            None => println!(
+                "     [{index}] {} = {:?}",
+                part.attributes()["filename"],
+                String::from_utf8_lossy(part.content()),
+            ),
+        }
         assert_eq!(
             part.attributes()["segment.original.filename"],
             "records.txt"
         );
+        seen += 1;
     }
+
+    // What the bundle promised is what arrived — the terminator included.
+    assert_eq!(declared, Some(seen));
+    assert_eq!(seen, 4, "three records and the terminator");
     Ok(())
 }
 

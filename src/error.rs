@@ -21,7 +21,8 @@ pub(crate) fn truncated(expected: u64, actual: u64) -> std::io::Error {
 pub(crate) fn unwrap_io(err: std::io::Error) -> Error {
     let is_truncation = err.kind() == std::io::ErrorKind::UnexpectedEof
         && matches!(
-            err.get_ref().and_then(|inner| inner.downcast_ref::<Error>()),
+            err.get_ref()
+                .and_then(|inner| inner.downcast_ref::<Error>()),
             Some(Error::SizeMismatch { .. })
         );
     if !is_truncation {
@@ -230,7 +231,10 @@ mod tests {
             let io: std::io::Error = err.into();
             assert_eq!(io.kind(), kind);
             assert_eq!(io.to_string(), text);
-            assert!(io.get_ref().is_some_and(|inner| inner.is::<Error>()));
+            assert!(
+                io.get_ref()
+                    .is_some_and(<dyn std::error::Error + Send + Sync>::is::<Error>)
+            );
         }
     }
 

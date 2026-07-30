@@ -6,6 +6,14 @@
 //! the same, then restores the original filename and drops the fragment
 //! attributes so the result looks like the flow file the split started from.
 //!
+//! It takes both forms a split can arrive in: `split.rs` knows the total up
+//! front and puts `fragment.count` on every part, while `split_async.rs` does
+//! not and ends the bundle with a terminator carrying the count. Only one flow
+//! file has to declare it either way, so the completeness check is the same.
+//! The terminator needs one extra step here that NiFi does not need: it is
+//! empty, so concatenating it is harmless, but this example joins parts with a
+//! newline and would otherwise leave a trailing one.
+//!
 //!     cargo run --example merge
 
 use nififf3::{FlowFile, FlowFiles, attr};
@@ -32,13 +40,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     parts.sort_by_key(index_of);
 
-    // At least one part must declare the total, and the bin must be complete.
+    // At least one flow file must declare the total, and the bin must be
+    // complete. The count is over flow files in the bundle, so a terminator
+    // counts towards it — which is exactly why it can declare it at all.
     let expected: usize = parts
         .iter()
         .find_map(|part| part.attributes().get(attr::FRAGMENT_COUNT))
         .ok_or("no part declares fragment.count")?
         .parse()?;
     assert_eq!(parts.len(), expected, "incomplete fragment set");
+
+    // Drop a terminator now that it has served its purpose. It carries no
+    // content, so NiFi would concatenate it to nothing and never notice; a
+    // consumer that puts something *between* parts has to.
+    parts.retain(|part| !is_terminator(part, expected));
 
     let mut content = Vec::new();
     for (offset, part) in parts.iter().enumerate() {
@@ -71,23 +86,39 @@ fn index_of(part: &FlowFile<Vec<u8>>) -> u64 {
     part.attributes()[attr::FRAGMENT_INDEX].parse().unwrap_or(0)
 }
 
-/// The output of `split.rs`, with the parts deliberately out of order to show
-/// that `fragment.index` is what puts them back.
+/// Whether `part` is the empty flow file `Fragments::terminate` adds to carry
+/// the count: the last in the bundle, with nothing in it.
+///
+/// A convention rather than a guarantee — a split whose real last part happens
+/// to be empty looks identical. A producer that emits empty parts and needs
+/// them told apart should mark its terminator with an attribute of its own.
+fn is_terminator(part: &FlowFile<Vec<u8>>, count: usize) -> bool {
+    part.size() == 0 && index_of(part) == count as u64
+}
+
+/// The output of `split_async.rs` — a bundle whose count arrives on a
+/// terminator, since that is the form that needs the extra handling. Swapping
+/// `fragments()` for `fragments().with_count(3)` and dropping the terminator
+/// gives `split.rs`'s output, which merges through the same code.
+///
+/// The parts are deliberately out of order, to show that `fragment.index` is
+/// what puts them back.
 fn fragmented() -> Vec<u8> {
     let parent = FlowFile::builder()
         .attribute("filename", "records.txt")
         .attribute("source", "example")
         .content(Vec::new());
 
-    let mut parts = parent.fragments().with_count(3);
+    let mut parts = parent.fragments();
     let flow_files = [
         parts.next().content(&b"alpha"[..]),
         parts.next().content(&b"beta"[..]),
         parts.next().content(&b"gamma"[..]),
+        parts.terminate(),
     ];
 
     let mut bytes = Vec::new();
-    for offset in [2, 0, 1] {
+    for offset in [2, 0, 1, 3] {
         bytes.extend_from_slice(&flow_files[offset].to_bytes());
     }
     bytes

@@ -226,6 +226,53 @@ assert_eq!(children[0].attributes()["segment.original.filename"], "pair.txt");
 Each part also gets its own `uuid` and a `fragment.identifier` shared across
 the set. The attribute keys are configurable if you need different ones.
 
+### Declaring the count
+
+A bundle has to say how big it is. `MergeContent` fills a bin when it holds as
+many flow files as the `fragment.count` of one of them says, so a bundle that
+never declares a count is not merged at all: the bin times out and every flow
+file in it is routed to `failure`. It needs the count on *at least one* flow
+file, not on all of them, which leaves two ways to declare it.
+
+When the total is known before the parts are built, `with_count` puts it on
+every part, as above. When it is not — an archive, a decoder, anything read to
+the end — `terminate` closes the bundle with an empty flow file carrying the
+count, so the parts can still be streamed as they are produced:
+
+```rust
+use nififf3::{FlowFile, FlowFiles, FlowFilesWriter};
+
+let parent = FlowFile::builder()
+    .attribute("filename", "records.txt")
+    .content(&b"alpha\nbeta"[..]);
+
+let mut parts = parent.fragments(); // no `with_count`: the total is unknown
+let mut out = Vec::new();
+let mut writer = FlowFilesWriter::new(&mut out);
+for record in parent.content().split(|byte| *byte == b'\n') {
+    writer.write_bytes(&parts.next().content(record))?;
+}
+writer.write_bytes(&parts.terminate())?; // now the total is known
+writer.finish()?;
+
+let bundle: Vec<_> = FlowFiles::new(out.as_slice()).collect::<Result<_, _>>()?;
+assert_eq!(bundle.len(), 3, "two parts and the terminator");
+assert_eq!(bundle[2].attributes()["fragment.count"], "3");
+assert_eq!(bundle[2].size(), 0);
+# Ok::<(), nififf3::Error>(())
+```
+
+The count covers every flow file in the bundle, so the terminator counts
+itself: `n` parts give a terminator with `fragment.index = fragment.count =
+n + 1`. It carries no content, so defragmenting concatenates it to nothing.
+`terminate` consumes the counter, since a part emitted after it would leave the
+bin one flow file over what it declared and it would never fill.
+
+A consumer doing its own reassembly — rather than handing the bundle to NiFi —
+can recognize the terminator as the part whose index equals the declared count
+and whose content is empty, and should drop it if it puts anything *between*
+parts. `examples/merge.rs` does exactly that.
+
 `defragment` is the inverse, for the far end of a merge: it drops the fragment
 attributes and restores `filename` from `segment.original.filename`, so the
 reassembled flow file looks like the one the split started from.
@@ -333,6 +380,13 @@ async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
 The producer reports failure as a boxed error, so `?` works directly on
 whatever the decoder, plain I/O or this crate hands back — no converting
 between error types to satisfy the signature.
+
+A streaming producer is the case `terminate` exists for: it learns how many
+parts there were only once the input is exhausted, by which time the earlier
+parts are already on the wire. Ending with
+`writer.write_bytes(&parts.terminate()).await?` declares the count for the
+bundle without holding anything back, and is what makes the response
+reassemblable by `MergeContent` at all.
 
 Returning the response is the commitment to a 2xx, so validate before it and
 report a problem with an individual part *as a part* — a flow file whose
