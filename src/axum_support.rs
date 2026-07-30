@@ -338,6 +338,12 @@ impl Stream for ExactLength {
 /// The limit is enforced by the body, several layers below the reader this
 /// crate parses from, so it arrives as an opaque [`io::Error`] like any other
 /// transport failure. Only the chain distinguishes it.
+///
+/// That makes this a guess about how axum nests its errors, checked against
+/// axum 0.8 and http-body-util 0.1. If either re-wraps `LengthLimitError` the
+/// check stops matching and an over-large body silently becomes a 400 rather
+/// than a 413 — `extractor_honours_the_default_body_limit` in `tests/axum.rs`
+/// is what notices.
 fn is_body_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     // Matches `io::Error::get_ref`; the chain itself drops the auto traits.
     let err: &(dyn std::error::Error + 'static) = err;

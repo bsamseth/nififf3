@@ -34,7 +34,7 @@ pub use sync::{FlowFiles, FlowFilesWriter};
 #[cfg(feature = "tokio")]
 pub use async_io::{FlowFilesAsync, FlowFilesWriterAsync};
 
-/// The [`Stream`](futures_core::Stream) trait
+/// The [`Stream`] trait
 /// [`FlowFilesAsync::into_stream`] returns, re-exported so that naming the
 /// bound does not mean adding a `futures-core` dependency of your own — and
 /// one whose version has to match this crate's.
@@ -58,8 +58,44 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 /// The type is generic over the container of the content, `R`. Parsing
 /// produces either an in-memory [`FlowFile<Vec<u8>>`] (via
 /// [`FlowFile::from_bytes`]) or a lazy variant whose content is a
-/// size-limited reader (via [`FlowFile::parse`] and, with the `tokio`
-/// feature, [`FlowFile::parse_async`]).
+/// size-limited reader (via [`FlowFile::parse`], and its `tokio` twin
+/// `parse_async`).
+///
+/// # Where to start
+///
+/// That genericity spreads the entry points over several `impl` blocks below,
+/// each headed by a `Self` type rather than by what it is for. This is the
+/// index:
+///
+/// | | in memory | from a reader | many, concatenated |
+/// | --- | --- | --- | --- |
+/// | **parse** | [`from_bytes`] | [`parse`] | [`FlowFiles`], or [`parse_next`] |
+/// | **serialize** | [`to_bytes`] | [`write_to`] | [`FlowFilesWriter`] |
+#[cfg_attr(
+    feature = "tokio",
+    doc = "| **parse, async** | — | [`parse_async`] | [`FlowFilesAsync`], or [`parse_next_async`] |"
+)]
+#[cfg_attr(
+    feature = "tokio",
+    doc = "| **serialize, async** | — | [`write_to_async`] | [`FlowFilesWriterAsync`] |"
+)]
+///
+/// [`builder`](Self::builder) creates one from scratch, [`derive`](Self::derive)
+/// from another flow file's attributes, and [`fragments`](Self::fragments)
+/// splits one into many. The `*_with_limits` variants of every parsing entry
+/// point take [`Limits`], and are what to use on untrusted input.
+///
+/// [`from_bytes`]: Self::from_bytes
+/// [`parse`]: Self::parse
+/// [`parse_next`]: Self::parse_next
+/// [`to_bytes`]: Self::to_bytes
+/// [`write_to`]: Self::write_to
+#[cfg_attr(feature = "tokio", doc = "[`parse_async`]: Self::parse_async")]
+#[cfg_attr(
+    feature = "tokio",
+    doc = "[`parse_next_async`]: Self::parse_next_async"
+)]
+#[cfg_attr(feature = "tokio", doc = "[`write_to_async`]: Self::write_to_async")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowFile<R> {
     pub(crate) size: u64,
@@ -358,8 +394,9 @@ impl FlowFile<Vec<u8>> {
     /// # Errors
     ///
     /// [`Error::InvalidMagic`] or [`Error::InvalidAttribute`] for a malformed
-    /// header, [`Error::SizeMismatch`] if fewer content bytes are present than
-    /// the header declares, and [`Error::TrailingData`] if more.
+    /// header, [`Error::Io`] for one that ends part-way through,
+    /// [`Error::SizeMismatch`] if fewer content bytes are present than the
+    /// header declares, and [`Error::TrailingData`] if more.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_bytes_with_limits(bytes, Limits::UNLIMITED)
     }

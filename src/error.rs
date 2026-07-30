@@ -68,8 +68,8 @@ pub enum Error {
     ///
     /// Returned directly by everything that yields this crate's [`Error`]:
     /// [`FlowFile::from_bytes`](crate::FlowFile::from_bytes), which validates
-    /// a whole buffer, and the [`FlowFiles`](crate::FlowFiles) /
-    /// [`FlowFilesAsync`](crate::FlowFilesAsync) readers.
+    /// a whole buffer, and the [`FlowFiles`](crate::FlowFiles) reader and its
+    /// async twin.
     ///
     /// The operations that merely move content around — `write_to`,
     /// `into_bytes` and their async twins — return [`std::io::Result`] and so

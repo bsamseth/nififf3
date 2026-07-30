@@ -27,6 +27,8 @@ impl FlowFileBuilder {
     }
 
     /// Add a single attribute, replacing any previous value for the key.
+    ///
+    /// The [`attr`] module names the keys NiFi gives a meaning to.
     #[must_use]
     pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.attributes.insert(key.into(), value.into());
@@ -124,9 +126,8 @@ impl FlowFileBuilder {
     /// the size must be known up front; `size` is the number of bytes that
     /// will be read from `content` when the flow file is serialized.
     ///
-    /// If the size is not known, use [`buffered`](Self::buffered) or (with
-    /// the `tempfile` feature) [`tempfile`](Self::tempfile) to spool the
-    /// reader first.
+    /// If the size is not known, use [`buffered`](Self::buffered) or, with
+    /// the `tempfile` feature, `tempfile`/`spooled` to spool the reader first.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -144,8 +145,9 @@ impl FlowFileBuilder {
     /// Finish the build by reading `content` to completion into memory.
     ///
     /// Useful when the content size is not known up front. The whole
-    /// content is held in memory; for large content prefer
-    /// [`tempfile`](Self::tempfile) (behind the `tempfile` feature).
+    /// content is held in memory; for large content prefer `tempfile`, or
+    /// `spooled` to stay in memory up to a bound — both behind the `tempfile`
+    /// feature.
     ///
     /// ```
     /// use nififf3::FlowFile;

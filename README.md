@@ -134,6 +134,9 @@ assert_eq!(flow_file.size(), 28);
 // Requires the `tempfile` feature. Content is spooled to disk, not memory.
 let flow_file = FlowFile::builder().tempfile(reader)?;
 let flow_file = FlowFile::builder().tempfile_async(reader).await?; // + `tokio`
+
+// Or the middle ground: in memory up to `max_memory`, on disk past it.
+let flow_file = FlowFile::builder().spooled(reader, 64 * 1024)?;
 ```
 
 Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
@@ -423,9 +426,10 @@ $ nififf3 to-json greeting.ff3 | nififf3 from-json | cmp - greeting.ff3
   attributes; the content is read from stdin.
 
 Commands taking a path read from stdin when it is omitted or `-`, and
-process flow files one at a time, so streams larger than memory are fine
-(except for `to-json`/`from-json`, which buffer one flow file at a time to
-base64 its content).
+process flow files one at a time, so streams larger than memory are fine. Two
+exceptions: `to-json`/`from-json` buffer one flow file at a time to base64 its
+content, and `create` reads all of stdin into memory, since it has to know the
+content length before it can write the header.
 
 Headers are trusted by default, as NiFi's own unpackager trusts them. For
 input you have not vetted, `--max-attributes`, `--max-attribute-len` and
