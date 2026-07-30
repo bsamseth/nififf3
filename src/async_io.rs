@@ -369,6 +369,20 @@ where
 /// As there, a failed write poisons the writer, since the stream is left
 /// mid-flow-file and appending to it would bury the failure.
 ///
+/// # Finishing
+///
+/// An [`AsyncWrite`] typically has to be told when it is done, and neither
+/// writing nor dropping this type tells it:
+///
+/// - [`shutdown`](Self::shutdown) is what finalizes a writer that has an
+///   ending of its own — a compressor's trailer, a TLS `close_notify`, a
+///   buffered writer's tail. Skipping it on one of those silently truncates
+///   the output, and the flow files come back corrupt.
+/// - [`finish`](Self::finish) flushes and returns the writer, for one that
+///   only buffers.
+/// - [`into_inner`](Self::into_inner) does neither, for discarding a stream
+///   rather than completing it.
+///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesAsync, FlowFilesWriterAsync};
 ///
@@ -454,6 +468,52 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
         result
     }
 
+    /// Flush the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying writer returns. A failed flush poisons the
+    /// writer, since bytes that never reached the stream leave it
+    /// mid-flow-file exactly as a failed write does.
+    pub async fn flush(&mut self) -> std::io::Result<()> {
+        let result = self.writer.flush().await;
+        self.poison_on_err(result)
+    }
+
+    /// Shut the underlying writer down, finalizing it.
+    ///
+    /// For a plain sink this is [`flush`](Self::flush) and little else, but a
+    /// writer that encodes — a compressor, a TLS session, a framed transport —
+    /// emits its ending here and nowhere else. Dropping the writer does not
+    /// produce it, so a stream that skips this is truncated in a way the
+    /// reader on the far end will report as a corrupt flow file, not as a
+    /// missing trailer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying writer returns; as [`flush`](Self::flush), a
+    /// failure poisons the writer.
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        let result = self.writer.shutdown().await;
+        self.poison_on_err(result)
+    }
+
+    /// Flush and return the underlying writer.
+    ///
+    /// For a writer that finalizes itself, call [`shutdown`](Self::shutdown)
+    /// first — or instead, followed by [`into_inner`](Self::into_inner), since
+    /// shutting down and then flushing is the wrong order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever flushing the underlying writer returns, in which case the
+    /// writer is dropped. To keep hold of it either way, call
+    /// [`flush`](Self::flush) and then [`into_inner`](Self::into_inner).
+    pub async fn finish(mut self) -> std::io::Result<W> {
+        self.flush().await?;
+        Ok(self.writer)
+    }
+
     /// Whether a write has failed, leaving the stream mid-flow-file. See
     /// [`FlowFilesWriter::is_poisoned`](crate::FlowFilesWriter::is_poisoned).
     pub fn is_poisoned(&self) -> bool {
@@ -471,7 +531,12 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
         &mut self.writer
     }
 
-    /// Consume the writer, returning the underlying one.
+    /// Consume the writer, returning the underlying one *without flushing or
+    /// shutting it down*.
+    ///
+    /// See [`finish`](Self::finish) and [`shutdown`](Self::shutdown) for
+    /// completing a stream; this is for taking the writer back after a failure
+    /// in order to discard or truncate what was produced.
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -682,6 +747,152 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("poisoned"));
         assert_eq!(writer.count(), 0);
+    }
+
+    /// An `AsyncWrite` that records what it was asked to do. The distinction
+    /// that matters is flush versus shutdown: a writer that encodes emits its
+    /// ending only on the latter.
+    #[derive(Default)]
+    struct Recording {
+        bytes: Vec<u8>,
+        flushes: usize,
+        shutdowns: usize,
+    }
+
+    impl AsyncWrite for Recording {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.shutdowns += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn write_one(writer: &mut FlowFilesWriterAsync<Recording>) {
+        writer
+            .write_bytes(&FlowFile::builder().content(&b"content"[..]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finishing_flushes_and_shutting_down_shuts_down() {
+        let mut writer = FlowFilesWriterAsync::new(Recording::default());
+        write_one(&mut writer).await;
+        let inner = writer.finish().await.unwrap();
+        assert_eq!((inner.flushes, inner.shutdowns), (1, 0));
+        let mut written = FlowFilesAsync::new(inner.bytes.as_slice());
+        assert!(written.next().await.is_some(), "the flow file survived");
+
+        let mut writer = FlowFilesWriterAsync::new(Recording::default());
+        write_one(&mut writer).await;
+        writer.shutdown().await.unwrap();
+        assert_eq!(writer.into_inner().shutdowns, 1);
+
+        // Neither happens on its own, which is the whole reason both exist.
+        let mut writer = FlowFilesWriterAsync::new(Recording::default());
+        write_one(&mut writer).await;
+        let inner = writer.into_inner();
+        assert_eq!((inner.flushes, inner.shutdowns), (0, 0));
+    }
+
+    /// The case these methods exist for, against a real encoder: gzip writes
+    /// its trailer on shutdown and nowhere else, so a stream that skips it
+    /// cannot be read back at all.
+    #[tokio::test]
+    async fn shutdown_finalizes_a_real_encoder() {
+        use async_compression::tokio::bufread::GzipDecoder;
+        use async_compression::tokio::write::GzipEncoder;
+
+        async fn compressed(shut_down: bool) -> Vec<u8> {
+            let mut writer = FlowFilesWriterAsync::new(GzipEncoder::new(Vec::new()));
+            writer
+                .write_bytes(&FlowFile::builder().content(&b"compressed"[..]))
+                .await
+                .unwrap();
+            if shut_down {
+                writer.shutdown().await.unwrap();
+            }
+            writer.into_inner().into_inner()
+        }
+
+        async fn decompress(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+            let mut out = Vec::new();
+            GzipDecoder::new(tokio::io::BufReader::new(bytes))
+                .read_to_end(&mut out)
+                .await?;
+            Ok(out)
+        }
+
+        let flow_file = FlowFile::from_bytes(&decompress(&compressed(true).await).await.unwrap())
+            .expect("a shut-down encoder produces a readable stream");
+        assert_eq!(flow_file.content().as_slice(), b"compressed");
+
+        assert!(
+            decompress(&compressed(false).await).await.is_err(),
+            "without shutdown the trailer never arrives and the data is lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_poisons_the_async_writer() {
+        struct FlushFails;
+
+        impl AsyncWrite for FlushFails {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("the device went away")))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = FlowFilesWriterAsync::new(FlushFails);
+        writer
+            .write_bytes(&FlowFile::builder().content(&b"first"[..]))
+            .await
+            .unwrap();
+
+        assert!(writer.flush().await.is_err());
+        assert!(writer.is_poisoned());
+        let err = writer
+            .write_bytes(&FlowFile::builder().content(&b"second"[..]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"));
     }
 
     #[tokio::test]

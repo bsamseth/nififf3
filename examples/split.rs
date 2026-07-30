@@ -33,11 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .content(*record),
         )?;
     }
-    println!(
-        "out: {} flow files, {} bytes total",
-        writer.count(),
-        out.len()
-    );
+    // Finish the stream rather than just dropping the writer: a `Vec` needs
+    // nothing, but a file, a socket or a compressor does.
+    let count = writer.count();
+    writer.finish()?;
+    println!("out: {count} flow files, {} bytes total", out.len());
 
     // Read them back the way a downstream consumer would.
     for part in FlowFiles::new(out.as_slice()) {

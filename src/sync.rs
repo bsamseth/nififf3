@@ -342,6 +342,15 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 /// from the content the truncated one still expects. See
 /// [`is_poisoned`](Self::is_poisoned).
 ///
+/// # Finishing
+///
+/// This type writes straight through and buffers nothing of its own, but the
+/// writer underneath it may, and neither writing nor dropping this one flushes
+/// it. Finish with [`finish`](Self::finish), which flushes and hands the writer
+/// back; [`flush`](Self::flush) does it without giving up the writer, and
+/// [`into_inner`](Self::into_inner) deliberately skips it, for discarding a
+/// stream rather than completing it.
+///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesWriter};
 ///
@@ -422,6 +431,43 @@ impl<W: Write> FlowFilesWriter<W> {
         result
     }
 
+    /// Flush the underlying writer.
+    ///
+    /// Nothing else here does: this type holds no buffer of its own, so
+    /// whatever the writer underneath keeps is only pushed out when asked.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying writer returns. A failed flush poisons the
+    /// writer, since bytes that never reached the stream leave it
+    /// mid-flow-file exactly as a failed write does.
+    pub fn flush(&mut self) -> io::Result<()> {
+        let result = self.writer.flush();
+        self.poison_on_err(result)
+    }
+
+    /// Flush and return the underlying writer: the ordinary way to finish.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, FlowFilesWriter};
+    ///
+    /// let mut writer = FlowFilesWriter::new(Vec::new());
+    /// writer.write_bytes(&FlowFile::builder().content(&b"only"[..]))?;
+    /// let bytes = writer.finish()?;
+    /// # assert!(bytes.starts_with(b"NiFiFF3"));
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Whatever flushing the underlying writer returns, in which case the
+    /// writer is dropped. To keep hold of it either way, call
+    /// [`flush`](Self::flush) and then [`into_inner`](Self::into_inner).
+    pub fn finish(mut self) -> io::Result<W> {
+        self.flush()?;
+        Ok(self.writer)
+    }
+
     /// Whether a write has failed, leaving the stream mid-flow-file.
     ///
     /// Once this is true every further write fails without touching the
@@ -442,7 +488,12 @@ impl<W: Write> FlowFilesWriter<W> {
         &mut self.writer
     }
 
-    /// Consume the writer, returning the underlying one.
+    /// Consume the writer, returning the underlying one *without flushing it*.
+    ///
+    /// For finishing a stream, use [`finish`](Self::finish). This is the
+    /// escape hatch for the other case: taking the writer back after a failure
+    /// in order to discard or truncate what was produced, where flushing the
+    /// tail of a truncated flow file is the last thing wanted.
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -683,6 +734,76 @@ mod tests {
         assert!(!writer.is_poisoned());
         assert_eq!(writer.count(), 2);
         assert_eq!(FlowFiles::new(out.as_slice()).count(), 2);
+    }
+
+    /// A writer that records what it was asked to do, standing in for one
+    /// that buffers — a `BufWriter`, a compressor, a socket.
+    #[derive(Default)]
+    struct Recording {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for Recording {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_flushes_and_into_inner_does_not() {
+        let write_one = |writer: &mut FlowFilesWriter<Recording>| {
+            writer
+                .write_bytes(&FlowFile::builder().content(&b"content"[..]))
+                .unwrap();
+        };
+
+        let mut writer = FlowFilesWriter::new(Recording::default());
+        write_one(&mut writer);
+        let inner = writer.finish().unwrap();
+        assert_eq!(inner.flushes, 1);
+        assert_eq!(FlowFiles::new(inner.bytes.as_slice()).count(), 1);
+
+        // The escape hatch stays an escape hatch: nothing is pushed out, so a
+        // half-written stream can be discarded instead of completed.
+        let mut writer = FlowFilesWriter::new(Recording::default());
+        write_one(&mut writer);
+        assert_eq!(writer.into_inner().flushes, 0);
+    }
+
+    #[test]
+    fn a_failed_flush_poisons_the_writer() {
+        struct FlushFails;
+
+        impl Write for FlushFails {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("the device went away"))
+            }
+        }
+
+        let mut writer = FlowFilesWriter::new(FlushFails);
+        writer
+            .write_bytes(&FlowFile::builder().content(&b"first"[..]))
+            .unwrap();
+
+        assert!(writer.flush().is_err());
+        // Bytes the writer accepted may never have reached the stream, so it
+        // is mid-flow-file for the same reason a failed write leaves it there.
+        assert!(writer.is_poisoned());
+        let err = writer
+            .write_bytes(&FlowFile::builder().content(&b"second"[..]))
+            .unwrap_err();
+        assert!(err.to_string().contains("poisoned"));
     }
 
     #[test]

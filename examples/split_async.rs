@@ -31,11 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .reader(*record, record.len() as u64);
         writer.write(part).await?;
     }
-    println!(
-        "out: {} flow files, {} bytes total",
-        writer.count(),
-        out.len()
-    );
+    // Finish the stream rather than just dropping the writer. A `Vec` needs
+    // nothing, but an `AsyncWrite` that encodes — a compressor, a TLS session
+    // — emits its ending only on `shutdown`, and losing it corrupts the lot.
+    let count = writer.count();
+    writer.finish().await?;
+    println!("out: {count} flow files, {} bytes total", out.len());
 
     let mut flow_files = FlowFilesAsync::new(out.as_slice());
     while let Some(part) = flow_files.next().await {

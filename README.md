@@ -149,6 +149,14 @@ truncated one's content, yielding a plausible flow file with the wrong bytes.
 `is_poisoned` reports the state; `into_inner` still returns the writer, for
 discarding or truncating what was produced.
 
+Finish a stream with `finish`, which flushes and hands the writer back —
+writing does not flush, and neither does dropping the writer. For an
+`AsyncWrite` that has an ending of its own (a compressor's trailer, a TLS
+`close_notify`, a buffered writer's tail), `FlowFilesWriterAsync::shutdown` is
+what emits it; skipping it truncates the output, and the flow files come back
+corrupt rather than merely short. `into_inner` deliberately does neither, so
+that a half-written stream can be abandoned instead of completed.
+
 Parsing is the only thing that produces this crate's `Error`. Everything that
 just moves bytes — `write_to`, `into_bytes`, the writers, and their async
 twins — returns `std::io::Result`, so handling them does not mean matching on
