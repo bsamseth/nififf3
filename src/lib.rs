@@ -433,6 +433,10 @@ impl FlowFile<Vec<u8>> {
 
     /// Serialize the flow file to the binary V3 format.
     ///
+    /// The whole flow file, header included — as against
+    /// [`into_memory`](Self::into_memory), which reads a reader-backed
+    /// *content* into memory and serializes nothing.
+    ///
     /// Declares [`size`](Self::size) bytes of content, the same value
     /// [`write_to`](Self::write_to) would stream.
     ///

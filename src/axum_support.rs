@@ -56,7 +56,7 @@ use crate::{Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDI
 /// use nififf3::FlowFileRequest;
 ///
 /// async fn handler(flow_file: FlowFileRequest) -> Result<String, nififf3::Error> {
-///     let flow_file = flow_file.into_bytes_async().await?;
+///     let flow_file = flow_file.into_memory_async().await?;
 ///     Ok(format!("got {} bytes", flow_file.size()))
 /// }
 /// ```
@@ -139,7 +139,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
 /// use nififf3::StrictFlowFileRequest;
 ///
 /// async fn handler(flow_file: StrictFlowFileRequest) -> Result<String, nififf3::Error> {
-///     let flow_file = flow_file.into_inner().into_bytes_async().await?;
+///     let flow_file = flow_file.into_inner().into_memory_async().await?;
 ///     Ok(format!("got {} bytes", flow_file.size()))
 /// }
 /// ```

@@ -89,7 +89,7 @@ impl<R: Read> FlowFile<io::Take<R>> {
     ///
     /// The returned flow file's content is the reader, limited to the
     /// declared content size. Reading fewer bytes than [`size`] before the
-    /// reader ends means the input was truncated; [`FlowFile::into_bytes`]
+    /// reader ends means the input was truncated; [`FlowFile::into_memory`]
     /// checks this for you.
     ///
     /// The header is read in small increments, so wrap unbuffered sources
@@ -103,7 +103,7 @@ impl<R: Read> FlowFile<io::Take<R>> {
     /// // Only the header is consumed; the content can be read incrementally.
     /// let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
     /// assert_eq!(flow_file.size(), 5);
-    /// let flow_file = flow_file.into_bytes().unwrap();
+    /// let flow_file = flow_file.into_memory().unwrap();
     /// assert_eq!(flow_file.content().as_slice(), b"hello");
     /// ```
     ///
@@ -154,7 +154,7 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// let mut count = 0;
     /// while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
     ///     count += 1;
-    ///     flow_file.into_bytes().unwrap(); // consume the content
+    ///     flow_file.into_memory().unwrap(); // consume the content
     /// }
     /// assert_eq!(count, 2);
     /// ```
@@ -244,6 +244,11 @@ impl<R: Read> FlowFile<R> {
 
     /// Read the content to completion, producing an in-memory flow file.
     ///
+    /// The inverse of [`into_reader`](FlowFile::into_reader), and not to be
+    /// confused with [`to_bytes`](FlowFile::to_bytes): this moves the *content*
+    /// into memory and serializes nothing, while `to_bytes` serializes the
+    /// whole flow file — header and all — to the wire format.
+    ///
     /// Validates that exactly [`size`] bytes of content were available.
     ///
     /// # Errors
@@ -254,7 +259,7 @@ impl<R: Read> FlowFile<R> {
     /// [`Error::SizeMismatch`].
     ///
     /// [`size`]: FlowFile::size
-    pub fn into_bytes(mut self) -> io::Result<FlowFile<Vec<u8>>> {
+    pub fn into_memory(mut self) -> io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = (&mut self.content)
             .take(self.size)
@@ -367,7 +372,7 @@ impl<R: Read> Iterator for FlowFiles<R> {
             Ok(None) => None,
             // The conversion recovers a truncation as `SizeMismatch`, so
             // buffering here reports it the way `from_bytes` does.
-            Ok(Some(flow_file)) => Some(flow_file.into_bytes().map_err(Error::from)),
+            Ok(Some(flow_file)) => Some(flow_file.into_memory().map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {
@@ -610,7 +615,7 @@ mod tests {
         let bytes = sample_bytes();
         let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
         assert_eq!(flow_file.size(), 5);
-        let flow_file = flow_file.into_bytes().unwrap();
+        let flow_file = flow_file.into_memory().unwrap();
         assert_eq!(flow_file.content().as_slice(), b"hello");
     }
 
@@ -630,7 +635,7 @@ mod tests {
         let mut reader = bytes.as_slice();
         let mut count = 0;
         while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
-            let flow_file = flow_file.into_bytes().unwrap();
+            let flow_file = flow_file.into_memory().unwrap();
             assert_eq!(flow_file.content().as_slice(), b"hello");
             count += 1;
         }
@@ -685,10 +690,10 @@ mod tests {
                 actual: 3
             })
         ));
-        // `into_bytes` parses nothing, so it reports the same condition as an
+        // `into_memory` parses nothing, so it reports the same condition as an
         // io error — with the structured error still recoverable from it.
         let parsed = FlowFile::parse(truncated).unwrap();
-        let err = parsed.into_bytes().unwrap_err();
+        let err = parsed.into_memory().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(matches!(
             err.get_ref().and_then(|e| e.downcast_ref::<Error>()),

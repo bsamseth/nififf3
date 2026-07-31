@@ -79,7 +79,7 @@ pub enum Error {
     /// async twin.
     ///
     /// The operations that merely move content around — `write_to`,
-    /// `into_bytes` and their async twins — return [`std::io::Result`] and so
+    /// `into_memory` and their async twins — return [`std::io::Result`] and so
     /// report the same condition as an [`std::io::Error`] of kind
     /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying this
     /// value, which
@@ -170,7 +170,7 @@ pub enum Error {
 /// otherwise.
 ///
 /// [`Error::SizeMismatch`] round-trips: converting back recovers the variant,
-/// which is what lets an [`std::io::Result`] from `into_bytes` or a writer
+/// which is what lets an [`std::io::Result`] from `into_memory` or a writer
 /// carry a truncation into an [`Error`]-returning caller intact. The other
 /// variants convert back to [`Error::Io`], since an [`std::io::Error`] this
 /// crate did not build is not one it should take apart.
@@ -191,7 +191,7 @@ pub enum Error {
 /// ```
 /// Recovers a truncation rather than wrapping it: an
 /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying an
-/// [`Error::SizeMismatch`] — which is how `into_bytes`, `write_to` and the
+/// [`Error::SizeMismatch`] — which is how `into_memory`, `write_to` and the
 /// writers report content that ends early — converts back to that variant,
 /// not to [`Error::Io`] around it.
 ///
@@ -203,7 +203,7 @@ pub enum Error {
 /// use nififf3::{Error, FlowFile};
 ///
 /// fn buffer(bytes: &[u8]) -> Result<FlowFile<Vec<u8>>, Error> {
-///     Ok(FlowFile::parse(bytes)?.into_bytes()?) // `?` on an `io::Result`
+///     Ok(FlowFile::parse(bytes)?.into_memory()?) // `?` on an `io::Result`
 /// }
 ///
 /// let mut truncated = FlowFile::builder().content(&b"hello"[..]).to_bytes();

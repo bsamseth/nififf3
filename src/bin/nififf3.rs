@@ -134,7 +134,7 @@ fn open_input(path: Option<&Path>) -> io::Result<Box<dyn BufRead>> {
 fn to_json(mut reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     let mut stdout = io::stdout().lock();
     while let Some(flow_file) = FlowFile::parse_next_with_limits(&mut reader, limits)? {
-        serde_json::to_writer(&mut stdout, &flow_file.into_bytes()?)?;
+        serde_json::to_writer(&mut stdout, &flow_file.into_memory()?)?;
         writeln!(stdout)?;
     }
     Ok(())

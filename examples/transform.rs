@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Here we do want the content, so read it in and check it was complete.
-    let flow_file = flow_file.into_bytes()?;
+    let flow_file = flow_file.into_memory()?;
 
     // `derive` carries the attributes over and mints a fresh `uuid`, since in
     // NiFi that attribute identifies one flow file.

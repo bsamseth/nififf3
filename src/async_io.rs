@@ -105,7 +105,7 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     ///
     /// let flow_file = FlowFile::parse_async(bytes.as_slice()).await.unwrap();
     /// assert_eq!(flow_file.size(), 5);
-    /// let flow_file = flow_file.into_bytes_async().await.unwrap();
+    /// let flow_file = flow_file.into_memory_async().await.unwrap();
     /// assert_eq!(flow_file.content().as_slice(), b"hello");
     /// # });
     /// ```
@@ -152,7 +152,7 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// let mut count = 0;
     /// while let Some(flow_file) = FlowFile::parse_next_async(&mut reader).await.unwrap() {
     ///     count += 1;
-    ///     flow_file.into_bytes_async().await.unwrap(); // consume the content
+    ///     flow_file.into_memory_async().await.unwrap(); // consume the content
     /// }
     /// assert_eq!(count, 2);
     /// # });
@@ -317,7 +317,7 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         {
             Ok(None) => None,
             // As in `FlowFiles::next`: the conversion recovers a truncation.
-            Ok(Some(flow_file)) => Some(flow_file.into_bytes_async().await.map_err(Error::from)),
+            Ok(Some(flow_file)) => Some(flow_file.into_memory_async().await.map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
         if !matches!(result, Some(Ok(_))) {
@@ -610,13 +610,13 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
         Ok(copied)
     }
 
-    /// Async version of [`FlowFile::into_bytes`]: reads the content to
+    /// Async version of [`FlowFile::into_memory`]: reads the content to
     /// completion and validates its length against the declared size.
     ///
     /// # Errors
     ///
-    /// As [`FlowFile::into_bytes`].
-    pub async fn into_bytes_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
+    /// As [`FlowFile::into_memory`].
+    pub async fn into_memory_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = (&mut self.content)
             .take(self.size)
@@ -668,7 +668,7 @@ mod tests {
 
         let parsed = FlowFile::parse_async(expected.as_slice()).await.unwrap();
         assert_eq!(parsed.size(), 5);
-        let parsed = parsed.into_bytes_async().await.unwrap();
+        let parsed = parsed.into_memory_async().await.unwrap();
         assert_eq!(parsed.attributes()["path"], "x");
         assert_eq!(parsed.content().as_slice(), b"hello");
     }
@@ -993,7 +993,7 @@ mod tests {
         let bytes = sample().to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
         let parsed = FlowFile::parse_async(truncated).await.unwrap();
-        let err = parsed.into_bytes_async().await.unwrap_err();
+        let err = parsed.into_memory_async().await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(matches!(
             err.get_ref().and_then(|e| e.downcast_ref::<Error>()),

@@ -43,7 +43,7 @@ let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
 assert_eq!(flow_file.size(), 8);
 
 // Read the content when you need it, e.g. all at once:
-let flow_file = flow_file.into_bytes().unwrap();
+let flow_file = flow_file.into_memory().unwrap();
 assert_eq!(flow_file.content().as_slice(), b"streamed");
 ```
 
@@ -60,7 +60,7 @@ bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
 let mut reader = bytes.as_slice();
 let mut contents = Vec::new();
 while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
-    contents.push(flow_file.into_bytes().unwrap().into_content());
+    contents.push(flow_file.into_memory().unwrap().into_content());
 }
 assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
 ```
@@ -94,7 +94,7 @@ assert!(matches!(err, Error::AttributeTooLong { .. }));
 `max_content_len` caps the content size a header may declare, failing with
 `Error::ContentTooLarge` before any content is read. It is off by default,
 because parsing streams the content rather than buffering it — set it when
-the caller will go on to `into_bytes` the result and would rather learn the
+the caller will go on to `into_memory` the result and would rather learn the
 size is unacceptable up front. It bounds what the header *claims*; bounding
 what actually arrives is the transport's job (over HTTP, axum's
 `DefaultBodyLimit` — see below).
@@ -141,6 +141,11 @@ let flow_file = FlowFile::builder().tempfile_async(reader).await?; // + `tokio`
 let flow_file = FlowFile::builder().spooled(reader, 64 * 1024)?;
 ```
 
+`into_memory` reads a reader-backed flow file's *content* into memory and
+serializes nothing; `to_bytes`, below, does the opposite — it serializes a whole
+flow file, header included. The pair used to be `into_bytes`/`to_bytes`, one
+character apart and easily mistaken for each other.
+
 Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
 `write_to` for `std::io::Write`, and `write_to_async` for
 `tokio::io::AsyncWrite`. The last two consume the flow file, since they leave
@@ -165,7 +170,7 @@ corrupt rather than merely short. `into_inner` deliberately does neither, so
 that a half-written stream can be abandoned instead of completed.
 
 Parsing is the only thing that produces this crate's `Error`. Everything that
-just moves bytes — `write_to`, `into_bytes`, the writers, and their async
+just moves bytes — `write_to`, `into_memory`, the writers, and their async
 twins — returns `std::io::Result`, so handling them does not mean matching on
 flow-file failures that cannot occur. In those, content that ends before its
 declared size is `ErrorKind::UnexpectedEof` carrying an `Error::SizeMismatch`,
@@ -300,7 +305,7 @@ assert!(!merged.attributes().contains_key("fragment.index"));
 ## Async I/O (`tokio` feature)
 
 The async API mirrors the sync one: `parse_async` reads only the header and
-exposes the content as a size-limited `AsyncRead`; `into_bytes_async` and
+exposes the content as a size-limited `AsyncRead`; `into_memory_async` and
 `write_to_async` consume it.
 
 ```rust,ignore
@@ -349,7 +354,7 @@ use nififf3::{FlowFile, FlowFileRequest};
 
 async fn echo(flow_file: FlowFileRequest) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
     // The content streams from the request body; buffer it here for brevity.
-    let flow_file = flow_file.into_bytes_async().await?;
+    let flow_file = flow_file.into_memory_async().await?;
     Ok(FlowFile::builder()
         .attribute("echoed", "true")
         .content(flow_file.into_content())
@@ -371,7 +376,7 @@ use nififf3::{Error, FlowFilesResponse, StrictFlowFileRequest};
 
 async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
     // Validate here, while a real status code is still available.
-    let parent = req.into_inner().into_bytes_async().await?;
+    let parent = req.into_inner().into_memory_async().await?;
     let mut parts = parent.fragments();
 
     Ok(FlowFilesResponse::new(move |mut writer| async move {

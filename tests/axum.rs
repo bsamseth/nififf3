@@ -13,14 +13,14 @@ use tower::ServiceExt;
 async fn echo(
     flow_file: FlowFileRequest,
 ) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
-    let flow_file = flow_file.into_bytes_async().await?;
+    let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file.into_reader())
 }
 
 async fn strict_echo(
     flow_file: StrictFlowFileRequest,
 ) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
-    let flow_file = flow_file.into_inner().into_bytes_async().await?;
+    let flow_file = flow_file.into_inner().into_memory_async().await?;
     Ok(flow_file.into_reader())
 }
 

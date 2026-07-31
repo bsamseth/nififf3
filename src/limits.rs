@@ -55,7 +55,7 @@ use crate::{Error, Result};
 /// [`max_content_len`](Self::max_content_len) is off by default, because the
 /// content is *streamed*: parsing does not read it, and the declared size on
 /// its own costs nothing. Set it when a caller will go on to buffer the
-/// content — [`into_bytes`](crate::FlowFile::into_bytes) and friends — and
+/// content — [`into_memory`](crate::FlowFile::into_memory) and friends — and
 /// the declared size should be refused before that happens rather than after.
 /// Over HTTP, prefer axum's
 /// [`DefaultBodyLimit`](https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html),

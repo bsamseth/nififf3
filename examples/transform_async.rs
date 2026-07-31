@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flow_file.attributes()["filename"],
     );
 
-    let flow_file = flow_file.into_bytes_async().await?;
+    let flow_file = flow_file.into_memory_async().await?;
 
     let shouted = flow_file
         .derive()

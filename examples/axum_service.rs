@@ -23,7 +23,7 @@ use tower::ServiceExt;
 
 /// One in, one out: the content is rewritten, the attributes carried over.
 async fn transform(req: StrictFlowFileRequest) -> Result<impl IntoResponse, Error> {
-    let flow_file = req.into_inner().into_bytes_async().await?;
+    let flow_file = req.into_inner().into_memory_async().await?;
     Ok(flow_file
         .derive()
         .attribute("transformed", "uppercase")
@@ -38,7 +38,7 @@ async fn transform(req: StrictFlowFileRequest) -> Result<impl IntoResponse, Erro
 /// 200, so a problem with one record belongs in the body as attributes on its
 /// own flow file.
 async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
-    let parent = req.into_inner().into_bytes_async().await?;
+    let parent = req.into_inner().into_memory_async().await?;
     let mut parts = parent.fragments();
 
     Ok(FlowFilesResponse::new(move |mut writer| async move {
