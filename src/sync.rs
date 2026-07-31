@@ -33,7 +33,7 @@ fn read_string(reader: &mut impl Read, max_len: Option<usize>) -> Result<String>
     if read != len {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "attribute truncated").into());
     }
-    Ok(String::from_utf8(buf)?)
+    String::from_utf8(buf).map_err(Error::InvalidAttribute)
 }
 
 /// Read the header, returning the attributes and the declared content size.
@@ -548,6 +548,17 @@ impl<W: Write> FlowFilesWriter<W> {
 mod tests {
     use super::*;
 
+    /// A poisoned write is recognisable by its payload rather than its
+    /// message: the point of `Error::WriterPoisoned` is that a caller can tell
+    /// it from any other write failure without matching on text.
+    fn is_poisoned_error(err: &io::Error) -> bool {
+        err.kind() == io::ErrorKind::BrokenPipe
+            && matches!(
+                err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+                Some(Error::WriterPoisoned)
+            )
+    }
+
     pub(crate) fn sample_flow_file() -> FlowFile<Vec<u8>> {
         FlowFile::builder()
             .attribute("a", "b")
@@ -769,7 +780,7 @@ mod tests {
         let err = writer
             .write_bytes(&FlowFile::builder().attribute("n", "2").content(&b"ok"[..]))
             .unwrap_err();
-        assert!(err.to_string().contains("poisoned"));
+        assert!(is_poisoned_error(&err), "{err:?}");
         assert_eq!(writer.count(), 0);
 
         // Nothing was appended after the failure: the header plus the 3
@@ -864,7 +875,7 @@ mod tests {
         let err = writer
             .write_bytes(&FlowFile::builder().content(&b"second"[..]))
             .unwrap_err();
-        assert!(err.to_string().contains("poisoned"));
+        assert!(is_poisoned_error(&err), "{err:?}");
     }
 
     #[test]

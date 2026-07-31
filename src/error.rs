@@ -37,10 +37,7 @@ pub(crate) fn unwrap_io(err: std::io::Error) -> Error {
 
 /// A write was attempted on a writer whose stream is already mid-flow-file.
 pub(crate) fn poisoned() -> std::io::Error {
-    std::io::Error::other(
-        "flow file writer is poisoned: an earlier write left a truncated \
-         flow file in the stream",
-    )
+    Error::WriterPoisoned.into()
 }
 
 /// Errors produced when parsing or serializing flow files.
@@ -53,16 +50,26 @@ pub enum Error {
     /// Converting an [`std::io::Error`] into an [`Error`] goes through
     /// [`From`], which recovers a truncation as
     /// [`SizeMismatch`](Self::SizeMismatch) instead of wrapping it here.
-    #[error("I/O error: {0}")]
-    Io(#[source] std::io::Error),
+    ///
+    /// Transparent: this variant adds nothing to what the error it carries
+    /// already says, so it displays as that error and reports it as its
+    /// source. A prefix here would be printed twice by anything that walks the
+    /// chain.
+    #[error(transparent)]
+    Io(std::io::Error),
 
     /// The input does not start with the `NiFiFF3` magic header.
     #[error("invalid magic header: expected \"NiFiFF3\", got {0:?}")]
     InvalidMagic([u8; 7]),
 
     /// An attribute key or value is not valid UTF-8.
+    ///
+    /// Deliberately not a [`From`] conversion: `#[from]` here would give every
+    /// [`String::from_utf8`] failure in *caller* code a silent `?` into this
+    /// variant, reporting "attribute is not valid UTF-8" about a value that was
+    /// never an attribute.
     #[error("attribute is not valid UTF-8: {0}")]
-    InvalidAttribute(#[from] std::string::FromUtf8Error),
+    InvalidAttribute(std::string::FromUtf8Error),
 
     /// The content length does not match the size declared in the header.
     ///
@@ -110,6 +117,21 @@ pub enum Error {
         /// The configured maximum.
         limit: usize,
     },
+
+    /// A write was attempted on a [`FlowFilesWriter`](crate::FlowFilesWriter)
+    /// or its async twin after an earlier write failed, leaving the stream
+    /// part-way through a flow file.
+    ///
+    /// Reported as an [`std::io::Error`] of kind
+    /// [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) carrying this value,
+    /// since the writers return [`std::io::Result`]. `get_ref` and
+    /// `downcast_ref` recover it, which is how to tell a poisoned writer from
+    /// any other write failure without matching on the message.
+    #[error(
+        "flow file writer is poisoned: an earlier write left a truncated \
+         flow file in the stream"
+    )]
+    WriterPoisoned,
 
     /// The header declares more content than the configured
     /// [`Limits`](crate::Limits) allow.
@@ -198,6 +220,8 @@ impl From<Error> for std::io::Error {
             err => {
                 let kind = match err {
                     Error::SizeMismatch { .. } => ErrorKind::UnexpectedEof,
+                    // Not bad data: the stream itself is no longer usable.
+                    Error::WriterPoisoned => ErrorKind::BrokenPipe,
                     _ => ErrorKind::InvalidData,
                 };
                 std::io::Error::new(kind, err)
@@ -265,6 +289,60 @@ mod tests {
             // Still legible, and the payload is still there to downcast.
             assert!(back.to_string().contains(&text));
         }
+    }
+
+    /// `Io` adds nothing to what it carries, so it must not restate it: with a
+    /// prefix of its own, anything printing the chain saw the same sentence
+    /// twice. Being transparent, the variant *is* the error it wraps.
+    #[test]
+    fn io_displays_as_the_error_it_carries_exactly_once() {
+        fn chain(err: &Error) -> Vec<String> {
+            let mut err: Option<&(dyn std::error::Error + 'static)> = Some(err);
+            std::iter::from_fn(|| {
+                let current = err?;
+                err = current.source();
+                Some(current.to_string())
+            })
+            .collect()
+        }
+
+        let plain = Error::Io(std::io::Error::new(ErrorKind::ConnectionReset, "gone"));
+        assert_eq!(plain.to_string(), "gone", "no prefix of its own");
+        assert_eq!(chain(&plain), ["gone"], "and nothing repeats it");
+
+        // Carrying one of this crate's errors reads the same way: `io::Error`
+        // displays as its payload and reports that payload's source rather
+        // than the payload itself, so the message appears once here too.
+        let carried = Error::Io(std::io::Error::new(
+            ErrorKind::InvalidData,
+            Error::InvalidMagic([0; 7]),
+        ));
+        assert_eq!(chain(&carried).len(), 1, "{:?}", chain(&carried));
+        assert!(carried.to_string().contains("invalid magic"));
+
+        // The payload is still a value, reachable the way `unwrap_io` reaches
+        // it — transparency costs nothing structural.
+        let Error::Io(ref io) = carried else {
+            panic!("not an Io error");
+        };
+        assert!(matches!(
+            io.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+            Some(Error::InvalidMagic(_))
+        ));
+    }
+
+    /// Poisoning is a value to match on, not a message to grep. The writers
+    /// return `io::Result`, so it travels as a payload under a kind that says
+    /// the stream is unusable.
+    #[test]
+    fn poisoning_is_recoverable_from_the_io_error() {
+        let err = poisoned();
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        assert!(matches!(
+            err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+            Some(Error::WriterPoisoned)
+        ));
+        assert!(err.to_string().contains("poisoned"));
     }
 
     #[test]

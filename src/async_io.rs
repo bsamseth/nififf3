@@ -39,7 +39,7 @@ async fn read_string<R: AsyncRead + Unpin>(
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attribute truncated").into(),
         );
     }
-    Ok(String::from_utf8(buf)?)
+    String::from_utf8(buf).map_err(Error::InvalidAttribute)
 }
 
 pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
@@ -630,6 +630,15 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
 mod tests {
     use super::*;
 
+    /// As in the sync tests: the payload, not the message.
+    fn is_poisoned_error(err: &std::io::Error) -> bool {
+        err.kind() == std::io::ErrorKind::BrokenPipe
+            && matches!(
+                err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+                Some(Error::WriterPoisoned)
+            )
+    }
+
     fn sample() -> FlowFile<Vec<u8>> {
         FlowFile::builder()
             .attribute("a", "b")
@@ -822,7 +831,7 @@ mod tests {
             .write_bytes(&FlowFile::builder().content(&b"ok"[..]))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("poisoned"));
+        assert!(is_poisoned_error(&err), "{err:?}");
         assert_eq!(writer.count(), 0);
     }
 
@@ -969,7 +978,7 @@ mod tests {
             .write_bytes(&FlowFile::builder().content(&b"second"[..]))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("poisoned"));
+        assert!(is_poisoned_error(&err), "{err:?}");
     }
 
     #[tokio::test]
