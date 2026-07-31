@@ -5,7 +5,7 @@
 //! against real decoders (`async-compression` + `astral-tokio-tar`) rather
 //! than a stand-in.
 
-#![cfg(feature = "axum")]
+#![cfg(all(feature = "axum", feature = "uuid"))]
 
 use std::io;
 

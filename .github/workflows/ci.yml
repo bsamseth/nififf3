@@ -30,9 +30,10 @@ jobs:
         with:
           tool: cargo-hack
       - uses: Swatinem/rust-cache@v2
-      # Every subset of the six features, over every target (lib, bins, tests,
+      # Every subset of the features, over every target (lib, bins, tests,
       # examples). Targets whose `required-features` are absent are skipped by
-      # cargo, so e.g. the `cli` bin is only linted where `cli` is on.
+      # cargo, so e.g. the `cli` bin is only linted where `cli` is on, and the
+      # examples only where `uuid` is.
       - run: cargo hack clippy --feature-powerset --all-targets --locked -- -D warnings
 
   test:

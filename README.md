@@ -502,8 +502,13 @@ does in `defragment` mode.
 
 ## Feature flags
 
-No features are enabled by default; the sync API is always available.
+The sync parsing and serialization API is always available. Only `uuid` is on
+by default.
 
+- `uuid` — `derive` and `fragments`, which mint flow file and fragment
+  identifiers. On by default, since both are core to using this crate with
+  NiFi; `default-features = false` keeps a parse-and-serialize build down to
+  `thiserror`.
 - `tokio` — async parsing and serialization over `AsyncRead`/`AsyncWrite`.
 - `stream` — `FlowFilesAsync::into_stream`, for composing with `StreamExt`
   (implies `tokio`).

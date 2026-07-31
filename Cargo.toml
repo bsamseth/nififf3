@@ -23,7 +23,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 pedantic = { level = "warn", priority = -1 }
 
 [features]
-default = []
+# `uuid` is on by default: `derive` and `fragments` are core to using this
+# crate with NiFi, and both mint identifiers. Turn it off with
+# `default-features = false` to keep a parsing-and-serialization build down to
+# `thiserror`.
+default = ["uuid"]
+uuid = ["dep:uuid"]
 tokio = ["dep:tokio"]
 tempfile = ["dep:tempfile"]
 stream = ["tokio", "dep:futures-core"]
@@ -43,7 +48,7 @@ cli = ["dep:clap", "dep:serde_json", "serde"]
 
 [dependencies]
 thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["io-util", "fs"], optional = true }
 tempfile = { version = "3", optional = true }
 axum = { version = "0.8", optional = true }
@@ -72,18 +77,31 @@ name = "nififf3"
 path = "src/bin/nififf3.rs"
 required-features = ["cli"]
 
+# Every example derives or splits flow files, so each needs `uuid`.
+[[example]]
+name = "transform"
+required-features = ["uuid"]
+
+[[example]]
+name = "split"
+required-features = ["uuid"]
+
+[[example]]
+name = "merge"
+required-features = ["uuid"]
+
 [[example]]
 name = "transform_async"
-required-features = ["tokio"]
+required-features = ["tokio", "uuid"]
 
 [[example]]
 name = "split_async"
-required-features = ["tokio"]
+required-features = ["tokio", "uuid"]
 
 [[example]]
 name = "merge_async"
-required-features = ["tokio"]
+required-features = ["tokio", "uuid"]
 
 [[example]]
 name = "axum_service"
-required-features = ["axum"]
+required-features = ["axum", "uuid"]

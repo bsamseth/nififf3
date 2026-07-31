@@ -27,7 +27,10 @@ mod serde_support;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;
-pub use fragments::{FragmentKeys, Fragments};
+pub use fragments::FragmentKeys;
+
+#[cfg(feature = "uuid")]
+pub use fragments::Fragments;
 pub use limits::Limits;
 pub use sync::{FlowFiles, FlowFilesWriter};
 
@@ -81,8 +84,7 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
     doc = "| **serialize, async** | — | [`write_to_async`] | [`FlowFilesWriterAsync`] |"
 )]
 ///
-/// [`builder`](Self::builder) creates one from scratch, [`derive`](Self::derive)
-/// from another flow file's attributes, and [`fragments`](Self::fragments)
+/// [`builder`](Self::builder) creates one from scratch, `derive` from another flow file's attributes, and `fragments`
 /// splits one into many. The `*_with_limits` variants of every parsing entry
 /// point take [`Limits`], and are what to use on untrusted input.
 ///
@@ -350,13 +352,14 @@ impl<R> FlowFile<R> {
     ///
     /// To produce many flow files from one, use [`fragments`](Self::fragments),
     /// which adds NiFi's fragment attributes on top of this.
+    #[cfg(feature = "uuid")]
     pub fn derive(&self) -> FlowFileBuilder {
         self.derive_keep_uuid()
             .attribute(attr::UUID, uuid::Uuid::new_v4().to_string())
     }
 
-    /// Like [`derive`](Self::derive), but copying the [`uuid`](attr::UUID)
-    /// attribute unchanged rather than generating a new one.
+    /// Like `derive`, but copying the [`uuid`](attr::UUID) attribute unchanged
+    /// rather than generating a new one.
     ///
     /// Appropriate when the result represents the *same* flow file rather
     /// than a new one — a re-encoded or re-compressed payload, say.
@@ -384,6 +387,7 @@ impl<R> FlowFile<R> {
     /// assert_eq!(children[0].attributes()["fragment.index"], "1");
     /// assert_eq!(children[1].attributes()["fragment.index"], "2");
     /// ```
+    #[cfg(feature = "uuid")]
     pub fn fragments(&self) -> Fragments {
         Fragments::new(&self.attributes)
     }

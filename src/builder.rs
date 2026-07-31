@@ -49,8 +49,8 @@ impl FlowFileBuilder {
 
     /// Remove an attribute, if present.
     ///
-    /// Mostly useful after [`FlowFile::derive`](crate::FlowFile::derive) or
-    /// [`Fragments::next_part`](crate::Fragments::next_part), to drop an inherited
+    /// Mostly useful after `FlowFile::derive` or
+    /// `Fragments::next_part`, to drop an inherited
     /// attribute that does not apply to the new flow file.
     ///
     /// ```
@@ -69,7 +69,7 @@ impl FlowFileBuilder {
         self
     }
 
-    /// Undo what [`Fragments`](crate::Fragments) added: drop the fragment
+    /// Undo what `Fragments` added: drop the fragment
     /// attributes and restore [`filename`](crate::attr::FILENAME) from
     /// [`segment.original.filename`](crate::attr::SEGMENT_ORIGINAL_FILENAME).
     ///
@@ -109,7 +109,7 @@ impl FlowFileBuilder {
     /// [`defragment`](Self::defragment) for a split that numbered its parts
     /// with custom keys.
     ///
-    /// The other end of [`Fragments::with_keys`](crate::Fragments::with_keys): the same value that decided
+    /// The other end of `Fragments::with_keys`: the same value that decided
     /// what to write decides what to undo, so a custom split is as reversible
     /// as a default one.
     ///
@@ -333,6 +333,7 @@ impl FlowFileBuilder {
 mod tests {
     use crate::FlowFile;
 
+    #[cfg(feature = "uuid")]
     #[test]
     fn defragment_undoes_what_fragments_added() {
         let parent = FlowFile::builder()
@@ -360,6 +361,7 @@ mod tests {
 
     /// A custom split has to be as reversible as a default one: the same
     /// `FragmentKeys` writes the parts and undoes them.
+    #[cfg(feature = "uuid")]
     #[test]
     fn defragment_with_undoes_a_custom_split_round_trip() {
         use crate::FragmentKeys;
@@ -394,6 +396,7 @@ mod tests {
     }
 
     /// And the default keys are just the default value of the same thing.
+    #[cfg(feature = "uuid")]
     #[test]
     fn defragment_is_defragment_with_the_default_keys() {
         use crate::FragmentKeys;
@@ -414,6 +417,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "uuid")]
     #[test]
     fn defragment_leaves_a_filename_alone_when_there_was_no_split() {
         let merged = FlowFile::builder()

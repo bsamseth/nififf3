@@ -1,11 +1,11 @@
 //! Well-known flow file attribute names used by NiFi.
 //!
 //! NiFi treats these as ordinary attributes, so nothing forces you to use
-//! them — [`Fragments`](crate::Fragments) writes them by default but takes
+//! them — `Fragments` writes them by default but takes
 //! different keys if you need them.
 
 /// The per-flow-file unique identifier. Replaced with a fresh value by
-/// [`FlowFile::derive`](crate::FlowFile::derive).
+/// `FlowFile::derive`.
 pub const UUID: &str = "uuid";
 
 /// The name of the file the content came from.

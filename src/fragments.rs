@@ -1,8 +1,11 @@
 //! Deriving many flow files from one.
 
+#[cfg(feature = "uuid")]
 use std::collections::HashMap;
 
-use crate::{FlowFile, FlowFileBuilder, attr};
+#[cfg(feature = "uuid")]
+use crate::{FlowFile, FlowFileBuilder};
+use crate::attr;
 
 /// The attribute keys a fragment set is numbered with.
 ///
@@ -13,7 +16,7 @@ use crate::{FlowFile, FlowFileBuilder, attr};
 /// what to use for anything `MergeContent` will see.
 ///
 /// Worth naming as a value when they are *not* the defaults, because both ends
-/// of a split need the same set: [`Fragments::with_keys`] to write them and
+/// of a split need the same set: `Fragments::with_keys` to write them and
 /// [`FlowFileBuilder::defragment_with`](crate::FlowFileBuilder::defragment_with)
 /// to undo them.
 ///
@@ -81,6 +84,7 @@ impl FragmentKeys {
     }
 
     /// Every key in the set, for dropping a parent's values under them.
+    #[cfg(feature = "uuid")]
     pub(crate) fn all(&self) -> [&String; 4] {
         [
             &self.identifier,
@@ -157,6 +161,8 @@ impl Default for FragmentKeys {
 ///   archive, a decoder: [`terminate`](Self::terminate), which ends the set
 ///   with an empty flow file carrying the count. Nothing has to be held back
 ///   or rewritten, so the parts can be streamed as they are produced.
+#[cfg_attr(docsrs, doc(cfg(feature = "uuid")))]
+#[cfg(feature = "uuid")]
 #[derive(Debug)]
 pub struct Fragments {
     attributes: HashMap<String, String>,
@@ -167,6 +173,7 @@ pub struct Fragments {
     keys: FragmentKeys,
 }
 
+#[cfg(feature = "uuid")]
 impl Fragments {
     pub(crate) fn new(attributes: &HashMap<String, String>) -> Self {
         let keys = FragmentKeys::default();
@@ -399,7 +406,7 @@ impl Fragments {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "uuid"))]
 mod tests {
     use crate::FlowFile;
 
