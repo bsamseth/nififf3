@@ -515,7 +515,9 @@ by default.
 - `axum` — request extractor and response types (implies `stream`).
 - `tempfile` — spool content of unknown length to a temporary file.
 - `serde` — `Serialize`/`Deserialize` for in-memory flow files, with the
-  content base64 encoded; this is the JSON shape the CLI uses.
+  content base64 encoded; this is the JSON shape the CLI uses. Reader-backed
+  flow files serialize through `StreamingFlowFile`, which pushes the content
+  through the base64 encoder rather than buffering it first.
 - `cli` — the `nififf3` binary (implies `serde`).
 
 ## Wire format

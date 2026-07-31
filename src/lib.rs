@@ -51,6 +51,9 @@ pub use axum_support::{
     StrictRejection,
 };
 
+#[cfg(feature = "serde")]
+pub use serde_support::StreamingFlowFile;
+
 /// Convenience alias for results produced by this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -1,12 +1,14 @@
 //! `Serialize`/`Deserialize` impls for in-memory flow files.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::FlowFile;
+use crate::{Error, FlowFile};
 
 /// Serializes as a struct with the fields `size`, `attributes` (in sorted
 /// key order), and `content` (base64 encoded), e.g. as JSON:
@@ -86,6 +88,87 @@ impl<'de> Deserialize<'de> for FlowFile<Vec<u8>> {
     }
 }
 
+/// A reader-backed flow file, made serializable.
+///
+/// [`Serialize`] is implemented for `FlowFile<Vec<u8>>` only, because
+/// serializing takes `&self` and reading a reader takes `&mut`. This wrapper
+/// bridges that, and streams the content through the base64 encoder as it goes
+/// — so what is held in memory is the encoded string, not the content *and*
+/// its encoding.
+///
+/// ```
+/// use nififf3::{FlowFile, StreamingFlowFile};
+///
+/// let bytes = FlowFile::builder()
+///     .attribute("filename", "greeting.txt")
+///     .content(&b"hello"[..])
+///     .to_bytes();
+///
+/// // The content is never buffered as bytes, only as base64.
+/// let flow_file = FlowFile::parse(bytes.as_slice())?;
+/// let json = serde_json::to_string(&StreamingFlowFile::new(flow_file))?;
+///
+/// assert_eq!(
+///     json,
+///     r#"{"size":5,"attributes":{"filename":"greeting.txt"},"content":"aGVsbG8="}"#
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// Serializing consumes the content, so it works once. A second attempt reads
+/// nothing and fails rather than emitting a flow file with the wrong content.
+#[derive(Debug)]
+pub struct StreamingFlowFile<R>(RefCell<FlowFile<R>>);
+
+impl<R> StreamingFlowFile<R> {
+    /// Wrap a flow file for serialization.
+    #[must_use]
+    pub fn new(flow_file: FlowFile<R>) -> Self {
+        Self(RefCell::new(flow_file))
+    }
+
+    /// Unwrap, giving back the flow file and whatever is left of its content.
+    #[must_use]
+    pub fn into_inner(self) -> FlowFile<R> {
+        self.0.into_inner()
+    }
+}
+
+impl<R: Read> Serialize for StreamingFlowFile<R> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Repr<'a> {
+            size: u64,
+            attributes: BTreeMap<&'a str, &'a str>,
+            content: String,
+        }
+
+        let mut flow_file = self.0.borrow_mut();
+        let size = flow_file.size;
+
+        let mut encoder = base64::write::EncoderStringWriter::new(&BASE64);
+        let read = std::io::copy(&mut (&mut flow_file.content).take(size), &mut encoder)
+            .map_err(serde::ser::Error::custom)?;
+        if read != size {
+            return Err(serde::ser::Error::custom(Error::SizeMismatch {
+                expected: size,
+                actual: read,
+            }));
+        }
+
+        Repr {
+            size,
+            attributes: flow_file
+                .attributes
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect(),
+            content: encoder.into_inner(),
+        }
+        .serialize(serializer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::FlowFile;
@@ -133,6 +216,48 @@ mod tests {
             let flow_file: FlowFile<Vec<u8>> = serde_json::from_str(json).unwrap();
             assert_eq!(flow_file, empty, "{json}");
         }
+    }
+
+    /// The streaming form has to produce byte-for-byte what the in-memory one
+    /// does, or the two would describe the same flow file differently.
+    #[test]
+    fn streaming_matches_the_in_memory_serialization() {
+        use crate::StreamingFlowFile;
+
+        let bytes = sample().to_bytes();
+        let parsed = FlowFile::parse(bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&StreamingFlowFile::new(parsed)).unwrap(),
+            serde_json::to_string(&sample()).unwrap()
+        );
+    }
+
+    /// Content that ends early would otherwise serialize to a flow file whose
+    /// declared size does not match what it carries — which this impl's own
+    /// `Deserialize` would then reject.
+    #[test]
+    fn streaming_a_truncated_content_fails() {
+        use crate::StreamingFlowFile;
+
+        let bytes = sample().to_bytes();
+        let parsed = FlowFile::parse(&bytes[..bytes.len() - 2]).unwrap();
+
+        let err = serde_json::to_string(&StreamingFlowFile::new(parsed)).unwrap_err();
+        assert!(err.to_string().contains("size mismatch"), "{err}");
+    }
+
+    /// The reader is consumed, so serializing twice must fail rather than
+    /// quietly emit an empty content for the same declared size.
+    #[test]
+    fn streaming_twice_fails_rather_than_lying() {
+        use crate::StreamingFlowFile;
+
+        let bytes = sample().to_bytes();
+        let streaming = StreamingFlowFile::new(FlowFile::parse(bytes.as_slice()).unwrap());
+
+        assert!(serde_json::to_string(&streaming).is_ok());
+        assert!(serde_json::to_string(&streaming).is_err());
     }
 
     #[test]
