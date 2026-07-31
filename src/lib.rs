@@ -273,6 +273,37 @@ impl<R> FlowFile<R> {
         }
     }
 
+    /// Transform the content container and its declared [`size`](Self::size)
+    /// together, for a transform that changes the length.
+    ///
+    /// The checked form of [`map_content`](Self::map_content) plus
+    /// [`with_size`](Self::with_size): `f` returns the new container *and* how
+    /// many bytes it holds, so the two cannot drift apart by forgetting the
+    /// second call.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder().content(&b"hi"[..]);
+    /// let flow_file = flow_file.map_content_sized(|content| {
+    ///     let repeated = content.repeat(3);
+    ///     let len = repeated.len() as u64;
+    ///     (repeated, len)
+    /// });
+    ///
+    /// assert_eq!(flow_file.size(), 6);
+    /// assert_eq!(flow_file.content().as_slice(), b"hihihi");
+    /// ```
+    #[must_use]
+    pub fn map_content_sized<T>(self, f: impl FnOnce(R) -> (T, u64)) -> FlowFile<T> {
+        let (content, size) = f(self.content);
+        FlowFile {
+            size,
+            attributes: self.attributes,
+            content,
+        }
+    }
+
     /// Declare a different content [`size`](Self::size), keeping attributes
     /// and content.
     ///
@@ -431,6 +462,62 @@ impl FlowFile<Vec<u8>> {
         Ok(Self::from_raw_parts(size, attributes, reader.to_vec()))
     }
 
+    /// Parse a flow file from a `Vec` holding exactly one, reusing its
+    /// allocation for the content.
+    ///
+    /// The owning counterpart to [`from_bytes`](Self::from_bytes), which
+    /// copies the content out of the slice it is given. Here the header is
+    /// parsed and then removed from the front of `bytes`, leaving the content
+    /// in the same allocation it arrived in — worth having when the bytes are
+    /// already owned, which is the common case for anything read into memory.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let bytes = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..])
+    ///     .to_bytes();
+    ///
+    /// let flow_file = FlowFile::from_vec(bytes).unwrap();
+    /// assert_eq!(flow_file.content().as_slice(), b"hello");
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`from_bytes`](Self::from_bytes).
+    pub fn from_vec(bytes: Vec<u8>) -> Result<Self> {
+        Self::from_vec_with_limits(bytes, Limits::UNLIMITED)
+    }
+
+    /// Like [`from_vec`](Self::from_vec), but enforcing [`Limits`] on the
+    /// header. Use this for untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_bytes_with_limits`](Self::from_bytes_with_limits).
+    pub fn from_vec_with_limits(mut bytes: Vec<u8>, limits: Limits) -> Result<Self> {
+        let (attributes, size, header_len) = {
+            let mut reader = bytes.as_slice();
+            let (attributes, size) = sync::parse_header(&mut reader, None, limits)?;
+            (attributes, size, bytes.len() - reader.len())
+        };
+        let actual = (bytes.len() - header_len) as u64;
+        if actual < size {
+            return Err(Error::SizeMismatch {
+                expected: size,
+                actual,
+            });
+        }
+        if actual > size {
+            return Err(Error::TrailingData(actual - size));
+        }
+        // Shifts the content down over the header rather than allocating a
+        // second buffer for it.
+        bytes.drain(..header_len);
+        Ok(Self::from_raw_parts(size, attributes, bytes))
+    }
+
     /// Serialize the flow file to the binary V3 format.
     ///
     /// The whole flow file, header included — as against
@@ -469,6 +556,35 @@ impl FlowFile<Vec<u8>> {
         let mut buf = format::encode_header(&self.attributes, self.size);
         buf.extend_from_slice(&self.content);
         buf
+    }
+
+    /// Transform in-memory content, deriving the new [`size`](Self::size) from
+    /// what `f` returns.
+    ///
+    /// The common length-changing case — decompress, re-encode, rewrite —
+    /// where the length is simply the new content's, so nothing has to declare
+    /// it. Use [`map_content_sized`](Self::map_content_sized) when the result
+    /// is a reader whose length only the caller knows.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..])
+    ///     .map_bytes(|content| content.to_ascii_uppercase());
+    ///
+    /// assert_eq!(flow_file.content().as_slice(), b"HELLO");
+    /// assert_eq!(flow_file.size(), 5);
+    /// assert_eq!(flow_file.attribute("filename"), Some("greeting.txt"));
+    /// ```
+    #[must_use]
+    pub fn map_bytes(self, f: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Self {
+        self.map_content_sized(|content| {
+            let content = f(content);
+            let size = content.len() as u64;
+            (content, size)
+        })
     }
 
     /// Wrap the content in a [`std::io::Cursor`], which implements both
@@ -541,6 +657,67 @@ mod tests {
             .content(&b"hi"[..])
             .with_size(99)
             .to_bytes();
+    }
+
+    /// The point of the sized forms: the size follows the content instead of
+    /// being a second thing to remember.
+    #[test]
+    fn the_sized_maps_keep_the_size_with_the_content() {
+        let flow_file = FlowFile::builder()
+            .attribute("k", "v")
+            .content(&b"hi"[..])
+            .map_bytes(|content| content.repeat(3));
+        assert_eq!(flow_file.size(), 6);
+        assert_eq!(flow_file.content().as_slice(), b"hihihi");
+        assert_eq!(flow_file.attribute("k"), Some("v"), "attributes carried");
+
+        // Same answer as spelling it out by hand, which is what these replace.
+        let by_hand = FlowFile::builder()
+            .attribute("k", "v")
+            .content(&b"hi"[..])
+            .map_content(|content| content.repeat(3))
+            .with_size(6);
+        assert_eq!(flow_file, by_hand);
+
+        // And the general form, for a container whose length only `f` knows.
+        let sized = FlowFile::builder()
+            .content(&b"hi"[..])
+            .map_content_sized(|content| (std::io::Cursor::new(content.repeat(2)), 4));
+        assert_eq!(sized.size(), 4);
+    }
+
+    /// The owning parse has to agree with the borrowing one exactly, since the
+    /// only difference is meant to be who owns the bytes.
+    #[test]
+    fn from_vec_matches_from_bytes() {
+        let bytes = FlowFile::builder()
+            .attribute("filename", "greeting.txt")
+            .content(&b"hello"[..])
+            .to_bytes();
+
+        assert_eq!(
+            FlowFile::from_vec(bytes.clone()).unwrap(),
+            FlowFile::from_bytes(&bytes).unwrap()
+        );
+
+        // Including how it rejects things.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            FlowFile::from_vec(trailing),
+            Err(Error::TrailingData(1))
+        ));
+        assert!(matches!(
+            FlowFile::from_vec(bytes[..bytes.len() - 2].to_vec()),
+            Err(Error::SizeMismatch {
+                expected: 5,
+                actual: 3
+            })
+        ));
+        assert!(matches!(
+            FlowFile::from_vec_with_limits(bytes, Limits::UNLIMITED.with_max_content_len(4)),
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
     }
 
     #[test]

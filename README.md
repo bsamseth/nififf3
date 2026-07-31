@@ -184,9 +184,12 @@ condition match the same way. Only a truncation is recovered — any other
 
 The declared `size()` is what every serializer writes and every reader-based
 operation consumes, and each of the constructors above keeps it in step with
-the content. `map_content` is the exception: it swaps the container while
-carrying the size across, so a transform that *changes* the length —
-decompressing, re-encoding — has to declare the new one with `with_size`.
+the content. `map_content` swaps the container while carrying the size across,
+so it is only for transforms that preserve the length. For one that *changes*
+it — decompressing, re-encoding — use `map_bytes`, which derives the new size
+from the content it returns, or `map_content_sized` when the result is a reader
+whose length only you know. `with_size` remains for declaring a size by hand,
+and is the one way left to get this wrong.
 
 ## Deriving flow files from flow files
 

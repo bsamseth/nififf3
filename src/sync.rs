@@ -275,6 +275,42 @@ impl<R: Read> FlowFile<R> {
     }
 }
 
+impl FlowFile<Vec<u8>> {
+    /// Serialize the flow file to a writer.
+    ///
+    /// The in-memory counterpart to [`write_to`](FlowFile::write_to), which is
+    /// bounded on `R: Read` and so does not apply here — `Vec<u8>` is not a
+    /// reader, and two inherent methods of the same name cannot coexist even
+    /// though only one of them could ever apply. Hence the name.
+    ///
+    /// Takes `&self` rather than consuming, since nothing is exhausted by
+    /// writing in-memory content. Returns the number of content bytes written.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder().content(&b"hello"[..]);
+    /// let mut out = Vec::new();
+    /// flow_file.write_bytes_to(&mut out)?;
+    ///
+    /// assert_eq!(FlowFile::from_bytes(&out)?, flow_file);
+    /// # Ok::<(), nififf3::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer returns.
+    ///
+    /// # Panics
+    ///
+    /// As [`to_bytes`](FlowFile::to_bytes): an attribute the wire format
+    /// cannot express, or a declared size disagreeing with the content.
+    pub fn write_bytes_to<W: Write>(&self, writer: &mut W) -> io::Result<u64> {
+        writer.write_all(&self.to_bytes())?;
+        Ok(self.size)
+    }
+}
+
 /// Iterator over a stream of concatenated flow files.
 ///
 /// Yields each flow file with its content buffered in memory, and ends on a
@@ -626,6 +662,22 @@ mod tests {
         let copied = flow_file.write_to(&mut out).unwrap();
         assert_eq!(copied, 5);
         assert_eq!(out, sample_bytes());
+    }
+
+    /// The in-memory writer has to produce exactly what the reader-based one
+    /// does, or the two ways to write a flow file would disagree.
+    #[test]
+    fn write_bytes_to_matches_write_to() {
+        let flow_file = sample_flow_file();
+
+        let mut buffered = Vec::new();
+        let written = flow_file.write_bytes_to(&mut buffered).unwrap();
+        assert_eq!(written, 5, "content bytes, as `write_to` reports");
+
+        let mut streamed = Vec::new();
+        flow_file.into_reader().write_to(&mut streamed).unwrap();
+        assert_eq!(buffered, streamed);
+        assert_eq!(buffered, sample_bytes());
     }
 
     #[test]
