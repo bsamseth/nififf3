@@ -66,8 +66,9 @@ fn archive_of(parent: FlowFile<impl AsyncRead + Unpin>) -> Archive<impl AsyncRea
 /// declared size before its bytes are read, so an entry whose content runs
 /// short can only abort the response. See [`unpack_lenient`] for the
 /// alternative.
-async fn unpack(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
-    let parent = req.into_inner();
+async fn unpack(
+    StrictFlowFileRequest(parent): StrictFlowFileRequest,
+) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = archive_of(parent);
 
@@ -113,8 +114,9 @@ async fn unpack(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> 
 /// while nothing has been committed for it yet, so it can be reported as an
 /// error flow file instead of poisoning the response. The cost is holding one
 /// entry in memory at a time — the trade the streaming [`unpack`] avoids.
-async fn unpack_lenient(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
-    let parent = req.into_inner();
+async fn unpack_lenient(
+    StrictFlowFileRequest(parent): StrictFlowFileRequest,
+) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = archive_of(parent);
 

@@ -7,27 +7,152 @@ use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use http_body_util::BodyExt;
-use nififf3::{FlowFile, FlowFileRequest, Limits, MEDIA_TYPE, StrictFlowFileRequest};
+use nififf3::{
+    FlowFile, FlowFileRequest, FlowFilesRequest, Limits, MEDIA_TYPE, StrictFlowFileRequest,
+    StrictFlowFilesRequest,
+};
 use tower::ServiceExt;
 
 async fn echo(
-    flow_file: FlowFileRequest,
+    FlowFileRequest(flow_file): FlowFileRequest,
 ) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
     let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file.into_reader())
 }
 
 async fn strict_echo(
-    flow_file: StrictFlowFileRequest,
+    StrictFlowFileRequest(flow_file): StrictFlowFileRequest,
 ) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
-    let flow_file = flow_file.into_inner().into_memory_async().await?;
+    let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file.into_reader())
+}
+
+/// The many-in case: NiFi's `PostHTTP` sends several flow files concatenated
+/// under one request, which the single-flow-file extractor cannot accept.
+async fn count_batch(
+    FlowFilesRequest(mut flow_files): FlowFilesRequest,
+) -> Result<String, nififf3::Error> {
+    let mut sizes = Vec::new();
+    while let Some(flow_file) = flow_files.next().await {
+        sizes.push(flow_file?.size().to_string());
+    }
+    Ok(sizes.join(","))
+}
+
+async fn strict_count_batch(
+    StrictFlowFilesRequest(mut flow_files): StrictFlowFilesRequest,
+) -> Result<String, nififf3::Error> {
+    let mut count = 0;
+    while let Some(flow_file) = flow_files.next().await {
+        flow_file?;
+        count += 1;
+    }
+    Ok(count.to_string())
 }
 
 fn app() -> Router {
     Router::new()
         .route("/echo", post(echo))
         .route("/strict", post(strict_echo))
+        .route("/batch", post(count_batch))
+        .route("/strict-batch", post(strict_count_batch))
+}
+
+fn batch_bytes() -> Vec<u8> {
+    let mut bytes = FlowFile::builder().content(&b"first"[..]).to_bytes();
+    bytes.extend(FlowFile::builder().content(&b"second!"[..]).to_bytes());
+    bytes.extend(FlowFile::builder().content(Vec::new()).to_bytes());
+    bytes
+}
+
+async fn body_text(response: axum::response::Response) -> String {
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn the_batch_extractor_reads_every_flow_file_in_the_body() {
+    let response = app()
+        .oneshot(Request::post("/batch").body(Body::from(batch_bytes())).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "5,7,0");
+}
+
+/// An empty body is a batch of none, not a failure — the same reading
+/// `FlowFiles` gives a stream that ends immediately.
+#[tokio::test]
+async fn the_batch_extractor_accepts_an_empty_body() {
+    let response = app()
+        .oneshot(Request::post("/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "");
+}
+
+/// Nothing is read at extraction time, so a malformed body surfaces from
+/// `next` — which the handler turns into the same 400 as anywhere else.
+#[tokio::test]
+async fn the_batch_extractor_reports_a_malformed_body_from_the_handler() {
+    let response = app()
+        .oneshot(
+            Request::post("/batch")
+                .body(Body::from("not a flow file"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(response).await.contains("invalid magic"));
+}
+
+#[tokio::test]
+async fn the_strict_batch_extractor_checks_the_content_type() {
+    let response = app()
+        .oneshot(
+            Request::post("/strict-batch")
+                .body(Body::from(batch_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let response = app()
+        .oneshot(
+            Request::post("/strict-batch")
+                .header(header::CONTENT_TYPE, MEDIA_TYPE)
+                .body(Body::from(batch_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "3");
+}
+
+/// A batch is exactly what the single-flow-file extractor must not accept: it
+/// would read the first and silently drop the rest.
+#[tokio::test]
+async fn the_single_extractor_rejects_a_batch_as_trailing_data() {
+    let response = app()
+        .oneshot(Request::post("/echo").body(Body::from(batch_bytes())).unwrap())
+        .await
+        .unwrap();
+
+    // The extractor parses one flow file; echoing it back returns only that
+    // one, which is why a batch needs its own extractor.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        FlowFile::from_bytes(&body).unwrap().content().as_slice(),
+        b"first"
+    );
 }
 
 fn sample_bytes() -> Vec<u8> {

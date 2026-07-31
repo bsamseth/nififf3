@@ -354,6 +354,34 @@ type with `415 Unsupported Media Type`. Flow files with
 `Content-Type: application/flowfile-v3`), as does the error type (as a
 `400 Bad Request`).
 
+Both are newtypes, like axum's own extractors, so a handler destructures them
+in its signature: `async fn handler(FlowFileRequest(flow_file): FlowFileRequest)`.
+
+### Batches
+
+NiFi's `PostHTTP` sends *several* flow files concatenated under one request.
+`FlowFilesRequest` (and `StrictFlowFilesRequest`) reads them all, yielding one
+at a time — `FlowFileRequest` parses only the first:
+
+```rust,ignore
+use nififf3::FlowFilesRequest;
+
+async fn ingest(
+    FlowFilesRequest(mut flow_files): FlowFilesRequest,
+) -> Result<String, nififf3::Error> {
+    let mut count = 0;
+    while let Some(flow_file) = flow_files.next().await {
+        let flow_file = flow_file?; // a parse failure surfaces here
+        count += 1;
+    }
+    Ok(format!("took {count}"))
+}
+```
+
+Each content is buffered as it is yielded; to stream them instead, build a
+`FlowFileBody` from the request body and drive `FlowFile::parse_next_async`
+over it.
+
 ```rust,ignore
 use axum::{Router, routing::post};
 use nififf3::{FlowFile, FlowFileRequest};

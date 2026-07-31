@@ -17,7 +17,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 
-use crate::{Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDIA_TYPE};
+use crate::{
+    Error, FlowFile, FlowFilesAsync, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDIA_TYPE,
+};
 
 /// A flow file extracted from an axum request.
 ///
@@ -52,17 +54,48 @@ use crate::{Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDI
 ///     .layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)); // or ::disable()
 /// ```
 ///
+/// Destructure it in the handler signature, as with axum's own extractors:
+///
 /// ```no_run
 /// use nififf3::FlowFileRequest;
 ///
-/// async fn handler(flow_file: FlowFileRequest) -> Result<String, nififf3::Error> {
+/// async fn handler(FlowFileRequest(flow_file): FlowFileRequest) -> Result<String, nififf3::Error> {
 ///     let flow_file = flow_file.into_memory_async().await?;
 ///     Ok(format!("got {} bytes", flow_file.size()))
 /// }
 /// ```
-pub type FlowFileRequest = FlowFile<tokio::io::Take<FlowFileBody>>;
+///
+/// It also dereferences to the flow file, for reading attributes without
+/// taking it apart.
+#[derive(Debug)]
+pub struct FlowFileRequest(pub FlowFile<tokio::io::Take<FlowFileBody>>);
+
+impl std::ops::Deref for FlowFileRequest {
+    type Target = FlowFile<tokio::io::Take<FlowFileBody>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FlowFileRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// [`AsyncRead`] adapter over an axum request body.
+///
+/// The extractors build one for you. Construct it directly — with
+/// [`from_body`](Self::from_body) or the equivalent `From` — to parse a body
+/// some other way than they do: different [`Limits`], say, or a flow file
+/// followed by something that is not one.
+///
+/// Note that a [`Body`] taken straight off a request has *not* been through
+/// axum's [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit); the
+/// extractors apply it by calling
+/// [`RequestExt::with_limited_body`](axum::RequestExt::with_limited_body)
+/// first, and anything reading a body by hand should do the same.
 pub struct FlowFileBody {
     stream: BodyDataStream,
     chunk: Bytes,
@@ -72,6 +105,43 @@ pub struct FlowFileBody {
     /// about — a flow file declaring more content than the body carries makes
     /// that the ordinary case, not a pathological one.
     ended: bool,
+}
+
+impl FlowFileBody {
+    /// Read an axum request body as an [`AsyncRead`].
+    ///
+    /// ```no_run
+    /// use axum::extract::Request;
+    /// use axum::RequestExt as _;
+    /// use nififf3::{FlowFileBody, FlowFilesAsync, Limits};
+    ///
+    /// async fn handler(request: Request) -> Result<usize, nififf3::Error> {
+    ///     // `with_limited_body` is what applies `DefaultBodyLimit`.
+    ///     let body = FlowFileBody::from_body(request.with_limited_body().into_body());
+    ///     let mut flow_files = FlowFilesAsync::with_limits(body, Limits::recommended());
+    ///
+    ///     let mut count = 0;
+    ///     while let Some(flow_file) = flow_files.next().await {
+    ///         flow_file?;
+    ///         count += 1;
+    ///     }
+    ///     Ok(count)
+    /// }
+    /// ```
+    #[must_use]
+    pub fn from_body(body: Body) -> Self {
+        Self {
+            stream: body.into_data_stream(),
+            chunk: Bytes::new(),
+            ended: false,
+        }
+    }
+}
+
+impl From<Body> for FlowFileBody {
+    fn from(body: Body) -> Self {
+        Self::from_body(body)
+    }
 }
 
 impl std::fmt::Debug for FlowFileBody {
@@ -112,18 +182,22 @@ impl AsyncRead for FlowFileBody {
     }
 }
 
+/// The request body as an [`AsyncRead`], with axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) applied.
+///
+/// `with_limited_body` is what applies it; reading `req.into_body()` directly
+/// would silently opt out.
+fn limited_body(req: Request) -> FlowFileBody {
+    FlowFileBody::from_body(req.with_limited_body().into_body())
+}
+
 impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
     type Rejection = Error;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        // `with_limited_body` is what applies `DefaultBodyLimit`; reading
-        // `req.into_body()` directly would silently opt out of it.
-        let body = FlowFileBody {
-            stream: req.with_limited_body().into_body().into_data_stream(),
-            chunk: Bytes::new(),
-            ended: false,
-        };
-        FlowFile::parse_async_with_limits(body, Limits::recommended()).await
+        FlowFile::parse_async_with_limits(limited_body(req), Limits::recommended())
+            .await
+            .map(Self)
     }
 }
 
@@ -132,29 +206,26 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
 ///
 /// A missing or different content type is rejected with
 /// `415 Unsupported Media Type` before the body is parsed. Media type
-/// parameters (e.g. a `charset`) are ignored in the comparison. The wrapper
-/// dereferences to the inner flow file.
+/// parameters (e.g. a `charset`) are ignored in the comparison.
+///
+/// Wraps the same flow file [`FlowFileRequest`] does, and is used the same
+/// way — destructured, or dereferenced:
 ///
 /// ```no_run
 /// use nififf3::StrictFlowFileRequest;
 ///
-/// async fn handler(flow_file: StrictFlowFileRequest) -> Result<String, nififf3::Error> {
-///     let flow_file = flow_file.into_inner().into_memory_async().await?;
+/// async fn handler(
+///     StrictFlowFileRequest(flow_file): StrictFlowFileRequest,
+/// ) -> Result<String, nififf3::Error> {
+///     let flow_file = flow_file.into_memory_async().await?;
 ///     Ok(format!("got {} bytes", flow_file.size()))
 /// }
 /// ```
 #[derive(Debug)]
-pub struct StrictFlowFileRequest(pub FlowFileRequest);
-
-impl StrictFlowFileRequest {
-    /// Unwrap into the inner [`FlowFileRequest`].
-    pub fn into_inner(self) -> FlowFileRequest {
-        self.0
-    }
-}
+pub struct StrictFlowFileRequest(pub FlowFile<tokio::io::Take<FlowFileBody>>);
 
 impl std::ops::Deref for StrictFlowFileRequest {
-    type Target = FlowFileRequest;
+    type Target = FlowFile<tokio::io::Take<FlowFileBody>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -187,7 +258,26 @@ fn abbreviated(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
-/// Rejection returned by the [`StrictFlowFileRequest`] extractor.
+/// Reject the request unless it carries `Content-Type: application/flowfile-v3`.
+///
+/// Compares the media type only, ignoring any parameters. The comparison sees
+/// the whole header; only what travels back to the client is abbreviated.
+fn require_media_type(req: &Request) -> Result<(), StrictRejection> {
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let media_type = content_type.map(|value| value.split(';').next().unwrap_or("").trim());
+    if media_type.is_some_and(|value| value.eq_ignore_ascii_case(MEDIA_TYPE)) {
+        Ok(())
+    } else {
+        Err(StrictRejection::UnsupportedMediaType(
+            content_type.map(abbreviated),
+        ))
+    }
+}
+
+/// Rejection returned by the strict extractors.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StrictRejection {
@@ -219,19 +309,100 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
     type Rejection = StrictRejection;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let content_type = req
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        // Compare the media type only, ignoring any parameters. The comparison
-        // sees the whole header; only what travels back to the client is cut.
-        let media_type = content_type.map(|value| value.split(';').next().unwrap_or("").trim());
-        if !media_type.is_some_and(|value| value.eq_ignore_ascii_case(MEDIA_TYPE)) {
-            return Err(StrictRejection::UnsupportedMediaType(
-                content_type.map(abbreviated),
-            ));
-        }
-        Ok(Self(FlowFileRequest::from_request(req, state).await?))
+        require_media_type(&req)?;
+        Ok(Self(FlowFileRequest::from_request(req, state).await?.0))
+    }
+}
+
+/// Every flow file in a request body, read one at a time.
+///
+/// The many-in counterpart to [`FlowFilesResponse`], and what NiFi's own
+/// `PostHTTP` sends: several flow files concatenated under one
+/// `application/flowfile-v3` request. [`FlowFileRequest`] parses exactly one
+/// and rejects a body with more.
+///
+/// Each flow file's content is buffered in memory as it is yielded — the
+/// number of them is unbounded, the size of any one is bounded by
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) as usual. To stream
+/// the contents instead, build a [`FlowFileBody`] and drive
+/// [`FlowFile::parse_next_async`] over it yourself.
+///
+/// Headers are parsed with [`Limits::recommended`], as for the single-flow-file
+/// extractors. Parse errors surface from [`next`](FlowFilesAsync::next) rather
+/// than from extraction, since nothing is read until then: the extractor itself
+/// only fails if the request cannot be taken apart at all.
+///
+/// ```no_run
+/// use nififf3::FlowFilesRequest;
+///
+/// async fn handler(
+///     FlowFilesRequest(mut flow_files): FlowFilesRequest,
+/// ) -> Result<String, nififf3::Error> {
+///     let mut count = 0;
+///     while let Some(flow_file) = flow_files.next().await {
+///         let flow_file = flow_file?;
+///         count += flow_file.size();
+///     }
+///     Ok(format!("{count} content bytes in total"))
+/// }
+/// ```
+#[derive(Debug)]
+pub struct FlowFilesRequest(pub FlowFilesAsync<FlowFileBody>);
+
+impl std::ops::Deref for FlowFilesRequest {
+    type Target = FlowFilesAsync<FlowFileBody>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FlowFilesRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for FlowFilesRequest {
+    type Rejection = Error;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(FlowFilesAsync::with_limits(
+            limited_body(req),
+            Limits::recommended(),
+        )))
+    }
+}
+
+/// [`FlowFilesRequest`], additionally requiring
+/// `Content-Type: application/flowfile-v3`.
+///
+/// The many-in counterpart to [`StrictFlowFileRequest`], rejecting a missing or
+/// different content type with `415 Unsupported Media Type` before any of the
+/// body is read.
+#[derive(Debug)]
+pub struct StrictFlowFilesRequest(pub FlowFilesAsync<FlowFileBody>);
+
+impl std::ops::Deref for StrictFlowFilesRequest {
+    type Target = FlowFilesAsync<FlowFileBody>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StrictFlowFilesRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for StrictFlowFilesRequest {
+    type Rejection = StrictRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        require_media_type(&req)?;
+        Ok(Self(FlowFilesRequest::from_request(req, state).await?.0))
     }
 }
 

@@ -43,8 +43,9 @@ pub use futures_core::Stream;
 
 #[cfg(feature = "axum")]
 pub use axum_support::{
-    BlockingResponseSink, BoxError, FlowFileBody, FlowFileRequest, FlowFilesResponse, ResponseSink,
-    StrictFlowFileRequest, StrictRejection,
+    BlockingResponseSink, BoxError, FlowFileBody, FlowFileRequest, FlowFilesRequest,
+    FlowFilesResponse, ResponseSink, StrictFlowFileRequest, StrictFlowFilesRequest,
+    StrictRejection,
 };
 
 /// Convenience alias for results produced by this crate.
