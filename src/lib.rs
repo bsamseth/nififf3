@@ -346,7 +346,7 @@ impl<R> FlowFile<R> {
     /// let children: Vec<_> = parent
     ///     .content()
     ///     .split(|b| *b == b'\n')
-    ///     .map(|line| parts.next().content(line))
+    ///     .map(|line| parts.next_part().content(line))
     ///     .collect();
     ///
     /// assert_eq!(children[0].attributes()["fragment.index"], "1");

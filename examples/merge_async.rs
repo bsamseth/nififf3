@@ -72,9 +72,9 @@ fn fragmented() -> Vec<u8> {
 
     let mut parts = parent.fragments().with_count(3);
     let flow_files = [
-        parts.next().content(&b"alpha"[..]),
-        parts.next().content(&b"beta"[..]),
-        parts.next().content(&b"gamma"[..]),
+        parts.next_part().content(&b"alpha"[..]),
+        parts.next_part().content(&b"beta"[..]),
+        parts.next_part().content(&b"gamma"[..]),
     ];
 
     let mut bytes = Vec::new();

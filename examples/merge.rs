@@ -111,9 +111,9 @@ fn fragmented() -> Vec<u8> {
 
     let mut parts = parent.fragments();
     let flow_files = [
-        parts.next().content(&b"alpha"[..]),
-        parts.next().content(&b"beta"[..]),
-        parts.next().content(&b"gamma"[..]),
+        parts.next_part().content(&b"alpha"[..]),
+        parts.next_part().content(&b"beta"[..]),
+        parts.next_part().content(&b"gamma"[..]),
         parts.terminate(),
     ];
 

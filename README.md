@@ -227,7 +227,7 @@ let mut parts = parent.fragments().with_count(2);
 let children: Vec<_> = parent
     .content()
     .split(|byte| *byte == b'\n')
-    .map(|line| parts.next().content(line))
+    .map(|line| parts.next_part().content(line))
     .collect();
 
 assert_eq!(children[0].attributes()["fragment.index"], "1");
@@ -262,7 +262,7 @@ let mut parts = parent.fragments(); // no `with_count`: the total is unknown
 let mut out = Vec::new();
 let mut writer = FlowFilesWriter::new(&mut out);
 for record in parent.content().split(|byte| *byte == b'\n') {
-    writer.write_bytes(&parts.next().content(record))?;
+    writer.write_bytes(&parts.next_part().content(record))?;
 }
 writer.write_bytes(&parts.terminate())?; // now the total is known
 writer.finish()?;
@@ -295,7 +295,7 @@ use nififf3::FlowFile;
 let parent = FlowFile::builder()
     .attribute("filename", "pair.txt")
     .content(&b"first\nsecond"[..]);
-let part = parent.fragments().next().content(&b"first"[..]);
+let part = parent.fragments().next_part().content(&b"first"[..]);
 
 let merged = part.derive().defragment().content(&b"first\nsecond"[..]);
 assert_eq!(merged.attributes()["filename"], "pair.txt");
@@ -382,7 +382,7 @@ async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
     Ok(FlowFilesResponse::new(move |mut writer| async move {
         for line in parent.content().split(|byte| *byte == b'\n') {
             // `line` is a reader, so its content is never copied into a part.
-            writer.write(parts.next().reader(line, line.len() as u64)).await?;
+            writer.write(parts.next_part().reader(line, line.len() as u64)).await?;
         }
         Ok(())
     }))

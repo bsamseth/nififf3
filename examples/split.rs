@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (offset, record) in records.iter().enumerate() {
         writer.write_bytes(
             &parts
-                .next()
+                .next_part()
                 .attribute("filename", format!("record-{offset}.txt"))
                 .content(*record),
         )?;

@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (offset, record) in parent.content().split(|byte| *byte == b'\n').enumerate() {
         // `record` is an `AsyncRead`; its bytes go straight to the writer.
         let part = parts
-            .next()
+            .next_part()
             .attribute("filename", format!("record-{offset}.txt"))
             .reader(record, record.len() as u64);
         writer.write(part).await?;

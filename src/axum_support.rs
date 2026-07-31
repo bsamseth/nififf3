@@ -430,7 +430,7 @@ enum Source {
 /// Turning one of the streaming variants into a response spawns the producer,
 /// so it must happen inside a tokio runtime — which an axum handler always is.
 /// Converting one by hand outside a runtime panics.
-/// [`from_vec`](Self::from_vec) spawns nothing and is fine anywhere.
+/// [`buffered`](Self::buffered) spawns nothing and is fine anywhere.
 pub struct FlowFilesResponse {
     source: Source,
     buffer_size: usize,
@@ -475,7 +475,7 @@ impl FlowFilesResponse {
     /// let response = FlowFilesResponse::new(move |mut writer| async move {
     ///     for line in parent.content().split(|byte| *byte == b'\n') {
     ///         // `line` is a reader, so its content is never copied into a part.
-    ///         writer.write(parts.next().reader(line, line.len() as u64)).await?;
+    ///         writer.write(parts.next_part().reader(line, line.len() as u64)).await?;
     ///     }
     ///     Ok(())
     /// })
@@ -554,6 +554,9 @@ impl FlowFilesResponse {
     /// once. Use [`new`](Self::new) or [`from_stream`](Self::from_stream) when
     /// that is not a trade worth making.
     ///
+    /// Takes anything iterable, so a `Vec`, an array, or a mapped iterator all
+    /// work without collecting first.
+    ///
     /// ```
     /// use axum::http::header;
     /// use axum::response::IntoResponse;
@@ -562,16 +565,16 @@ impl FlowFilesResponse {
     /// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
     /// let mut parts = parent.fragments().with_count(2);
     ///
-    /// let response = FlowFilesResponse::from_vec(vec![
-    ///     parts.next().content(&b"first"[..]),
-    ///     parts.next().content(&b"second"[..]),
+    /// let response = FlowFilesResponse::buffered([
+    ///     parts.next_part().content(&b"first"[..]),
+    ///     parts.next_part().content(&b"second"[..]),
     /// ])
     /// .into_response();
     ///
     /// assert!(response.headers().contains_key(header::CONTENT_LENGTH));
     /// ```
     #[must_use]
-    pub fn from_vec(parts: Vec<FlowFile<Vec<u8>>>) -> Self {
+    pub fn buffered(parts: impl IntoIterator<Item = FlowFile<Vec<u8>>>) -> Self {
         let mut bytes = Vec::new();
         for part in parts {
             bytes.extend_from_slice(&part.to_bytes());
@@ -584,7 +587,7 @@ impl FlowFilesResponse {
 
     /// Set how many serialized bytes may be in flight between the producer
     /// and the socket. Defaults to 64 KiB; ignored by
-    /// [`from_vec`](Self::from_vec).
+    /// [`buffered`](Self::buffered).
     ///
     /// Rounded up to at least one byte: a buffer of zero can never accept a
     /// write, so the producer would park on its first one and the response
@@ -598,7 +601,7 @@ impl FlowFilesResponse {
 }
 
 /// Sets `Content-Type: application/flowfile-v3`. The body is chunked, except
-/// for [`FlowFilesResponse::from_vec`], which sets a `Content-Length`.
+/// for [`FlowFilesResponse::buffered`], which sets a `Content-Length`.
 ///
 /// A response with no parts at all is a legitimate empty body.
 impl IntoResponse for FlowFilesResponse {

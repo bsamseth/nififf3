@@ -39,7 +39,7 @@ impl Default for Keys {
 /// A counter for splitting one flow file into many.
 ///
 /// Created with [`FlowFile::fragments`](crate::FlowFile::fragments). Each call
-/// to [`next`](Self::next) yields a [`FlowFileBuilder`] carrying the parent's
+/// to [`next_part`](Self::next_part) yields a [`FlowFileBuilder`] carrying the parent's
 /// attributes — with a fresh [`uuid`](attr::UUID), as
 /// [`derive`](crate::FlowFile::derive) does — plus NiFi's fragment attributes,
 /// which let `MergeContent` reassemble the parent in `defragment` mode:
@@ -68,7 +68,7 @@ impl Default for Keys {
 ///     .content(Vec::new());
 ///
 /// let mut parts = parent.fragments().with_count(2);
-/// let first = parts.next().attribute("filename", "a.txt").content(&b"a"[..]);
+/// let first = parts.next_part().attribute("filename", "a.txt").content(&b"a"[..]);
 ///
 /// assert_eq!(first.attributes()["fragment.index"], "1");
 /// assert_eq!(first.attributes()["fragment.count"], "2");
@@ -205,12 +205,7 @@ impl Fragments {
     /// past it describes a set that cannot be reassembled — a panic is louder
     /// than shipping a bundle that times out to `failure` in production.
     #[must_use]
-    #[expect(
-        clippy::should_implement_trait,
-        reason = "`Iterator` would have to yield builders forever, with no way \
-                  to stop; `parts.next()` is still the right name at the call site"
-    )]
-    pub fn next(&mut self) -> FlowFileBuilder {
+    pub fn next_part(&mut self) -> FlowFileBuilder {
         self.index += 1;
         assert!(
             self.count.is_none_or(|count| self.index <= count),
@@ -255,7 +250,7 @@ impl Fragments {
     /// let mut out = Vec::new();
     /// let mut writer = FlowFilesWriter::new(&mut out);
     /// for record in parent.content().split(|byte| *byte == b'\n') {
-    ///     writer.write_bytes(&parts.next().content(record))?;
+    ///     writer.write_bytes(&parts.next_part().content(record))?;
     /// }
     /// writer.write_bytes(&parts.terminate())?;
     /// writer.finish()?;
@@ -336,8 +331,8 @@ mod tests {
     #[test]
     fn indexes_are_one_up_and_share_an_identifier() {
         let mut parts = parent().fragments();
-        let first = parts.next().content(Vec::new());
-        let second = parts.next().content(Vec::new());
+        let first = parts.next_part().content(Vec::new());
+        let second = parts.next_part().content(Vec::new());
 
         assert_eq!(first.attributes()["fragment.index"], "1");
         assert_eq!(second.attributes()["fragment.index"], "2");
@@ -355,7 +350,7 @@ mod tests {
     #[test]
     fn inherits_attributes_but_not_the_parent_uuid() {
         let parent = parent();
-        let child = parent.fragments().next().content(Vec::new());
+        let child = parent.fragments().next_part().content(Vec::new());
 
         assert_eq!(child.attributes()["path"], "/in");
         assert_eq!(
@@ -369,8 +364,8 @@ mod tests {
     fn terminate_counts_itself_as_the_last_flow_file() {
         let parent = parent();
         let mut parts = parent.fragments();
-        let first = parts.next().content(&b"a"[..]);
-        let second = parts.next().content(&b"b"[..]);
+        let first = parts.next_part().content(&b"a"[..]);
+        let second = parts.next_part().content(&b"b"[..]);
         let terminator = parts.terminate();
 
         // NiFi fills the bin when it holds `fragment.count` flow files, and
@@ -407,7 +402,7 @@ mod tests {
     #[test]
     fn terminate_honours_custom_attribute_keys() {
         let mut parts = parent().fragments().count_attribute("split.total");
-        let _ = parts.next();
+        let _ = parts.next_part();
         let terminator = parts.terminate();
 
         assert_eq!(terminator.attributes()["split.total"], "2");
@@ -420,8 +415,8 @@ mod tests {
         // Two parts of a set declared to hold two: the terminator would be a
         // third flow file in a bin that fills at two.
         let mut parts = parent().fragments().with_count(2);
-        let _ = parts.next();
-        let _ = parts.next();
+        let _ = parts.next_part();
+        let _ = parts.next_part();
         let _ = parts.terminate();
     }
 
@@ -431,7 +426,7 @@ mod tests {
     fn a_terminated_bundle_declares_the_number_of_flow_files_it_contains() {
         let parent = parent();
         let mut parts = parent.fragments();
-        let mut bundle: Vec<_> = (0..4).map(|_| parts.next().content(Vec::new())).collect();
+        let mut bundle: Vec<_> = (0..4).map(|_| parts.next_part().content(Vec::new())).collect();
         bundle.push(parts.terminate());
 
         let declared: usize = bundle
@@ -448,7 +443,7 @@ mod tests {
         assert!(
             !parent()
                 .fragments()
-                .next()
+                .next_part()
                 .content(Vec::new())
                 .attributes()
                 .contains_key("fragment.count")
@@ -456,7 +451,7 @@ mod tests {
         let child = parent()
             .fragments()
             .with_count(7)
-            .next()
+            .next_part()
             .content(Vec::new());
         assert_eq!(child.attributes()["fragment.count"], "7");
     }
@@ -468,7 +463,7 @@ mod tests {
             .attribute("fragment.index", "3")
             .attribute("fragment.count", "9")
             .content(Vec::new());
-        let child = parent.fragments().next().content(Vec::new());
+        let child = parent.fragments().next_part().content(Vec::new());
 
         assert_ne!(child.attributes()["fragment.identifier"], "old");
         assert_eq!(child.attributes()["fragment.index"], "1");
@@ -480,7 +475,7 @@ mod tests {
     fn producing_more_fragments_than_declared_is_caught() {
         let mut parts = parent().fragments().with_count(2);
         for _ in 0..3 {
-            let _ = parts.next();
+            let _ = parts.next_part();
         }
     }
 
@@ -488,7 +483,7 @@ mod tests {
     fn an_undeclared_count_never_runs_out() {
         let mut parts = parent().fragments();
         for _ in 0..3 {
-            let _ = parts.next();
+            let _ = parts.next_part();
         }
         assert_eq!(parts.produced(), 3);
     }
@@ -501,7 +496,7 @@ mod tests {
             .attribute("segment.original.filename", "grandparent.tar")
             .attribute("fragment.index", "3")
             .content(Vec::new());
-        let child = parent.fragments().next().content(Vec::new());
+        let child = parent.fragments().next_part().content(Vec::new());
 
         assert_eq!(child.attributes()["fragment.index"], "1");
         assert!(
@@ -525,7 +520,7 @@ mod tests {
             .attribute("split.parent", "grandparent.tar")
             .content(Vec::new());
 
-        let child = custom_keys(parent.fragments()).next().content(Vec::new());
+        let child = custom_keys(parent.fragments()).next_part().content(Vec::new());
 
         assert_ne!(child.attributes()["split.id"], "old");
         assert_eq!(child.attributes()["split.n"], "1");
@@ -566,7 +561,7 @@ mod tests {
             .attribute("segment.original.filename", "grandparent.tar")
             .content(Vec::new());
 
-        let child = custom_keys(parent.fragments()).next().content(Vec::new());
+        let child = custom_keys(parent.fragments()).next_part().content(Vec::new());
 
         for key in [
             "fragment.identifier",
@@ -595,7 +590,7 @@ mod tests {
         let child = parent
             .fragments()
             .original_filename_attribute("split.parent")
-            .next()
+            .next_part()
             .content(Vec::new());
 
         assert_eq!(child.attributes()["split.parent"], "a.tar");
@@ -617,7 +612,7 @@ mod tests {
             .count_attribute("split.total")
             .original_filename_attribute("split.parent")
             .with_identifier("fixed")
-            .next()
+            .next_part()
             .content(Vec::new());
 
         assert_eq!(child.attributes()["split.id"], "fixed");
@@ -631,7 +626,7 @@ mod tests {
     fn builder_attributes_win_over_inherited_ones() {
         let child = parent()
             .fragments()
-            .next()
+            .next_part()
             .attribute("filename", "entry.txt")
             .without_attribute("path")
             .content(Vec::new());

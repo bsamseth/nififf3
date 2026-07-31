@@ -79,14 +79,14 @@ async fn unpack(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> 
                     let size = entry.header().entry_size()?;
                     let name = entry.path()?.display().to_string();
                     writer
-                        .write(parts.next().attribute("filename", name).reader(entry, size))
+                        .write(parts.next_part().attribute("filename", name).reader(entry, size))
                         .await?;
                 }
                 Err(err) => {
                     writer
                         .write_bytes(
                             &parts
-                                .next()
+                                .next_part()
                                 .attribute(ERROR_ATTRIBUTE, err.to_string())
                                 .without_attribute("filename")
                                 .content(Vec::new()),
@@ -125,7 +125,7 @@ async fn unpack_lenient(req: StrictFlowFileRequest) -> Result<FlowFilesResponse,
                 Ok(mut entry) => {
                     let size = entry.header().entry_size()?;
                     let name = entry.path()?.display().to_string();
-                    let part = parts.next().attribute("filename", name);
+                    let part = parts.next_part().attribute("filename", name);
                     let mut content = Vec::new();
                     match entry.read_to_end(&mut content).await {
                         Ok(read) if read as u64 == size => (part.content(content), None),
@@ -138,7 +138,7 @@ async fn unpack_lenient(req: StrictFlowFileRequest) -> Result<FlowFilesResponse,
                 }
                 Err(err) => (
                     parts
-                        .next()
+                        .next_part()
                         .without_attribute("filename")
                         .content(Vec::new()),
                     Some(err.to_string()),
@@ -393,14 +393,15 @@ async fn an_archive_with_no_entries_is_a_bundle_with_no_parts() {
 }
 
 #[tokio::test]
-async fn from_vec_sets_a_content_length() {
+async fn buffered_sets_a_content_length() {
     let parent = FlowFile::builder()
         .attribute("filename", "pair")
         .content(Vec::new());
     let mut parts = parent.fragments().with_count(2);
-    let response = FlowFilesResponse::from_vec(vec![
-        parts.next().content(&b"first"[..]),
-        parts.next().content(&b"second"[..]),
+    // Any `IntoIterator`, not just a `Vec`.
+    let response = FlowFilesResponse::buffered([
+        parts.next_part().content(&b"first"[..]),
+        parts.next_part().content(&b"second"[..]),
     ])
     .into_response();
 

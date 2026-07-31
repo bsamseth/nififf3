@@ -50,7 +50,7 @@ impl FlowFileBuilder {
     /// Remove an attribute, if present.
     ///
     /// Mostly useful after [`FlowFile::derive`](crate::FlowFile::derive) or
-    /// [`Fragments::next`](crate::Fragments::next), to drop an inherited
+    /// [`Fragments::next_part`](crate::Fragments::next_part), to drop an inherited
     /// attribute that does not apply to the new flow file.
     ///
     /// ```
@@ -88,7 +88,7 @@ impl FlowFileBuilder {
     ///     .content(&b"a\nb"[..]);
     ///
     /// let mut parts = parent.fragments().with_count(2);
-    /// let first = parts.next().attribute("filename", "record-0").content(&b"a"[..]);
+    /// let first = parts.next_part().attribute("filename", "record-0").content(&b"a"[..]);
     ///
     /// let merged = first.derive().defragment().content(&b"a\nb"[..]);
     ///
@@ -308,7 +308,7 @@ mod tests {
             .content(&b"a\nb"[..]);
 
         let mut parts = parent.fragments().with_count(2);
-        let part = parts.next().attribute("filename", "record-0").content(&b"a"[..]);
+        let part = parts.next_part().attribute("filename", "record-0").content(&b"a"[..]);
 
         let merged = part.derive().defragment().content(&b"a\nb"[..]);
         let attributes = merged.attributes();

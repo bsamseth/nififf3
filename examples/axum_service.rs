@@ -45,7 +45,7 @@ async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
         for (offset, record) in parent.content().split(|byte| *byte == b'\n').enumerate() {
             // `record` is a reader, so its content is never copied into a part.
             let part = parts
-                .next()
+                .next_part()
                 .attribute("filename", format!("record-{offset}.txt"))
                 .reader(record, record.len() as u64);
             writer.write(part).await?;
