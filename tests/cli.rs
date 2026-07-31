@@ -193,6 +193,57 @@ fn limit_flags_reject_oversized_headers() {
         .success();
 }
 
+/// The limit flags are global, so they have to mean the same thing on every
+/// subcommand — including the two that never run a header parser.
+#[test]
+fn limit_flags_apply_to_the_json_path_too() {
+    let json = r#"{"attributes": {"k": "a value longer than the limit"}, "content": ""}"#;
+
+    nififf3()
+        .args(["from-json", "--max-attribute-len", "4"])
+        .write_stdin(json)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("attribute length"));
+
+    // And to the flow file `create` builds, content included.
+    nififf3()
+        .args(["create", "--max-content-len", "2", "k=v"])
+        .write_stdin("far too much content")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("content size"));
+
+    // Unset still means no cap.
+    nififf3()
+        .arg("from-json")
+        .write_stdin(json)
+        .assert()
+        .success();
+}
+
+/// The aggregate cap catches what the per-attribute ones cannot.
+#[test]
+fn total_attribute_length_flag_is_enforced() {
+    let many = FlowFile::builder()
+        .attributes((0..10).map(|i| (format!("k{i}"), "v".repeat(100))))
+        .content(Vec::new())
+        .to_bytes();
+
+    nififf3()
+        .args(["attrs", "--max-total-attribute-len", "256"])
+        .write_stdin(many.clone())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("attribute bytes total"));
+
+    nififf3()
+        .args(["attrs", "--max-attribute-len", "1024"])
+        .write_stdin(many)
+        .assert()
+        .success();
+}
+
 #[test]
 fn to_json_rejects_garbage() {
     nififf3()

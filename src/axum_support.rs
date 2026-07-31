@@ -27,7 +27,7 @@ use crate::{Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDI
 /// be processed incrementally.
 ///
 /// Request bodies are untrusted, so the header is parsed with
-/// [`Limits::default`]. To use different limits, extract the raw
+/// [`Limits::recommended`]. To use different limits, extract the raw
 /// [`axum::body::Body`] and call
 /// [`FlowFile::parse_async_with_limits`] on a reader over it.
 ///
@@ -123,7 +123,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
             chunk: Bytes::new(),
             ended: false,
         };
-        FlowFile::parse_async_with_limits(body, Limits::default()).await
+        FlowFile::parse_async_with_limits(body, Limits::recommended()).await
     }
 }
 
@@ -361,6 +361,7 @@ impl IntoResponse for Error {
         let status = match self {
             Error::TooManyAttributes { .. }
             | Error::AttributeTooLong { .. }
+            | Error::HeaderTooLarge { .. }
             | Error::ContentTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Io(ref err) if err.get_ref().is_some_and(is_body_limit) => {
                 StatusCode::PAYLOAD_TOO_LARGE

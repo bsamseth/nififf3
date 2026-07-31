@@ -67,9 +67,16 @@ pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
         return Err(Error::TooManyAttributes { count, limit });
     }
     let mut attributes = HashMap::with_capacity(count.min(1024));
+    let mut total = 0usize;
     for _ in 0..count {
         let key = read_string(reader, limits.max_attribute_len).await?;
         let value = read_string(reader, limits.max_attribute_len).await?;
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+        if let Some(limit) = limits.max_total_attribute_len
+            && total > limit
+        {
+            return Err(Error::HeaderTooLarge { len: total, limit });
+        }
         attributes.insert(key, value);
     }
     let mut size = [0u8; 8];
@@ -705,7 +712,7 @@ mod tests {
             .content(Vec::new())
             .to_bytes();
 
-        let limits = Limits::default().max_attribute_len(8);
+        let limits = Limits::recommended().with_max_attribute_len(8);
         assert!(matches!(
             FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
             Err(Error::AttributeTooLong { limit: 8, .. })
@@ -715,7 +722,7 @@ mod tests {
     #[tokio::test]
     async fn async_limits_reject_an_oversized_declared_content_size() {
         let bytes = sample().to_bytes();
-        let limits = Limits::default().max_content_len(4);
+        let limits = Limits::recommended().with_max_content_len(4);
 
         assert!(matches!(
             FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,

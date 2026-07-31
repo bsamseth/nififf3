@@ -361,7 +361,7 @@ async fn a_disabled_body_limit_lets_large_flow_files_through() {
 async fn a_declared_content_size_over_the_limit_is_rejected_before_the_content() {
     // The header claims 5 bytes; the limit allows 4. Nothing is read past it.
     let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
-    let limits = Limits::default().max_content_len(4);
+    let limits = Limits::recommended().with_max_content_len(4);
 
     let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
     assert!(matches!(

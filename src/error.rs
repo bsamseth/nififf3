@@ -108,6 +108,20 @@ pub enum Error {
         limit: usize,
     },
 
+    /// The attribute keys and values together exceed the total the configured
+    /// [`Limits`](crate::Limits) allow.
+    ///
+    /// Raised part-way through the header, as soon as the running total passes
+    /// the limit, rather than after the whole header has been read.
+    #[error("attribute bytes total {len} which exceeds the limit of {limit}")]
+    HeaderTooLarge {
+        /// The running total of attribute key and value bytes when the limit
+        /// was passed.
+        len: usize,
+        /// The configured maximum.
+        limit: usize,
+    },
+
     /// An attribute key or value is longer than the configured
     /// [`Limits`](crate::Limits) allow.
     #[error("attribute length {len} exceeds the limit of {limit} bytes")]

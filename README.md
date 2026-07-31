@@ -83,8 +83,10 @@ let bytes = FlowFile::builder()
     .content(&b"hi"[..])
     .to_bytes();
 
-// Defaults: at most 4096 attributes, 1 MiB per attribute key/value.
-let limits = Limits::default().max_attribute_len(10);
+// Recommended: at most 4096 attributes, 1 MiB per key/value, 2 MiB of
+// attribute bytes in total. `Limits::UNLIMITED` is the neutral starting point
+// to build up from instead, and every `with_max_*` takes `None` to clear.
+let limits = Limits::recommended().with_max_attribute_len(10);
 let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
 assert!(matches!(err, Error::AttributeTooLong { .. }));
 ```
@@ -316,7 +318,7 @@ flow_file.write_to_async(&mut tokio::io::stdout()).await?;
 ## Axum integration (`axum` feature)
 
 Handlers can take a `FlowFileRequest` extractor, which parses the flow file
-header from the request body (applying `Limits::default()`, since request
+header from the request body (applying `Limits::recommended()`, since request
 bodies are untrusted) and streams the content incrementally — arbitrarily
 large flow files never need to be in memory.
 
@@ -432,8 +434,11 @@ content, and `create` reads all of stdin into memory, since it has to know the
 content length before it can write the header.
 
 Headers are trusted by default, as NiFi's own unpackager trusts them. For
-input you have not vetted, `--max-attributes`, `--max-attribute-len` and
-`--max-content-len` apply the corresponding `Limits` to every flow file read:
+input you have not vetted, `--max-attributes`, `--max-attribute-len`,
+`--max-total-attribute-len` and `--max-content-len` apply the corresponding
+`Limits` to every flow file. They are honoured by every subcommand, including
+the two that never run a header parser — `from-json` checks each decoded flow
+file and `create` checks the one it built:
 
 ```console
 $ nififf3 attrs --max-attributes 4096 --max-content-len 1073741824 untrusted.ff3

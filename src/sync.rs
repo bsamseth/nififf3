@@ -61,9 +61,16 @@ pub(crate) fn parse_header(
         return Err(Error::TooManyAttributes { count, limit });
     }
     let mut attributes = HashMap::with_capacity(count.min(1024));
+    let mut total = 0usize;
     for _ in 0..count {
         let key = read_string(reader, limits.max_attribute_len)?;
         let value = read_string(reader, limits.max_attribute_len)?;
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+        if let Some(limit) = limits.max_total_attribute_len
+            && total > limit
+        {
+            return Err(Error::HeaderTooLarge { len: total, limit });
+        }
         attributes.insert(key, value);
     }
     let mut size = [0u8; 8];
@@ -734,7 +741,7 @@ mod tests {
     #[test]
     fn limits_reject_an_oversized_declared_content_size() {
         let bytes = sample_flow_file().to_bytes();
-        let limits = Limits::default().max_content_len(4);
+        let limits = Limits::recommended().with_max_content_len(4);
 
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
@@ -747,7 +754,7 @@ mod tests {
             FlowFile::parse_with_limits(header_only, limits),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::default()).is_ok());
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::recommended()).is_ok());
     }
 
     /// A reader that yields `available` bytes and then ends, so a flow file
@@ -883,14 +890,14 @@ mod tests {
         let bytes = sample_flow_file().to_bytes();
 
         assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, Limits::default().max_attributes(1)),
+            FlowFile::from_bytes_with_limits(&bytes, Limits::recommended().with_max_attributes(1)),
             Err(Error::TooManyAttributes { count: 2, limit: 1 })
         ));
         assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, Limits::default().max_content_len(4)),
+            FlowFile::from_bytes_with_limits(&bytes, Limits::recommended().with_max_content_len(4)),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
-        assert!(FlowFile::from_bytes_with_limits(&bytes, Limits::default()).is_ok());
+        assert!(FlowFile::from_bytes_with_limits(&bytes, Limits::recommended()).is_ok());
     }
 
     #[test]
@@ -936,7 +943,7 @@ mod tests {
             .content(Vec::new());
         let bytes = flow_file.to_bytes();
 
-        let limits = Limits::default().max_attributes(5);
+        let limits = Limits::recommended().with_max_attributes(5);
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::TooManyAttributes {
@@ -944,7 +951,34 @@ mod tests {
                 limit: 5
             })
         ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::default()).is_ok());
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::recommended()).is_ok());
+    }
+
+    /// The aggregate the per-attribute limits cannot express: each attribute
+    /// here is tiny, and together they are not.
+    #[test]
+    fn limits_reject_an_oversized_header_in_total() {
+        let bytes = FlowFile::builder()
+            .attributes((0..10).map(|i| (format!("k{i}"), "v".repeat(100))))
+            .content(Vec::new())
+            .to_bytes();
+
+        let limits = Limits::UNLIMITED.with_max_total_attribute_len(256);
+        assert!(matches!(
+            FlowFile::parse_with_limits(bytes.as_slice(), limits),
+            Err(Error::HeaderTooLarge { limit: 256, .. })
+        ));
+        // Each one on its own is well inside the per-attribute limits, so
+        // nothing but the total would have caught this.
+        assert!(
+            FlowFile::parse_with_limits(
+                bytes.as_slice(),
+                Limits::UNLIMITED
+                    .with_max_attributes(10)
+                    .with_max_attribute_len(1024)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -954,7 +988,7 @@ mod tests {
             .content(Vec::new())
             .to_bytes();
 
-        let limits = Limits::default().max_attribute_len(8);
+        let limits = Limits::recommended().with_max_attribute_len(8);
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::AttributeTooLong { limit: 8, .. })

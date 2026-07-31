@@ -17,8 +17,13 @@ struct Cli {
     limits: LimitArgs,
 }
 
-/// Caps on what a flow file header may declare. Unset means no cap, matching
-/// NiFi's own unpackager; set them when reading input you do not trust.
+/// Caps on a flow file's attributes and declared content size. Unset means no
+/// cap, matching NiFi's own unpackager; set them when handling input you do not
+/// trust.
+///
+/// Every subcommand honours them, including the two that never run a header
+/// parser: `from-json` checks each decoded flow file, and `create` checks the
+/// one it built.
 #[derive(Args)]
 #[expect(
     clippy::struct_field_names,
@@ -33,6 +38,11 @@ struct LimitArgs {
     #[arg(long, global = true, value_name = "BYTES")]
     max_attribute_len: Option<usize>,
 
+    /// Reject headers whose attribute keys and values total more than this,
+    /// in bytes.
+    #[arg(long, global = true, value_name = "BYTES")]
+    max_total_attribute_len: Option<usize>,
+
     /// Reject headers declaring more content than this, in bytes.
     #[arg(long, global = true, value_name = "BYTES")]
     max_content_len: Option<u64>,
@@ -42,13 +52,16 @@ impl From<LimitArgs> for Limits {
     fn from(args: LimitArgs) -> Self {
         let mut limits = Limits::UNLIMITED;
         if let Some(n) = args.max_attributes {
-            limits = limits.max_attributes(n);
+            limits = limits.with_max_attributes(n);
         }
         if let Some(n) = args.max_attribute_len {
-            limits = limits.max_attribute_len(n);
+            limits = limits.with_max_attribute_len(n);
+        }
+        if let Some(n) = args.max_total_attribute_len {
+            limits = limits.with_max_total_attribute_len(n);
         }
         if let Some(n) = args.max_content_len {
-            limits = limits.max_content_len(n);
+            limits = limits.with_max_content_len(n);
         }
         limits
     }
@@ -102,10 +115,10 @@ fn run() -> Result<()> {
     let limits = Limits::from(cli.limits);
     match cli.command {
         Command::ToJson { path } => to_json(open_input(path.as_deref())?, limits),
-        Command::FromJson { path } => from_json(open_input(path.as_deref())?),
+        Command::FromJson { path } => from_json(open_input(path.as_deref())?, limits),
         Command::Attrs { path } => attrs(open_input(path.as_deref())?, limits),
         Command::Content { path } => content(open_input(path.as_deref())?, limits),
-        Command::Create { attributes } => create(&attributes),
+        Command::Create { attributes } => create(&attributes, limits),
     }
 }
 
@@ -127,11 +140,16 @@ fn to_json(mut reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     Ok(())
 }
 
-fn from_json(reader: Box<dyn BufRead>) -> Result<()> {
+fn from_json(reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     let mut stdout = io::stdout().lock();
     for flow_file in serde_json::Deserializer::from_reader(reader).into_iter::<FlowFile<Vec<u8>>>()
     {
-        stdout.write_all(&flow_file?.to_bytes())?;
+        // The JSON path never goes through a parser, so the limits have to be
+        // applied to the decoded flow file instead — otherwise `--max-*` would
+        // mean something on one input format and nothing on the other.
+        let flow_file = flow_file?;
+        limits.check(flow_file.attributes(), flow_file.size())?;
+        stdout.write_all(&flow_file.to_bytes())?;
     }
     Ok(())
 }
@@ -173,7 +191,7 @@ fn copy_content<R: Read, W: Write>(flow_file: FlowFile<R>, writer: &mut W) -> Re
     Ok(())
 }
 
-fn create(attribute_args: &[String]) -> Result<()> {
+fn create(attribute_args: &[String], limits: Limits) -> Result<()> {
     let mut builder = FlowFile::builder();
     for arg in attribute_args {
         let (key, value) = arg
@@ -182,6 +200,8 @@ fn create(attribute_args: &[String]) -> Result<()> {
         builder = builder.attribute(key, value);
     }
     let flow_file = builder.buffered(io::stdin().lock())?;
+    // A flow file this command wrote should be one it would also accept.
+    limits.check(flow_file.attributes(), flow_file.size())?;
     io::stdout().lock().write_all(&flow_file.to_bytes())?;
     Ok(())
 }
