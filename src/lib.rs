@@ -27,7 +27,7 @@ mod serde_support;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;
-pub use fragments::Fragments;
+pub use fragments::{FragmentKeys, Fragments};
 pub use limits::Limits;
 pub use sync::{FlowFiles, FlowFilesWriter};
 

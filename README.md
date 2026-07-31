@@ -290,7 +290,10 @@ parts. `examples/merge.rs` does exactly that.
 
 `defragment` is the inverse, for the far end of a merge: it drops the fragment
 attributes and restores `filename` from `segment.original.filename`, so the
-reassembled flow file looks like the one the split started from.
+reassembled flow file looks like the one the split started from. A split that
+numbered its parts with custom keys holds them as a `FragmentKeys` and hands
+the same value to both ends — `fragments().with_keys(keys)` on the way out and
+`defragment_with(&keys)` on the way back.
 
 ```rust
 use nififf3::FlowFile;

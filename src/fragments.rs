@@ -4,18 +4,84 @@ use std::collections::HashMap;
 
 use crate::{FlowFile, FlowFileBuilder, attr};
 
-/// The attribute keys [`Fragments`] writes.
-#[derive(Debug, Clone)]
-struct Keys {
-    identifier: String,
-    index: String,
-    count: String,
-    original_filename: String,
+/// The attribute keys a fragment set is numbered with.
+///
+/// Defaults to NiFi's own — [`fragment.identifier`](attr::FRAGMENT_ID),
+/// [`fragment.index`](attr::FRAGMENT_INDEX),
+/// [`fragment.count`](attr::FRAGMENT_COUNT) and
+/// [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) — which is
+/// what to use for anything `MergeContent` will see.
+///
+/// Worth naming as a value when they are *not* the defaults, because both ends
+/// of a split need the same set: [`Fragments::with_keys`] to write them and
+/// [`FlowFileBuilder::defragment_with`](crate::FlowFileBuilder::defragment_with)
+/// to undo them.
+///
+/// ```
+/// use nififf3::{FlowFile, FragmentKeys};
+///
+/// let keys = FragmentKeys::default()
+///     .index_attribute("split.n")
+///     .count_attribute("split.total");
+///
+/// let parent = FlowFile::builder()
+///     .attribute("filename", "records.txt")
+///     .content(&b"a\nb"[..]);
+/// let part = parent
+///     .fragments()
+///     .with_keys(keys.clone())
+///     .with_count(2)
+///     .next_part()
+///     .content(&b"a"[..]);
+/// assert_eq!(part.attribute("split.n"), Some("1"));
+///
+/// let merged = part.derive().defragment_with(&keys).content(&b"a\nb"[..]);
+/// assert_eq!(merged.attribute("split.n"), None);
+/// assert_eq!(merged.attribute("filename"), Some("records.txt"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentKeys {
+    pub(crate) identifier: String,
+    pub(crate) index: String,
+    pub(crate) count: String,
+    pub(crate) original_filename: String,
 }
 
-impl Keys {
-    /// Every key this set writes, for dropping the parent's values under them.
-    fn all(&self) -> [&String; 4] {
+impl FragmentKeys {
+    /// Write the fragment identifier under `key` instead of
+    /// [`fragment.identifier`](attr::FRAGMENT_ID).
+    #[must_use]
+    pub fn identifier_attribute(mut self, key: impl Into<String>) -> Self {
+        self.identifier = key.into();
+        self
+    }
+
+    /// Write the fragment index under `key` instead of
+    /// [`fragment.index`](attr::FRAGMENT_INDEX).
+    #[must_use]
+    pub fn index_attribute(mut self, key: impl Into<String>) -> Self {
+        self.index = key.into();
+        self
+    }
+
+    /// Write the fragment count under `key` instead of
+    /// [`fragment.count`](attr::FRAGMENT_COUNT).
+    #[must_use]
+    pub fn count_attribute(mut self, key: impl Into<String>) -> Self {
+        self.count = key.into();
+        self
+    }
+
+    /// Write the original filename under `key` instead of
+    /// [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME).
+    #[must_use]
+    pub fn original_filename_attribute(mut self, key: impl Into<String>) -> Self {
+        self.original_filename = key.into();
+        self
+    }
+
+    /// Every key in the set, for dropping a parent's values under them.
+    pub(crate) fn all(&self) -> [&String; 4] {
         [
             &self.identifier,
             &self.index,
@@ -25,7 +91,7 @@ impl Keys {
     }
 }
 
-impl Default for Keys {
+impl Default for FragmentKeys {
     fn default() -> Self {
         Self {
             identifier: attr::FRAGMENT_ID.to_string(),
@@ -98,12 +164,12 @@ pub struct Fragments {
     count: Option<u64>,
     original_filename: Option<String>,
     index: u64,
-    keys: Keys,
+    keys: FragmentKeys,
 }
 
 impl Fragments {
     pub(crate) fn new(attributes: &HashMap<String, String>) -> Self {
-        let keys = Keys::default();
+        let keys = FragmentKeys::default();
         let original_filename = attributes.get(attr::FILENAME).cloned();
         // A fresh split supersedes any the parent was itself part of, under
         // the default keys. The configured keys are not known yet — they are
@@ -146,11 +212,28 @@ impl Fragments {
         self
     }
 
+    /// Use `keys` for all four fragment attributes.
+    ///
+    /// The form to reach for when the same keys have to be undone later:
+    /// hold a [`FragmentKeys`] and hand it to both this and
+    /// [`defragment_with`](crate::FlowFileBuilder::defragment_with).
+    #[must_use]
+    pub fn with_keys(mut self, keys: FragmentKeys) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// The keys this set writes.
+    #[must_use]
+    pub fn keys(&self) -> &FragmentKeys {
+        &self.keys
+    }
+
     /// Write the fragment identifier under `key` instead of
     /// [`fragment.identifier`](attr::FRAGMENT_ID).
     #[must_use]
     pub fn identifier_attribute(mut self, key: impl Into<String>) -> Self {
-        self.keys.identifier = key.into();
+        self.keys = self.keys.identifier_attribute(key);
         self
     }
 
@@ -158,7 +241,7 @@ impl Fragments {
     /// [`fragment.index`](attr::FRAGMENT_INDEX).
     #[must_use]
     pub fn index_attribute(mut self, key: impl Into<String>) -> Self {
-        self.keys.index = key.into();
+        self.keys = self.keys.index_attribute(key);
         self
     }
 
@@ -166,7 +249,7 @@ impl Fragments {
     /// [`fragment.count`](attr::FRAGMENT_COUNT).
     #[must_use]
     pub fn count_attribute(mut self, key: impl Into<String>) -> Self {
-        self.keys.count = key.into();
+        self.keys = self.keys.count_attribute(key);
         self
     }
 
@@ -174,7 +257,7 @@ impl Fragments {
     /// [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME).
     #[must_use]
     pub fn original_filename_attribute(mut self, key: impl Into<String>) -> Self {
-        self.keys.original_filename = key.into();
+        self.keys = self.keys.original_filename_attribute(key);
         self
     }
 

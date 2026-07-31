@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{FlowFile, attr};
+use crate::{FlowFile, FragmentKeys, attr};
 
 /// Builder for [`FlowFile`]s.
 ///
@@ -98,16 +98,49 @@ impl FlowFileBuilder {
     /// assert!(!merged.attributes().contains_key("segment.original.filename"));
     /// ```
     ///
-    /// This handles the default attribute keys. A split that used custom ones
-    /// (see [`Fragments::identifier_attribute`](crate::Fragments::identifier_attribute)
-    /// and friends) needs [`without_attribute`](Self::without_attribute)
-    /// instead.
+    /// This handles the default attribute keys; for a split that used custom
+    /// ones, hand the same [`FragmentKeys`] to
+    /// [`defragment_with`](Self::defragment_with).
     #[must_use]
-    pub fn defragment(mut self) -> Self {
-        if let Some(filename) = self.attributes.remove(attr::SEGMENT_ORIGINAL_FILENAME) {
+    pub fn defragment(self) -> Self {
+        self.defragment_with(&FragmentKeys::default())
+    }
+
+    /// [`defragment`](Self::defragment) for a split that numbered its parts
+    /// with custom keys.
+    ///
+    /// The other end of [`Fragments::with_keys`](crate::Fragments::with_keys): the same value that decided
+    /// what to write decides what to undo, so a custom split is as reversible
+    /// as a default one.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, FragmentKeys};
+    ///
+    /// let keys = FragmentKeys::default()
+    ///     .index_attribute("split.n")
+    ///     .original_filename_attribute("split.parent");
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "records.csv")
+    ///     .content(&b"a\nb"[..]);
+    /// let part = parent
+    ///     .fragments()
+    ///     .with_keys(keys.clone())
+    ///     .next_part()
+    ///     .content(&b"a"[..]);
+    ///
+    /// let merged = part.derive().defragment_with(&keys).content(&b"a\nb"[..]);
+    ///
+    /// assert_eq!(merged.attribute("filename"), Some("records.csv"));
+    /// assert_eq!(merged.attribute("split.n"), None);
+    /// assert_eq!(merged.attribute("split.parent"), None);
+    /// ```
+    #[must_use]
+    pub fn defragment_with(mut self, keys: &FragmentKeys) -> Self {
+        if let Some(filename) = self.attributes.remove(&keys.original_filename) {
             self.attributes.insert(attr::FILENAME.to_string(), filename);
         }
-        for key in [attr::FRAGMENT_ID, attr::FRAGMENT_INDEX, attr::FRAGMENT_COUNT] {
+        for key in [&keys.identifier, &keys.index, &keys.count] {
             self.attributes.remove(key);
         }
         self
@@ -323,6 +356,62 @@ mod tests {
         ] {
             assert!(!attributes.contains_key(key), "{key} should be gone");
         }
+    }
+
+    /// A custom split has to be as reversible as a default one: the same
+    /// `FragmentKeys` writes the parts and undoes them.
+    #[test]
+    fn defragment_with_undoes_a_custom_split_round_trip() {
+        use crate::FragmentKeys;
+
+        let keys = FragmentKeys::default()
+            .identifier_attribute("split.id")
+            .index_attribute("split.n")
+            .count_attribute("split.total")
+            .original_filename_attribute("split.parent");
+
+        let parent = FlowFile::builder()
+            .attribute("filename", "records.csv")
+            .attribute("source", "upload")
+            .content(&b"a\nb"[..]);
+
+        let part = parent
+            .fragments()
+            .with_keys(keys.clone())
+            .with_count(2)
+            .next_part()
+            .attribute("filename", "record-0")
+            .content(&b"a"[..]);
+        assert_eq!(part.attribute("split.n"), Some("1"));
+        assert_eq!(part.attribute("split.parent"), Some("records.csv"));
+
+        let merged = part.derive().defragment_with(&keys).content(&b"a\nb"[..]);
+        assert_eq!(merged.attribute("filename"), Some("records.csv"), "restored");
+        assert_eq!(merged.attribute("source"), Some("upload"), "still inherited");
+        for key in ["split.id", "split.n", "split.total", "split.parent"] {
+            assert_eq!(merged.attribute(key), None, "{key} should be gone");
+        }
+    }
+
+    /// And the default keys are just the default value of the same thing.
+    #[test]
+    fn defragment_is_defragment_with_the_default_keys() {
+        use crate::FragmentKeys;
+
+        let part = FlowFile::builder()
+            .attribute("filename", "records.csv")
+            .content(Vec::new())
+            .fragments()
+            .next_part()
+            .content(Vec::new());
+
+        // `derive` mints a fresh uuid each call, so compare on everything else.
+        assert_eq!(
+            part.derive_keep_uuid().defragment().content(Vec::new()),
+            part.derive_keep_uuid()
+                .defragment_with(&FragmentKeys::default())
+                .content(Vec::new())
+        );
     }
 
     #[test]
