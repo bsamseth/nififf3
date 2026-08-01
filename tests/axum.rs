@@ -111,6 +111,22 @@ async fn the_batch_extractor_reports_a_malformed_body_from_the_handler() {
     assert!(body_text(response).await.contains("invalid magic"));
 }
 
+/// The batch extractor reads through the same limited body the single one
+/// does, so an over-large body is a 413 there too — and it is caught while
+/// reading, not after the whole batch has been taken in.
+#[tokio::test]
+async fn the_batch_extractor_honours_the_default_body_limit() {
+    let app = app().layer(DefaultBodyLimit::max(64));
+    let mut bytes = FlowFile::builder().content(vec![0u8; 100_000]).to_bytes();
+    bytes.extend(FlowFile::builder().content(&b"x"[..]).to_bytes());
+
+    let response = app
+        .oneshot(Request::post("/batch").body(Body::from(bytes)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 #[tokio::test]
 async fn the_strict_batch_extractor_checks_the_content_type() {
     let response = app()

@@ -222,6 +222,45 @@ fn limit_flags_apply_to_the_json_path_too() {
         .success();
 }
 
+/// `--max-content-len` has to bound the read, not judge it afterwards: the
+/// point of the flag is not to buffer an unbounded stdin in the first place.
+/// A limit of 0 makes that observable — one byte of input is already over it,
+/// so nothing after the first byte can have been needed to decide.
+#[test]
+fn create_stops_reading_at_the_content_limit() {
+    nififf3()
+        .args(["create", "--max-content-len", "0", "k=v"])
+        .write_stdin(vec![b'x'; 1 << 20])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("content size"));
+
+    // And an input inside the limit still goes through untouched.
+    let stdout = nififf3()
+        .args(["create", "--max-content-len", "5", "k=v"])
+        .write_stdin("hello")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        FlowFile::from_bytes(&stdout).unwrap().content().as_slice(),
+        b"hello"
+    );
+}
+
+/// Attribute limits are decided before stdin is touched at all.
+#[test]
+fn create_rejects_oversized_attributes_without_reading_content() {
+    nififf3()
+        .args(["create", "--max-attribute-len", "2", "key=value"])
+        .write_stdin("content")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("attribute length"));
+}
+
 /// The aggregate cap catches what the per-attribute ones cannot.
 #[test]
 fn total_attribute_length_flag_is_enforced() {

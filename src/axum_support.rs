@@ -495,7 +495,10 @@ impl Stream for ExactLength {
                 Poll::Ready(if this.remaining == 0 {
                     None
                 } else {
-                    let delivered = this.declared - this.remaining;
+                    // Saturating because `remaining` covers the header too:
+                    // the header is served from an in-memory cursor and always
+                    // drains, but nothing here depends on that being true.
+                    let delivered = this.declared.saturating_sub(this.remaining);
                     Some(Err(crate::error::truncated(this.declared, delivered)))
                 })
             }

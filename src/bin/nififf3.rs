@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -192,16 +192,38 @@ fn copy_content<R: Read, W: Write>(flow_file: FlowFile<R>, writer: &mut W) -> Re
 }
 
 fn create(attribute_args: &[String], limits: Limits) -> Result<()> {
-    let mut builder = FlowFile::builder();
+    let mut attributes = HashMap::new();
     for arg in attribute_args {
         let (key, value) = arg
             .split_once('=')
             .ok_or_else(|| format!("invalid attribute {arg:?}: expected KEY=VALUE"))?;
-        builder = builder.attribute(key, value);
+        attributes.insert(key.to_string(), value.to_string());
     }
-    let flow_file = builder.buffered(io::stdin().lock())?;
-    // A flow file this command wrote should be one it would also accept.
-    limits.check(flow_file.attributes(), flow_file.size())?;
+    // The attributes come from the command line, so they can be judged before
+    // a byte of content is read.
+    limits.check(&attributes, 0)?;
+
+    let content = read_within(io::stdin().lock(), limits.max_content_len())?;
+    let flow_file = FlowFile::builder().attributes(attributes).content(content);
     io::stdout().lock().write_all(&flow_file.to_bytes())?;
     Ok(())
+}
+
+/// Read to the end of `reader`, refusing to buffer more than `max` bytes.
+///
+/// `--max-content-len` is a guard, so it has to stop the read rather than
+/// judge it afterwards: buffering an unbounded stdin and *then* rejecting it
+/// is the thing the flag exists to prevent.
+fn read_within(mut reader: impl Read, max: Option<u64>) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let Some(limit) = max else {
+        reader.read_to_end(&mut buf)?;
+        return Ok(buf);
+    };
+    // One byte past the limit is all it takes to know it was exceeded.
+    let read = reader.take(limit.saturating_add(1)).read_to_end(&mut buf)? as u64;
+    if read > limit {
+        return Err(format!("content size exceeds the limit of {limit} bytes").into());
+    }
+    Ok(buf)
 }

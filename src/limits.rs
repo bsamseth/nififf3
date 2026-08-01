@@ -108,7 +108,7 @@ impl Limits {
     /// use [`UNLIMITED`](Self::UNLIMITED), matching NiFi. "Default" here means
     /// the defaults worth starting from, not the crate's default behaviour.
     #[must_use]
-    pub fn recommended() -> Self {
+    pub const fn recommended() -> Self {
         Self {
             max_attributes: Some(4096),
             max_attribute_len: Some(1 << 20),
@@ -218,7 +218,10 @@ impl Limits {
     ///
     /// For flow files that did not come from this crate's parsers — built by
     /// hand, or decoded from some other representation — where the same caps
-    /// should still hold. The CLI uses it to make `--max-*` mean the same thing
+    /// should still hold. One difference follows from working on a map rather
+    /// than a header: [`max_attributes`](Self::max_attributes) counts distinct
+    /// keys here, where a parser counts what the header declared, duplicates
+    /// included. The CLI uses it to make `--max-*` mean the same thing
     /// on the JSON path as on the binary one.
     ///
     /// ```

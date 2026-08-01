@@ -478,7 +478,8 @@ Commands taking a path read from stdin when it is omitted or `-`, and
 process flow files one at a time, so streams larger than memory are fine. Two
 exceptions: `to-json`/`from-json` buffer one flow file at a time to base64 its
 content, and `create` reads all of stdin into memory, since it has to know the
-content length before it can write the header.
+content length before it can write the header — `--max-content-len` bounds
+that read rather than judging it afterwards.
 
 Headers are trusted by default, as NiFi's own unpackager trusts them. For
 input you have not vetted, `--max-attributes`, `--max-attribute-len`,
