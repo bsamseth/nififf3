@@ -24,6 +24,13 @@ struct Cli {
 /// Every subcommand honours them, including the two that never run a header
 /// parser: `from-json` checks each decoded flow file, and `create` checks the
 /// one it built.
+///
+/// Where they are enforced differs, and it matters for `--max-content-len`.
+/// The binary paths and `create` refuse oversized content *before* buffering
+/// it. `from-json` cannot: serde has decoded the base64 into memory by the
+/// time there is a flow file to judge, so the limit rejects the input rather
+/// than preventing the allocation. Bound untrusted JSON at the transport if
+/// that distinction matters.
 #[derive(Args)]
 #[expect(
     clippy::struct_field_names,
