@@ -638,6 +638,7 @@ impl FlowFilesResponse {
     /// use nififf3::{FlowFile, FlowFilesAsync, FlowFilesResponse};
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # #[cfg(feature = "uuid")] {
     /// let parent = FlowFile::builder()
     ///     .attribute("filename", "pair.txt")
     ///     .content(&b"first\nsecond"[..]);
@@ -659,6 +660,7 @@ impl FlowFilesResponse {
     /// assert_eq!(first.content().as_slice(), b"first");
     /// assert_eq!(first.attributes()["fragment.index"], "1");
     /// assert_eq!(first.attributes()["segment.original.filename"], "pair.txt");
+    /// # }
     /// # });
     /// ```
     ///
@@ -733,12 +735,9 @@ impl FlowFilesResponse {
     /// use axum::response::IntoResponse;
     /// use nififf3::{FlowFile, FlowFilesResponse};
     ///
-    /// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
-    /// let mut parts = parent.fragments().with_count(2);
-    ///
     /// let response = FlowFilesResponse::buffered([
-    ///     parts.next_part().content(&b"first"[..]),
-    ///     parts.next_part().content(&b"second"[..]),
+    ///     FlowFile::builder().content(&b"first"[..]),
+    ///     FlowFile::builder().content(&b"second"[..]),
     /// ])
     /// .into_response();
     ///

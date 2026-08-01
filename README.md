@@ -199,6 +199,7 @@ attribute is replaced with a fresh one, since in NiFi it identifies a single
 flow file — `derive_keep_uuid` copies it verbatim instead.
 
 ```rust
+# #[cfg(feature = "uuid")] {
 use nififf3::FlowFile;
 
 let parent = FlowFile::builder()
@@ -213,6 +214,7 @@ let child = parent.derive()
 
 assert_eq!(child.attributes()["filename"], "report.header.csv");
 assert!(!child.attributes().contains_key("source"));
+# }
 ```
 
 When one flow file becomes *many* — an archive unpacked into a flow file per
@@ -220,6 +222,7 @@ entry, a batch split into records — `fragments` numbers the results with
 NiFi's fragment attributes, so `MergeContent` can reassemble them downstream:
 
 ```rust
+# #[cfg(feature = "uuid")] {
 use nififf3::FlowFile;
 
 let parent = FlowFile::builder()
@@ -236,6 +239,7 @@ let children: Vec<_> = parent
 assert_eq!(children[0].attributes()["fragment.index"], "1");
 assert_eq!(children[1].attributes()["fragment.index"], "2");
 assert_eq!(children[0].attributes()["segment.original.filename"], "pair.txt");
+# }
 ```
 
 Each part also gets its own `uuid` and a `fragment.identifier` shared across
@@ -255,6 +259,7 @@ the end — `terminate` closes the bundle with an empty flow file carrying the
 count, so the parts can still be streamed as they are produced:
 
 ```rust
+# #[cfg(feature = "uuid")] {
 use nififf3::{FlowFile, FlowFiles, FlowFilesWriter};
 
 let parent = FlowFile::builder()
@@ -274,6 +279,7 @@ let bundle: Vec<_> = FlowFiles::new(out.as_slice()).collect::<Result<_, _>>()?;
 assert_eq!(bundle.len(), 3, "two parts and the terminator");
 assert_eq!(bundle[2].attributes()["fragment.count"], "3");
 assert_eq!(bundle[2].size(), 0);
+# }
 # Ok::<(), nififf3::Error>(())
 ```
 
@@ -296,6 +302,7 @@ the same value to both ends — `fragments().with_keys(keys)` on the way out and
 `defragment_with(&keys)` on the way back.
 
 ```rust
+# #[cfg(feature = "uuid")] {
 use nififf3::FlowFile;
 
 let parent = FlowFile::builder()
@@ -306,6 +313,7 @@ let part = parent.fragments().next_part().content(&b"first"[..]);
 let merged = part.derive().defragment().content(&b"first\nsecond"[..]);
 assert_eq!(merged.attributes()["filename"], "pair.txt");
 assert!(!merged.attributes().contains_key("fragment.index"));
+# }
 ```
 
 ## Async I/O (`tokio` feature)

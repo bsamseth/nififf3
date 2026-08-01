@@ -56,12 +56,14 @@ impl FlowFileBuilder {
     /// ```
     /// use nififf3::FlowFile;
     ///
-    /// let parent = FlowFile::builder()
+    /// let flow_file = FlowFile::builder()
     ///     .attribute("filename", "archive.tar")
+    ///     .attribute("source", "upload")
+    ///     .without_attribute("filename")
     ///     .content(Vec::new());
     ///
-    /// let child = parent.derive().without_attribute("filename").content(Vec::new());
-    /// assert!(!child.attributes().contains_key("filename"));
+    /// assert_eq!(flow_file.attribute("filename"), None);
+    /// assert_eq!(flow_file.attribute("source"), Some("upload"));
     /// ```
     #[must_use]
     pub fn without_attribute(mut self, key: &str) -> Self {
@@ -82,20 +84,22 @@ impl FlowFileBuilder {
     /// ```
     /// use nififf3::FlowFile;
     ///
-    /// let parent = FlowFile::builder()
-    ///     .attribute("filename", "records.csv")
+    /// // One part of a split, as it would arrive.
+    /// let part = FlowFile::builder()
+    ///     .attribute("filename", "record-0")
     ///     .attribute("source", "upload")
-    ///     .content(&b"a\nb"[..]);
+    ///     .attribute("fragment.identifier", "8f14e45f")
+    ///     .attribute("fragment.index", "1")
+    ///     .attribute("fragment.count", "2")
+    ///     .attribute("segment.original.filename", "records.csv")
+    ///     .content(&b"a"[..]);
     ///
-    /// let mut parts = parent.fragments().with_count(2);
-    /// let first = parts.next_part().attribute("filename", "record-0").content(&b"a"[..]);
+    /// let merged = part.derive_keep_uuid().defragment().content(&b"a\nb"[..]);
     ///
-    /// let merged = first.derive().defragment().content(&b"a\nb"[..]);
-    ///
-    /// assert_eq!(merged.attributes()["filename"], "records.csv");
-    /// assert_eq!(merged.attributes()["source"], "upload"); // still inherited
-    /// assert!(!merged.attributes().contains_key("fragment.index"));
-    /// assert!(!merged.attributes().contains_key("segment.original.filename"));
+    /// assert_eq!(merged.attribute("filename"), Some("records.csv"));
+    /// assert_eq!(merged.attribute("source"), Some("upload")); // still inherited
+    /// assert_eq!(merged.attribute("fragment.index"), None);
+    /// assert_eq!(merged.attribute("segment.original.filename"), None);
     /// ```
     ///
     /// This handles the default attribute keys; for a split that used custom
@@ -120,16 +124,17 @@ impl FlowFileBuilder {
     ///     .index_attribute("split.n")
     ///     .original_filename_attribute("split.parent");
     ///
-    /// let parent = FlowFile::builder()
-    ///     .attribute("filename", "records.csv")
-    ///     .content(&b"a\nb"[..]);
-    /// let part = parent
-    ///     .fragments()
-    ///     .with_keys(keys.clone())
-    ///     .next_part()
+    /// // A part numbered with those keys, as the split left it.
+    /// let part = FlowFile::builder()
+    ///     .attribute("filename", "record-0")
+    ///     .attribute("split.n", "1")
+    ///     .attribute("split.parent", "records.csv")
     ///     .content(&b"a"[..]);
     ///
-    /// let merged = part.derive().defragment_with(&keys).content(&b"a\nb"[..]);
+    /// let merged = part
+    ///     .derive_keep_uuid()
+    ///     .defragment_with(&keys)
+    ///     .content(&b"a\nb"[..]);
     ///
     /// assert_eq!(merged.attribute("filename"), Some("records.csv"));
     /// assert_eq!(merged.attribute("split.n"), None);

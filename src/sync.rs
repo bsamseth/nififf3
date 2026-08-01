@@ -442,13 +442,10 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 /// ```
 /// use nififf3::{FlowFile, FlowFilesWriter};
 ///
-/// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
-/// let mut parts = parent.fragments().with_count(2);
-///
 /// let mut out = Vec::new();
 /// let mut writer = FlowFilesWriter::new(&mut out);
-/// writer.write_bytes(&parts.next_part().content(&b"first"[..]))?;
-/// writer.write_bytes(&parts.next_part().content(&b"second"[..]))?;
+/// writer.write_bytes(&FlowFile::builder().content(&b"first"[..]))?;
+/// writer.write_bytes(&FlowFile::builder().content(&b"second"[..]))?;
 /// assert_eq!(writer.count(), 2);
 ///
 /// # use nififf3::FlowFiles;

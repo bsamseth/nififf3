@@ -57,6 +57,23 @@ jobs:
       - name: Doc tests
         run: cargo test --all-features --locked --doc
 
+  doctests:
+    name: Doc tests (feature powerset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      # The clippy powerset above uses `--all-targets`, which excludes doc
+      # tests, and the test job's `--each-feature` never turns two features on
+      # at once. So a doc example that only exists under one combination, or
+      # that uses an item gated behind a feature its own item is not, is
+      # checked here and nowhere else.
+      - run: cargo hack test --feature-powerset --doc --locked
+
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
@@ -98,7 +115,7 @@ jobs:
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [clippy, test, msrv, examples]
+    needs: [clippy, test, doctests, msrv, examples]
     runs-on: ubuntu-latest
     # Trusted publishing: crates.io issues a short-lived token in exchange for
     # GitHub's OIDC token, so there is no registry credential to store here.

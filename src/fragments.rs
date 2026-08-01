@@ -21,6 +21,7 @@ use crate::attr;
 /// to undo them.
 ///
 /// ```
+/// # #[cfg(feature = "uuid")] {
 /// use nififf3::{FlowFile, FragmentKeys};
 ///
 /// let keys = FragmentKeys::default()
@@ -41,6 +42,7 @@ use crate::attr;
 /// let merged = part.derive().defragment_with(&keys).content(&b"a\nb"[..]);
 /// assert_eq!(merged.attribute("split.n"), None);
 /// assert_eq!(merged.attribute("filename"), Some("records.txt"));
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentKeys {

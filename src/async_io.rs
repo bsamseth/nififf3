@@ -411,13 +411,10 @@ where
 /// use nififf3::{FlowFile, FlowFilesAsync, FlowFilesWriterAsync};
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// let parent = FlowFile::builder().attribute("filename", "pair").content(Vec::new());
-/// let mut parts = parent.fragments().with_count(2);
-///
 /// let mut out = Vec::new();
 /// let mut writer = FlowFilesWriterAsync::new(&mut out);
-/// writer.write_bytes(&parts.next_part().content(&b"first"[..])).await.unwrap();
-/// writer.write_bytes(&parts.next_part().content(&b"second"[..])).await.unwrap();
+/// writer.write_bytes(&FlowFile::builder().content(&b"first"[..])).await.unwrap();
+/// writer.write_bytes(&FlowFile::builder().content(&b"second"[..])).await.unwrap();
 /// assert_eq!(writer.count(), 2);
 ///
 /// let mut parsed = FlowFilesAsync::new(out.as_slice());
