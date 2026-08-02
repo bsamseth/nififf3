@@ -203,9 +203,13 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// # Ok::<(), nififf3::Error>(())
     /// ```
     ///
-    /// [`FlowFiles`] sidesteps all of this by reading each content into memory
-    /// as it goes; reach for `parse_next` when that is the part you cannot
-    /// afford.
+    /// Two types remove the question entirely, and one of them should usually
+    /// be preferred to calling this directly: [`FlowFiles`] reads each content
+    /// into memory as it goes, and [`FlowFilesReader`] streams the content but
+    /// keeps the stream positioned for you, skipping whatever a flow file left
+    /// unread. `parse_next` is the primitive underneath them — reach for it
+    /// when you need the reader back between flow files, or are driving the
+    /// stream yourself.
     ///
     /// # Errors
     ///
@@ -403,8 +407,12 @@ impl FlowFile<Vec<u8>> {
 ///
 /// Yields each flow file with its content buffered in memory, and ends on a
 /// clean end of input. After an error the iterator is fused (keeps returning
-/// `None`), since the stream position is no longer trustworthy. To stream
-/// contents instead of buffering them, use [`FlowFile::parse_next`] directly.
+/// `None`), since the stream position is no longer trustworthy.
+///
+/// Buffering is the trade: it is what lets this be an ordinary [`Iterator`]
+/// yielding owned flow files. When a content is too large for that, use
+/// [`FlowFilesReader`], which streams instead and is just as safe; see its
+/// docs for the three-way choice between them and [`FlowFile::parse_next`].
 ///
 /// Because this buffers, it reports a content that ends before its declared
 /// size as [`Error::SizeMismatch`] directly, the way
@@ -507,6 +515,220 @@ impl<R: Read> Iterator for FlowFiles<R> {
 }
 
 impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
+
+/// Reads a stream of concatenated flow files *without* buffering their
+/// content, keeping the stream positioned for you.
+///
+/// The streaming counterpart to [`FlowFiles`], and the one to reach for when a
+/// flow file's content is too big to hold in memory. Where `FlowFiles` reads
+/// each content into a `Vec` and hands you an owned flow file, this hands you
+/// one whose content is the stream itself — so it is read as you read it, and
+/// never twice.
+///
+/// That laziness is what makes [`FlowFile::parse_next`] sharp to use directly:
+/// there, a flow file dropped with its content unread leaves the stream inside
+/// that content, and the next parse reads it as though it were a flow file.
+/// Here it does not matter. Each call picks up whatever the last flow file left
+/// behind and skips it, so reading none of the content, some of it, or all of
+/// it are equally correct:
+///
+/// ```
+/// use nififf3::{FlowFile, FlowFilesReader};
+///
+/// let mut bytes = FlowFile::builder().attribute("n", "1").content(&b"aaaa"[..]).to_bytes();
+/// bytes.extend(FlowFile::builder().attribute("n", "2").content(&b"bbbb"[..]).to_bytes());
+///
+/// // Only the attributes are wanted; the content is simply not read.
+/// let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+/// let mut names = Vec::new();
+/// while let Some(flow_file) = flow_files.next()? {
+///     names.push(flow_file.attribute("n").unwrap().to_string());
+/// }
+///
+/// assert_eq!(names, ["1", "2"]);
+/// # Ok::<(), nififf3::Error>(())
+/// ```
+///
+/// # Choosing between the three
+///
+/// | | content | use when |
+/// | --- | --- | --- |
+/// | [`FlowFiles`] | read into memory for you | the contents fit, and an owned `FlowFile<Vec<u8>>` per flow file is what you want |
+/// | `FlowFilesReader` | streamed, positioned for you | a content may be too large to buffer |
+/// | [`FlowFile::parse_next`] | streamed, positioned by you | you need the reader back between flow files, or are driving the stream yourself |
+///
+/// Only `FlowFiles` implements [`Iterator`]: the flow files this yields borrow
+/// the stream they came from, which no `Iterator` can express. In a `while let`
+/// loop that costs nothing, and it is what stops one being held past the next
+/// call — that is a compile error, not a corrupt read.
+///
+/// After an error, `next` keeps returning `None`, as [`FlowFiles`] does: the
+/// position in the stream is no longer trustworthy.
+#[derive(Debug)]
+pub struct FlowFilesReader<R> {
+    reader: R,
+    limits: Limits,
+    /// Declared content size of the flow file last handed out.
+    size: u64,
+    /// How much of that content has not been read. Maintained by [`StreamedContent`]
+    /// as it is read, rather than on drop, so that a content which is leaked
+    /// rather than dropped leaves the count correct.
+    unread: u64,
+    done: bool,
+}
+
+/// The content of a flow file from a [`FlowFilesReader`]: the stream itself,
+/// limited to this flow file's content.
+///
+/// Reading it is optional. Whatever is left goes when the next flow file is
+/// asked for.
+#[derive(Debug)]
+pub struct StreamedContent<'a, R> {
+    inner: io::Take<&'a mut R>,
+    unread: &'a mut u64,
+}
+
+impl<R: Read> Read for StreamedContent<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        *self.unread = self.unread.saturating_sub(read as u64);
+        Ok(read)
+    }
+}
+
+impl<R: Read> FlowFilesReader<R> {
+    /// Read flow files from `reader`, without header limits.
+    ///
+    /// The header parsing reads in small increments, so wrap unbuffered
+    /// sources (files, sockets) in a [`std::io::BufReader`].
+    pub fn new(reader: R) -> Self {
+        Self::with_limits(reader, Limits::UNLIMITED)
+    }
+
+    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
+    /// Use this for untrusted input.
+    pub fn with_limits(reader: R, limits: Limits) -> Self {
+        Self {
+            reader,
+            limits,
+            size: 0,
+            unread: 0,
+            done: false,
+        }
+    }
+
+    /// The next flow file, or `None` at the end of the stream.
+    ///
+    /// Anything left unread of the previous flow file's content is skipped
+    /// first, so the caller is never responsible for the stream's position.
+    ///
+    /// Returns `Result<Option<_>>` rather than the `Option<Result<_>>` an
+    /// [`Iterator`] would, matching [`FlowFile::parse_next`] — which this
+    /// replaces — so that `while let Some(flow_file) = reader.next()?` reads
+    /// with one `?` and no inner match.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::parse_next`], plus [`Error::SizeMismatch`] if the stream
+    /// ends part-way through content this call had to skip.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "`Iterator` cannot yield an item borrowing the iterator, which \
+                  is the whole point here; `next` is what a lending iterator's \
+                  method is called, it is what the async twin already calls it, \
+                  and `while let Some(..) = reader.next()?` does work — unlike \
+                  `Fragments::next_part`, which was renamed because it did not"
+    )]
+    pub fn next(&mut self) -> Result<Option<FlowFile<StreamedContent<'_, R>>>> {
+        if self.done {
+            return Ok(None);
+        }
+        if let Err(err) = self.discard_unread() {
+            self.done = true;
+            return Err(err);
+        }
+
+        let mut first = [0u8; 1];
+        loop {
+            match self.reader.read(&mut first) {
+                // As in `parse_next`: a one-byte buffer, so this is the end.
+                Ok(0) => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {} // retry
+                Err(e) => {
+                    self.done = true;
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let (attributes, size) =
+            match parse_header(&mut self.reader, Some(first[0]), self.limits) {
+                Ok(header) => header,
+                Err(err) => {
+                    self.done = true;
+                    return Err(err);
+                }
+            };
+
+        self.size = size;
+        self.unread = size;
+        // Disjoint borrows of two fields, which is what lets the content carry
+        // both the stream and the counter that tracks it.
+        let Self {
+            reader, unread, ..
+        } = self;
+        Ok(Some(FlowFile::from_raw_parts(
+            size,
+            attributes,
+            StreamedContent {
+                inner: reader.take(size),
+                unread,
+            },
+        )))
+    }
+
+    /// Read past whatever of the last flow file's content was left.
+    fn discard_unread(&mut self) -> Result<()> {
+        if self.unread == 0 {
+            return Ok(());
+        }
+        let skipped = io::copy(&mut (&mut self.reader).take(self.unread), &mut io::sink())?;
+        let unread = std::mem::replace(&mut self.unread, 0);
+        if skipped != unread {
+            // Report against the whole content, not the part being skipped:
+            // what the header declared is what did not arrive.
+            return Err(Error::SizeMismatch {
+                expected: self.size,
+                actual: self.size - unread + skipped,
+            });
+        }
+        Ok(())
+    }
+
+    /// A reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// A mutable reference to the underlying reader.
+    ///
+    /// Note that the stream may be positioned part-way through a flow file's
+    /// content — whatever the last one handed out did not read. [`next`](Self::next)
+    /// accounts for that; anything reading around it does not.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the reader, returning the underlying one. See
+    /// [`get_mut`](Self::get_mut) for where it is positioned.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
 
 /// Writes a stream of concatenated flow files, the counterpart to
 /// [`FlowFiles`].
@@ -837,6 +1059,109 @@ mod tests {
             flow_file.skip_content().unwrap();
         }
         assert_eq!(seen, ["envelope", "second"]);
+    }
+
+    /// The whole point: reading none, some or all of a content must leave the
+    /// stream in the same place — the one the next flow file starts at.
+    #[test]
+    fn the_streaming_reader_positions_the_stream_however_much_is_read() {
+        let mut bytes = FlowFile::builder()
+            .attribute("n", "1")
+            .content(&b"aaaa"[..])
+            .to_bytes();
+        bytes.extend(
+            FlowFile::builder()
+                .attribute("n", "2")
+                .content(&b"bbbb"[..])
+                .to_bytes(),
+        );
+        bytes.extend(
+            FlowFile::builder()
+                .attribute("n", "3")
+                .content(&b"cccc"[..])
+                .to_bytes(),
+        );
+
+        // Read nothing at all.
+        let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(flow_file) = flow_files.next().unwrap() {
+            seen.push(flow_file.attribute("n").unwrap().to_string());
+        }
+        assert_eq!(seen, ["1", "2", "3"]);
+
+        // Read one byte of each, leaving the rest.
+        let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(mut flow_file) = flow_files.next().unwrap() {
+            let mut byte = [0u8; 1];
+            flow_file.content_mut().read_exact(&mut byte).unwrap();
+            seen.push((flow_file.attribute("n").unwrap().to_string(), byte[0]));
+        }
+        assert_eq!(
+            seen,
+            [("1".into(), b'a'), ("2".into(), b'b'), ("3".into(), b'c')] as [(String, u8); 3]
+        );
+
+        // Read all of it.
+        let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(flow_file) = flow_files.next().unwrap() {
+            seen.push(flow_file.into_memory().unwrap().into_content());
+        }
+        assert_eq!(seen, [b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]);
+    }
+
+    /// The envelope that misleads `parse_next` when its content is dropped
+    /// unread is simply not a problem here.
+    #[test]
+    fn the_streaming_reader_is_not_fooled_by_nested_flow_files() {
+        let inner = FlowFile::builder()
+            .attribute("who", "inner")
+            .content(&b"payload"[..])
+            .to_bytes();
+        let mut bytes = FlowFile::builder()
+            .attribute("who", "envelope")
+            .content(inner)
+            .to_bytes();
+        bytes.extend(
+            FlowFile::builder()
+                .attribute("who", "second")
+                .content(Vec::new())
+                .to_bytes(),
+        );
+
+        let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(flow_file) = flow_files.next().unwrap() {
+            seen.push(flow_file.attribute("who").unwrap().to_string());
+        }
+        assert_eq!(seen, ["envelope", "second"]);
+    }
+
+    /// A stream that stops inside content nobody read is still a truncated
+    /// stream, and has to be reported rather than passed over in silence.
+    #[test]
+    fn the_streaming_reader_reports_a_truncated_content_it_skipped() {
+        let mut bytes = FlowFile::builder()
+            .attribute("n", "1")
+            .content(&b"aaaa"[..])
+            .to_bytes();
+        bytes.truncate(bytes.len() - 2);
+
+        let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+        assert!(flow_files.next().unwrap().is_some(), "the header is intact");
+        assert!(
+            matches!(
+                flow_files.next(),
+                Err(Error::SizeMismatch {
+                    expected: 4,
+                    actual: 2
+                })
+            ),
+            "the skip must notice the content ran out"
+        );
+        assert!(flow_files.next().unwrap().is_none(), "fused after the error");
     }
 
     #[test]

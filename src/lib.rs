@@ -32,10 +32,12 @@ pub use fragments::FragmentKeys;
 #[cfg(feature = "uuid")]
 pub use fragments::Fragments;
 pub use limits::Limits;
-pub use sync::{FlowFiles, FlowFilesWriter};
+pub use sync::{FlowFiles, FlowFilesReader, FlowFilesWriter, StreamedContent};
 
 #[cfg(feature = "tokio")]
-pub use async_io::{FlowFilesAsync, FlowFilesWriterAsync};
+pub use async_io::{
+    FlowFilesAsync, FlowFilesReaderAsync, FlowFilesWriterAsync, StreamedContentAsync,
+};
 
 /// The [`Stream`] trait
 /// [`FlowFilesAsync::into_stream`] returns, re-exported so that naming the
@@ -76,11 +78,11 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 ///
 /// | | in memory | from a reader | many, concatenated |
 /// | --- | --- | --- | --- |
-/// | **parse** | [`from_bytes`] | [`parse`] | [`FlowFiles`], or [`parse_next`] |
+/// | **parse** | [`from_bytes`] | [`parse`] | [`FlowFiles`] buffers, [`FlowFilesReader`] streams, [`parse_next`] is the primitive |
 /// | **serialize** | [`to_bytes`] | [`write_to`] | [`FlowFilesWriter`] |
 #[cfg_attr(
     feature = "tokio",
-    doc = "| **parse, async** | — | [`parse_async`] | [`FlowFilesAsync`], or [`parse_next_async`] |"
+    doc = "| **parse, async** | — | [`parse_async`] | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
 )]
 #[cfg_attr(
     feature = "tokio",

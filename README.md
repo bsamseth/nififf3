@@ -67,24 +67,52 @@ while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
 assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
 ```
 
-That last point is the one thing to get right about `parse_next`. The flow file
-it returns has not read a byte of content: the content *is* the reader, sitting
-at the first content byte, and the next flow file begins where it ends. So each
-one must be consumed before the next is parsed — `into_memory` to buffer it,
-`write_to` to copy it out, or `skip_content` to throw it away when only the
-attributes were wanted.
+### Reading a stream: which of the three
 
-Holding a flow file past the next call is a compile error, since it borrows the
-reader. *Dropping* one with its content unread is not, and that is the mistake
-to watch for: the reader is left inside that content, so the next call parses
-the content as if it were a flow file. Usually that errors. When the content
-happens to start with a valid header — an envelope carrying another flow file —
-it does not, and you get a record that was never sent, followed by anything from
-a clean stream to the loss of everything after it.
+`parse_next` is the primitive, and it hands you the stream itself: the flow file
+it returns has not read a byte of content, the content *is* the reader, and the
+next flow file begins where that content ends. So every content must be
+consumed before the next flow file is parsed — `into_memory` to buffer it,
+`write_to` to copy it out, `skip_content` to discard it. Two types do that
+bookkeeping for you, and one of them is usually what you want:
 
-`FlowFiles` has none of this to think about, because it reads each content into
-memory as it goes. Reach for `parse_next` when that is the part you cannot
-afford.
+| | content | use when |
+| --- | --- | --- |
+| `FlowFiles` | read into memory for you | the contents fit, and an owned `FlowFile<Vec<u8>>` each is what you want |
+| `FlowFilesReader` | streamed, positioned for you | a content may be too large to buffer |
+| `FlowFile::parse_next` | streamed, positioned by you | you need the reader back between flow files, or are driving the stream yourself |
+
+With `FlowFilesReader`, reading none of a content, some of it, or all of it are
+equally correct — the next call skips whatever is left:
+
+```rust
+use nififf3::{FlowFile, FlowFilesReader};
+
+let mut bytes = FlowFile::builder().attribute("n", "1").content(&b"aaaa"[..]).to_bytes();
+bytes.extend(FlowFile::builder().attribute("n", "2").content(&b"bbbb"[..]).to_bytes());
+
+// Only the attributes are wanted, so the content is simply not read.
+let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+let mut names = Vec::new();
+while let Some(flow_file) = flow_files.next()? {
+    names.push(flow_file.attribute("n").unwrap().to_string());
+}
+assert_eq!(names, ["1", "2"]);
+# Ok::<(), nififf3::Error>(())
+```
+
+Only `FlowFiles` is an `Iterator`: the flow files the other two yield borrow the
+stream they came from, which no `Iterator` can express. That borrow is also what
+makes holding one past the next call a compile error rather than a corrupt read.
+
+If you do use `parse_next` directly, the mistake to watch for is *dropping* a
+flow file with its content unread. The reader is then left inside that content,
+and the next call parses the content as if it were a flow file. Usually that
+errors. When the content starts with a valid header — an envelope carrying
+another flow file — it does not, and you get a record that was never sent,
+followed by anything from a clean stream to the loss of everything after it.
+Both async twins, `FlowFilesAsync` and `FlowFilesReaderAsync`, work the same
+way.
 
 ### Untrusted input
 

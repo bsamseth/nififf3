@@ -146,6 +146,10 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// [`FlowFile::parse_next`] for what dropping one unread does to the
     /// stream, which is the same here.
     ///
+    /// [`FlowFilesReaderAsync`] does that
+    /// bookkeeping for you and is usually the better choice; this is the
+    /// primitive underneath it.
+    ///
     /// ```
     /// use nififf3::FlowFile;
     ///
@@ -214,6 +218,10 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
 /// As with [`FlowFiles`](crate::FlowFiles), a content that ends before its
 /// declared size is reported as [`Error::SizeMismatch`] directly, not wrapped
 /// in [`Error::Io`].
+///
+/// Each content is buffered in memory. For contents too large for that, use
+/// [`FlowFilesReaderAsync`], which streams them and keeps the stream
+/// positioned for you.
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesAsync};
@@ -389,6 +397,187 @@ where
         pending: None,
         step,
         _item: std::marker::PhantomData,
+    }
+}
+
+/// Async equivalent of [`FlowFilesReader`](crate::FlowFilesReader): reads
+/// concatenated flow files without buffering their content, keeping the stream
+/// positioned for you.
+///
+/// The streaming counterpart to [`FlowFilesAsync`], which reads each content
+/// into memory instead. See
+/// [`FlowFilesReader`](crate::FlowFilesReader) for when to choose which, and
+/// why this is the safe way to stream: reading none of a flow file's content,
+/// some of it, or all of it are equally correct, because the next call skips
+/// whatever was left.
+///
+/// ```
+/// use nififf3::{FlowFile, FlowFilesReaderAsync};
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let mut bytes = FlowFile::builder().attribute("n", "1").content(&b"aaaa"[..]).to_bytes();
+/// bytes.extend(FlowFile::builder().attribute("n", "2").content(&b"bbbb"[..]).to_bytes());
+///
+/// // Only the attributes are wanted; the content is simply not read.
+/// let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
+/// let mut names = Vec::new();
+/// while let Some(flow_file) = flow_files.next().await.unwrap() {
+///     names.push(flow_file.attribute("n").unwrap().to_string());
+/// }
+///
+/// assert_eq!(names, ["1", "2"]);
+/// # });
+/// ```
+#[derive(Debug)]
+pub struct FlowFilesReaderAsync<R> {
+    reader: R,
+    limits: Limits,
+    size: u64,
+    unread: u64,
+    done: bool,
+}
+
+/// The content of a flow file from a [`FlowFilesReaderAsync`]: the stream
+/// itself, limited to this flow file's content.
+///
+/// Reading it is optional. Whatever is left goes when the next flow file is
+/// asked for.
+#[derive(Debug)]
+pub struct StreamedContentAsync<'a, R> {
+    inner: tokio::io::Take<&'a mut R>,
+    unread: &'a mut u64,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for StreamedContentAsync<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        // Delegate the `ReadBuf` handling to `Take`, then measure what it
+        // filled — the crate forbids the unsafe that doing it by hand needs.
+        let before = buf.filled().len();
+        std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        let read = buf.filled().len() - before;
+        *this.unread = this.unread.saturating_sub(read as u64);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
+    /// Read flow files from `reader`, without header limits.
+    ///
+    /// The header parsing reads in small increments, so wrap unbuffered
+    /// sources in a [`tokio::io::BufReader`].
+    pub fn new(reader: R) -> Self {
+        Self::with_limits(reader, Limits::UNLIMITED)
+    }
+
+    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
+    /// Use this for untrusted input.
+    pub fn with_limits(reader: R, limits: Limits) -> Self {
+        Self {
+            reader,
+            limits,
+            size: 0,
+            unread: 0,
+            done: false,
+        }
+    }
+
+    /// The next flow file, or `None` at the end of the stream.
+    ///
+    /// Anything left unread of the previous flow file's content is skipped
+    /// first, so the caller is never responsible for the stream's position.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFilesReader::next`](crate::FlowFilesReader::next).
+    pub async fn next(&mut self) -> Result<Option<FlowFile<StreamedContentAsync<'_, R>>>> {
+        if self.done {
+            return Ok(None);
+        }
+        if let Err(err) = self.discard_unread().await {
+            self.done = true;
+            return Err(err);
+        }
+
+        let mut first = [0u8; 1];
+        loop {
+            match self.reader.read(&mut first).await {
+                Ok(0) => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} // retry
+                Err(e) => {
+                    self.done = true;
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let (attributes, size) =
+            match parse_header(&mut self.reader, Some(first[0]), self.limits).await {
+                Ok(header) => header,
+                Err(err) => {
+                    self.done = true;
+                    return Err(err);
+                }
+            };
+
+        self.size = size;
+        self.unread = size;
+        let Self {
+            reader, unread, ..
+        } = self;
+        Ok(Some(FlowFile::from_raw_parts(
+            size,
+            attributes,
+            StreamedContentAsync {
+                inner: reader.take(size),
+                unread,
+            },
+        )))
+    }
+
+    /// Read past whatever of the last flow file's content was left.
+    async fn discard_unread(&mut self) -> Result<()> {
+        if self.unread == 0 {
+            return Ok(());
+        }
+        let skipped = tokio::io::copy(
+            &mut (&mut self.reader).take(self.unread),
+            &mut tokio::io::sink(),
+        )
+        .await?;
+        let unread = std::mem::replace(&mut self.unread, 0);
+        if skipped != unread {
+            return Err(Error::SizeMismatch {
+                expected: self.size,
+                actual: self.size - unread + skipped,
+            });
+        }
+        Ok(())
+    }
+
+    /// A reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// A mutable reference to the underlying reader. As
+    /// [`FlowFilesReader::get_mut`](crate::FlowFilesReader::get_mut), the
+    /// stream may sit part-way through a content.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the reader, returning the underlying one.
+    pub fn into_inner(self) -> R {
+        self.reader
     }
 }
 
@@ -723,6 +912,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trailer, b"and then something else");
+    }
+
+    /// As the sync twin: none, some or all of a content read must all leave
+    /// the stream where the next flow file starts.
+    #[tokio::test]
+    async fn the_async_streaming_reader_positions_the_stream_however_much_is_read() {
+        let mut bytes = FlowFile::builder()
+            .attribute("n", "1")
+            .content(&b"aaaa"[..])
+            .to_bytes();
+        bytes.extend(
+            FlowFile::builder()
+                .attribute("n", "2")
+                .content(&b"bbbb"[..])
+                .to_bytes(),
+        );
+
+        // Nothing read.
+        let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(flow_file) = flow_files.next().await.unwrap() {
+            seen.push(flow_file.attribute("n").unwrap().to_string());
+        }
+        assert_eq!(seen, ["1", "2"]);
+
+        // One byte of each read, the rest left.
+        let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(mut flow_file) = flow_files.next().await.unwrap() {
+            let mut byte = [0u8; 1];
+            flow_file.content_mut().read_exact(&mut byte).await.unwrap();
+            seen.push(byte[0]);
+        }
+        assert_eq!(seen, [b'a', b'b']);
+
+        // All of it.
+        let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
+        let mut seen = Vec::new();
+        while let Some(flow_file) = flow_files.next().await.unwrap() {
+            seen.push(flow_file.into_memory_async().await.unwrap().into_content());
+        }
+        assert_eq!(seen, [b"aaaa".to_vec(), b"bbbb".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn the_async_streaming_reader_reports_a_truncated_content_it_skipped() {
+        let mut bytes = sample().to_bytes();
+        bytes.truncate(bytes.len() - 2);
+
+        let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
+        assert!(flow_files.next().await.unwrap().is_some());
+        assert!(matches!(
+            flow_files.next().await,
+            Err(Error::SizeMismatch {
+                expected: 5,
+                actual: 3
+            })
+        ));
+        assert!(flow_files.next().await.unwrap().is_none(), "fused");
     }
 
     #[tokio::test]
