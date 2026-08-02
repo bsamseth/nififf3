@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.3.2
+
+Streaming reads that keep the stream positioned for you, and the documentation
+to steer people to the right one of the three ways to read.
+
+### Added
+
+- `FlowFilesReader` and `FlowFilesReaderAsync`, with the `StreamedContent` and
+  `StreamedContentAsync` their flow files carry: read a stream without
+  buffering the content, and without making the caller responsible for the
+  stream's position. `FlowFile::parse_next` requires every content to be
+  consumed before the next flow file is parsed, and misparses silently when one
+  is dropped unread — these skip whatever is left, so reading none of a
+  content, some of it, or all of it are equally correct.
+- `FlowFile::skip_content` and `skip_content_async`, the third option beside
+  `into_memory` and `write_to` for code using `parse_next` directly: what to
+  call when only the attributes were wanted.
+
+### Documentation
+
+- The three ways to read a stream — `FlowFiles` (buffers), `FlowFilesReader`
+  (streams, positions for you) and `parse_next` (streams, you position it) —
+  are compared side by side from the README and from each of the three, so
+  whichever one you land on points at the other two.
+- `parse_next` spells out what dropping a content unread does, including the
+  case where the content begins with a valid header and the result is a flow
+  file that was never sent rather than an error.
+- "Creating flow files" is split into subsections and its comparisons turned
+  into tables, and the error model moves out into a section of its own — it
+  describes how the whole crate reports failure, not how to build a flow file.
+
+## 0.3.1
+
+### Fixed
+
+- `nififf3 create` applied `--max-content-len` *after* reading all of stdin
+  into memory, which is the opposite of a guard. It now stops one byte past the
+  limit, and settles the attribute limits before reading anything.
+- The response body's length check could in principle underflow, since it
+  subtracted a running total covering the header from a size that does not.
+  Not reachable — the header always drains — but nothing at the subtraction
+  said so.
+
+### Added
+
+- `Limits::recommended` is `const`, matching `Limits::UNLIMITED`.
+- Generative tests over the parser: arbitrary and damaged flow files must be
+  rejected rather than panic, anything serialized must parse back identically,
+  and both sides of the `0xFFFF` field-length boundary must round-trip.
+
+### Documentation
+
+- Where each limit is enforced, not just that it is. Every path now refuses
+  oversized content before buffering it except `from-json`, where serde has
+  decoded it by the time there is a flow file to judge; that difference is
+  written down rather than left to be discovered.
+
 ## 0.3.0
 
 A review pass over the whole crate. Several breaking changes, all small at the
@@ -34,15 +91,6 @@ call site; the bug fixes are the reason to upgrade.
   carrying several concatenated flow files, which is what NiFi's `PostHTTP`
   sends. `FlowFileBody` is constructible now too, for driving the parse
   yourself.
-- `FlowFilesReader` and `FlowFilesReaderAsync`: read a stream of flow files
-  without buffering their content, and without leaving the caller responsible
-  for the stream's position. Where `parse_next` requires each content to be
-  consumed before the next flow file is parsed — and silently misparses if one
-  is dropped unread — these skip whatever is left, so reading none, some or all
-  of a content are equally correct.
-- `FlowFile::skip_content` and `skip_content_async`, for walking a stream when
-  only the attributes are wanted — `parse_next` requires each content to be
-  consumed, and this is how to consume one you do not want.
 - `FlowFile::attribute`, `from_parts`, `from_vec`, `map_bytes`,
   `map_content_sized`, `write_bytes_to`, and `PartialEq`/`Eq`.
 - `FlowFiles`/`FlowFilesAsync` gained `get_ref`, `get_mut` and `into_inner`;
