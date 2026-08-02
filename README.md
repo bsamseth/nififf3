@@ -60,10 +60,31 @@ bytes.extend(FlowFile::builder().content(&b"second"[..]).to_bytes());
 let mut reader = bytes.as_slice();
 let mut contents = Vec::new();
 while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
+    // Each flow file's content *is* the reader, so it has to be dealt with
+    // before the next one is parsed — here by reading it.
     contents.push(flow_file.into_memory().unwrap().into_content());
 }
 assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
 ```
+
+That last point is the one thing to get right about `parse_next`. The flow file
+it returns has not read a byte of content: the content *is* the reader, sitting
+at the first content byte, and the next flow file begins where it ends. So each
+one must be consumed before the next is parsed — `into_memory` to buffer it,
+`write_to` to copy it out, or `skip_content` to throw it away when only the
+attributes were wanted.
+
+Holding a flow file past the next call is a compile error, since it borrows the
+reader. *Dropping* one with its content unread is not, and that is the mistake
+to watch for: the reader is left inside that content, so the next call parses
+the content as if it were a flow file. Usually that errors. When the content
+happens to start with a valid header — an envelope carrying another flow file —
+it does not, and you get a record that was never sent, followed by anything from
+a clean stream to the loss of everything after it.
+
+`FlowFiles` has none of this to think about, because it reads each content into
+memory as it goes. Reach for `parse_next` when that is the part you cannot
+afford.
 
 ### Untrusted input
 

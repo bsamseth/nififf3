@@ -137,9 +137,14 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// Async version of [`FlowFile::parse_next`]: parse the next flow file
     /// from a stream of concatenated flow files.
     ///
-    /// Returns `Ok(None)` on a clean end of input. The previous flow file's
-    /// content must be fully consumed before calling this again, otherwise
-    /// parsing resumes in the middle of that content.
+    /// Returns `Ok(None)` on a clean end of input.
+    ///
+    /// Every flow file's content must be consumed before the next is parsed —
+    /// with [`into_memory_async`](FlowFile::into_memory_async),
+    /// [`write_to_async`](FlowFile::write_to_async) or
+    /// [`skip_content_async`](FlowFile::skip_content_async). See
+    /// [`FlowFile::parse_next`] for what dropping one unread does to the
+    /// stream, which is the same here.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -605,6 +610,24 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
             return Err(crate::error::truncated(self.size, copied));
         }
         Ok(copied)
+    }
+
+    /// Async version of [`FlowFile::skip_content`]: discards the content,
+    /// consuming exactly [`size`](FlowFile::size) bytes from the reader.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::skip_content`].
+    pub async fn skip_content_async(mut self) -> std::io::Result<u64> {
+        let skipped = tokio::io::copy(
+            &mut (&mut self.content).take(self.size),
+            &mut tokio::io::sink(),
+        )
+        .await?;
+        if skipped != self.size {
+            return Err(crate::error::truncated(self.size, skipped));
+        }
+        Ok(skipped)
     }
 
     /// Async version of [`FlowFile::into_memory`]: reads the content to

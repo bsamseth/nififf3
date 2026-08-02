@@ -34,6 +34,9 @@ call site; the bug fixes are the reason to upgrade.
   carrying several concatenated flow files, which is what NiFi's `PostHTTP`
   sends. `FlowFileBody` is constructible now too, for driving the parse
   yourself.
+- `FlowFile::skip_content` and `skip_content_async`, for walking a stream when
+  only the attributes are wanted — `parse_next` requires each content to be
+  consumed, and this is how to consume one you do not want.
 - `FlowFile::attribute`, `from_parts`, `from_vec`, `map_bytes`,
   `map_content_sized`, `write_bytes_to`, and `PartialEq`/`Eq`.
 - `FlowFiles`/`FlowFilesAsync` gained `get_ref`, `get_mut` and `into_inner`;

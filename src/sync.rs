@@ -140,9 +140,7 @@ impl<R: Read> FlowFile<io::Take<R>> {
 impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// Parse the next flow file from a stream of concatenated flow files.
     ///
-    /// Returns `Ok(None)` on a clean end of input. The previous flow file's
-    /// content must be fully consumed before calling this again, otherwise
-    /// parsing resumes in the middle of that content.
+    /// Returns `Ok(None)` on a clean end of input.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -158,6 +156,56 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// }
     /// assert_eq!(count, 2);
     /// ```
+    ///
+    /// # Every flow file's content must be consumed
+    ///
+    /// The returned flow file's content *is* the reader, positioned at the
+    /// first content byte. Nothing else can read the stream until that content
+    /// is dealt with, and the next flow file begins where it ends — so each one
+    /// has to be consumed before the next is parsed:
+    ///
+    /// - [`into_memory`](FlowFile::into_memory) reads it into a buffer;
+    /// - [`write_to`](FlowFile::write_to) copies it straight out;
+    /// - [`skip_content`](FlowFile::skip_content) throws it away, which is what
+    ///   to call when only the attributes were wanted.
+    ///
+    /// Holding a flow file past the next call is a compile error — it borrows
+    /// the reader — but *dropping* one with its content unread is not, and that
+    /// is the mistake to watch for. The reader is then left where the content
+    /// starts, so the next call parses the content as though it were a flow
+    /// file. Usually that is an error. It is worse when it is not: a flow file
+    /// whose content begins with a valid header — an envelope carrying another
+    /// flow file, say — yields something plausible that was never sent. What
+    /// happens after that depends on the rest of the content, so the damage
+    /// ranges from one phantom record in a stream that otherwise reads fine to
+    /// losing everything that followed.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// // An envelope: one flow file whose content is another, then a second
+    /// // ordinary flow file after it.
+    /// let inner = FlowFile::builder().attribute("who", "inner").content(&b"payload"[..]).to_bytes();
+    /// let mut bytes = FlowFile::builder().attribute("who", "envelope").content(inner).to_bytes();
+    /// bytes.extend(FlowFile::builder().attribute("who", "second").content(Vec::new()).to_bytes());
+    ///
+    /// let mut reader = bytes.as_slice();
+    /// let mut seen = Vec::new();
+    /// while let Some(flow_file) = FlowFile::parse_next(&mut reader)? {
+    ///     seen.push(flow_file.attribute("who").unwrap().to_string());
+    ///     flow_file.skip_content()?;
+    /// }
+    /// assert_eq!(seen, ["envelope", "second"]);
+    ///
+    /// // Without that `skip_content`, the second read starts inside the
+    /// // envelope's content and finds the flow file nested in it — while the
+    /// // one that really came next is never reached.
+    /// # Ok::<(), nififf3::Error>(())
+    /// ```
+    ///
+    /// [`FlowFiles`] sidesteps all of this by reading each content into memory
+    /// as it goes; reach for `parse_next` when that is the part you cannot
+    /// afford.
     ///
     /// # Errors
     ///
@@ -240,6 +288,46 @@ impl<R: Read> FlowFile<R> {
             return Err(crate::error::truncated(self.size, copied));
         }
         Ok(copied)
+    }
+
+    /// Discard the content, consuming exactly [`size`] bytes from the reader.
+    ///
+    /// What to call when only the attributes were wanted. For a flow file
+    /// parsed out of a stream by [`parse_next`](FlowFile::parse_next), leaving
+    /// the content unread is not free: the reader stays where the content
+    /// begins, and the next parse starts from there. See that method for what
+    /// goes wrong.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let mut bytes = FlowFile::builder().attribute("n", "1").content(&b"aaa"[..]).to_bytes();
+    /// bytes.extend(FlowFile::builder().attribute("n", "2").content(&b"bbb"[..]).to_bytes());
+    ///
+    /// let mut reader = bytes.as_slice();
+    /// let mut names = Vec::new();
+    /// while let Some(flow_file) = FlowFile::parse_next(&mut reader)? {
+    ///     names.push(flow_file.attribute("n").unwrap().to_string());
+    ///     flow_file.skip_content()?; // the content was not wanted, but must go
+    /// }
+    ///
+    /// assert_eq!(names, ["1", "2"]);
+    /// # Ok::<(), nififf3::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Only I/O. Content that ends before [`size`] is
+    /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
+    /// [`Error::SizeMismatch`], as [`into_memory`](Self::into_memory).
+    ///
+    /// [`size`]: FlowFile::size
+    pub fn skip_content(mut self) -> io::Result<u64> {
+        let skipped = io::copy(&mut (&mut self.content).take(self.size), &mut io::sink())?;
+        if skipped != self.size {
+            return Err(crate::error::truncated(self.size, skipped));
+        }
+        Ok(skipped)
     }
 
     /// Read the content to completion, producing an in-memory flow file.
@@ -689,6 +777,66 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    /// The attributes-only loop, which is the case that has no reason to read
+    /// the content and so the one most likely to forget.
+    #[test]
+    fn skip_content_walks_a_stream_without_reading_it() {
+        let mut bytes = sample_bytes();
+        bytes.extend_from_slice(&sample_bytes());
+
+        let mut reader = bytes.as_slice();
+        let mut count = 0;
+        while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
+            assert_eq!(flow_file.attribute("path"), Some("x"));
+            assert_eq!(flow_file.skip_content().unwrap(), 5);
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    /// The documented hazard, pinned: a flow file dropped with its content
+    /// unread leaves the reader inside that content, and an envelope — a flow
+    /// file carrying another — turns that into a plausible wrong answer rather
+    /// than an error. If this ever stops being true, the warning on
+    /// `parse_next` needs to change with it.
+    #[test]
+    fn dropping_content_unread_reparses_the_content_itself() {
+        let inner = FlowFile::builder()
+            .attribute("who", "inner")
+            .content(&b"payload"[..])
+            .to_bytes();
+        let mut bytes = FlowFile::builder()
+            .attribute("who", "envelope")
+            .content(inner)
+            .to_bytes();
+        bytes.extend(
+            FlowFile::builder()
+                .attribute("who", "second")
+                .content(Vec::new())
+                .to_bytes(),
+        );
+
+        let mut reader = bytes.as_slice();
+        let mut seen = Vec::new();
+        while let Ok(Some(flow_file)) = FlowFile::parse_next(&mut reader) {
+            seen.push(flow_file.attribute("who").unwrap().to_string());
+            // Deliberately no `skip_content`.
+        }
+        // The nested flow file surfaces as though it had been sent; parsing
+        // then lands inside *its* content, fails, and the flow file that
+        // really came second is never reached.
+        assert_eq!(seen, ["envelope", "inner"]);
+
+        // Skipping instead walks the stream that was actually sent.
+        let mut reader = bytes.as_slice();
+        let mut seen = Vec::new();
+        while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
+            seen.push(flow_file.attribute("who").unwrap().to_string());
+            flow_file.skip_content().unwrap();
+        }
+        assert_eq!(seen, ["envelope", "second"]);
     }
 
     #[test]
