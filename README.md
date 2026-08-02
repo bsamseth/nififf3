@@ -164,11 +164,20 @@ assert_eq!(flow_file.size(), 3);
 let bytes = flow_file.to_bytes();
 ```
 
-The binary format stores the content size *before* the content, so
-serializing from a reader requires the size up front
-(`builder().reader(read, size)`). For readers of unknown length, the builder
-can spool the content to learn its size — into memory, or (behind the
-`tempfile` feature) into an anonymous temporary file that is deleted on drop:
+### Content of unknown length
+
+The binary format stores the content size *before* the content, so nothing can
+be written until the length is known. `reader` takes your word for it; the
+others work it out by spooling the content first, and differ only in where they
+put it while they do:
+
+| finisher | content ends up | needs |
+| --- | --- | --- |
+| `content(bytes)` | in memory, size inferred | — |
+| `reader(read, size)` | left where it is — `size` is your claim | — |
+| `buffered(read)` | in memory | — |
+| `tempfile(read)` | an anonymous temp file, deleted on drop | `tempfile` |
+| `spooled(read, max)` | memory up to `max` bytes, a temp file past it | `tempfile` |
 
 ```rust
 use nififf3::FlowFile;
@@ -182,63 +191,108 @@ assert_eq!(flow_file.size(), 28);
 ```
 
 ```rust,ignore
-// Requires the `tempfile` feature. Content is spooled to disk, not memory.
+// Behind the `tempfile` feature: spooled to disk rather than memory.
 let flow_file = FlowFile::builder().tempfile(reader)?;
-let flow_file = FlowFile::builder().tempfile_async(reader).await?; // + `tokio`
 
-// Or the middle ground: in memory up to `max_memory`, on disk past it.
+// Or the middle ground — in memory up to `max_memory`, on disk past it.
 let flow_file = FlowFile::builder().spooled(reader, 64 * 1024)?;
+
+// `buffered` and `tempfile` have async twins (`tokio`).
+let flow_file = FlowFile::builder().tempfile_async(reader).await?;
 ```
 
-`into_memory` reads a reader-backed flow file's *content* into memory and
-serializes nothing; `to_bytes`, below, does the opposite — it serializes a whole
-flow file, header included. The pair used to be `into_bytes`/`to_bytes`, one
-character apart and easily mistaken for each other.
+### Serializing
 
-Serialization targets mirror the parsing sources: `to_bytes` for `Vec<u8>`,
-`write_to` for `std::io::Write`, and `write_to_async` for
-`tokio::io::AsyncWrite`. The last two consume the flow file, since they leave
-its content reader exhausted. To write several flow files back-to-back, use
-`FlowFilesWriter` (or `FlowFilesWriterAsync`), the counterpart to the
-`FlowFiles` reader.
+The targets mirror the parsing sources, one per content type:
 
-A write that fails part-way leaves a truncated flow file in the stream, so the
-writers refuse everything after one, the way `FlowFiles` stops reading after an
-error. Appending to a stream that is mid-record would hide the problem rather
-than report it: the next flow file's header would be read back as the
+| method | content | notes |
+| --- | --- | --- |
+| `to_bytes()` | `Vec<u8>` | returns the encoded flow file |
+| `write_bytes_to(w)` | `Vec<u8>` | writes it to a `std::io::Write` |
+| `write_to(w)` | any `Read` | streams; consumes the flow file |
+| `write_to_async(w)` | any `AsyncRead` | streams; consumes the flow file |
+
+The two streaming ones consume the flow file because they leave its content
+reader exhausted — a second call would write a second header and then fail,
+after committing those bytes.
+
+One name to watch: `to_bytes` serializes a *whole flow file*, header included,
+while `into_memory` reads a reader-backed flow file's *content* into memory and
+serializes nothing. They were once `to_bytes` and `into_bytes`, one character
+apart; the rename is why.
+
+### Writing several
+
+`FlowFilesWriter` (and `FlowFilesWriterAsync`) writes flow files back-to-back,
+the counterpart to the `FlowFiles` reader:
+
+```rust
+use nififf3::{FlowFile, FlowFiles, FlowFilesWriter};
+
+let mut writer = FlowFilesWriter::new(Vec::new());
+writer.write_bytes(&FlowFile::builder().content(&b"first"[..]))?;
+writer.write_bytes(&FlowFile::builder().content(&b"second"[..]))?;
+let bytes = writer.finish()?; // flushes, and hands the writer back
+
+assert_eq!(FlowFiles::new(bytes.as_slice()).count(), 2);
+# Ok::<(), std::io::Error>(())
+```
+
+Two things about that stream are worth knowing up front.
+
+**A failed write poisons the writer.** It has left a truncated flow file
+behind, so every later write is refused rather than appended — the way
+`FlowFiles` stops reading after an error. Appending would hide the problem
+instead of reporting it: the next flow file's header would be read back as the
 truncated one's content, yielding a plausible flow file with the wrong bytes.
-`is_poisoned` reports the state; `into_inner` still returns the writer, for
-discarding or truncating what was produced.
+`is_poisoned` reports the state, and `into_inner` still returns the writer so
+what was produced can be discarded or truncated.
 
-Finish a stream with `finish`, which flushes and hands the writer back —
-writing does not flush, and neither does dropping the writer. For an
-`AsyncWrite` that has an ending of its own (a compressor's trailer, a TLS
-`close_notify`, a buffered writer's tail), `FlowFilesWriterAsync::shutdown` is
-what emits it; skipping it truncates the output, and the flow files come back
-corrupt rather than merely short. `into_inner` deliberately does neither, so
-that a half-written stream can be abandoned instead of completed.
+**Nothing finishes the stream on its own.** Writing does not flush, and neither
+does dropping the writer:
 
-Parsing is the only thing that produces this crate's `Error`. Everything that
-just moves bytes — `write_to`, `into_memory`, the writers, and their async
-twins — returns `std::io::Result`, so handling them does not mean matching on
-flow-file failures that cannot occur. In those, content that ends before its
-declared size is `ErrorKind::UnexpectedEof` carrying an `Error::SizeMismatch`,
-which `io::Error::get_ref` and `downcast_ref` recover if the detail is wanted.
-Anything returning this crate's `Error` — `from_bytes`, `FlowFiles`,
-`FlowFilesAsync` — reports that case as `Error::SizeMismatch` directly, and so
-does `?`: converting an `io::Error` into this crate's `Error` recovers a
-truncation rather than burying it under `Error::Io`, so both routes to the same
-condition match the same way. Only a truncation is recovered — any other
-`io::Error` stays `Error::Io`, payload and all.
+| call | flushes | shuts down | returns the writer |
+| --- | --- | --- | --- |
+| `finish()` | yes | no | yes |
+| `flush()` | yes | no | no |
+| `shutdown()` (async) | yes | yes | no |
+| `into_inner()` | no | no | yes |
+
+`shutdown` is the one that matters for an `AsyncWrite` with an ending of its
+own — a compressor's trailer, a TLS `close_notify`, a buffered writer's tail.
+Skip it and the output is truncated, so the flow files come back corrupt rather
+than merely short. `into_inner` deliberately does neither, so a half-written
+stream can be abandoned instead of completed.
+
+### Keeping the size honest
 
 The declared `size()` is what every serializer writes and every reader-based
-operation consumes, and each of the constructors above keeps it in step with
-the content. `map_content` swaps the container while carrying the size across,
-so it is only for transforms that preserve the length. For one that *changes*
-it — decompressing, re-encoding — use `map_bytes`, which derives the new size
-from the content it returns, or `map_content_sized` when the result is a reader
-whose length only you know. `with_size` remains for declaring a size by hand,
-and is the one way left to get this wrong.
+operation consumes, and every constructor above keeps it in step with the
+content. Only the transforms can pull them apart:
+
+```rust
+use nififf3::FlowFile;
+
+let flow_file = FlowFile::builder().content(&b"hi"[..]);
+
+// Same bytes, different container: the size carries across.
+let cursor = flow_file.clone().map_content(std::io::Cursor::new);
+assert_eq!(cursor.size(), 2);
+
+// Different bytes: the new size comes from the content, not from you.
+let repeated = flow_file.map_bytes(|content| content.repeat(3));
+assert_eq!(repeated.size(), 6);
+```
+
+| transform | size | for |
+| --- | --- | --- |
+| `map_content(f)` | carried across | swapping the container, same bytes |
+| `map_bytes(f)` | taken from the result | rewriting in-memory content |
+| `map_content_sized(f)` | returned by `f` | a reader whose length only you know |
+| `with_size(n)` | whatever you say | declaring one by hand |
+
+`with_size` is the only one that can be wrong, which is the whole reason the
+other three exist.
 
 ## Deriving flow files from flow files
 
@@ -364,6 +418,41 @@ assert_eq!(merged.attributes()["filename"], "pair.txt");
 assert!(!merged.attributes().contains_key("fragment.index"));
 # }
 ```
+
+## Errors
+
+Parsing is the only thing that produces this crate's `Error`. Everything that
+just moves bytes — `write_to`, `into_memory`, the writers, and their async
+twins — returns `std::io::Result`, so handling those does not mean matching on
+flow-file failures that cannot occur.
+
+The one condition both worlds share is content that ends before its declared
+size. Each reports it in its own idiom, and converting between them keeps the
+detail rather than burying it:
+
+```rust
+use nififf3::{Error, FlowFile};
+
+let mut truncated = FlowFile::builder().content(&b"hello"[..]).to_bytes();
+truncated.truncate(truncated.len() - 2);
+
+// `into_memory` returns `io::Result`, so it reports an `UnexpectedEof`
+// carrying the detail — and `?` into an `Error` recovers it rather than
+// wrapping it in `Error::Io`.
+fn buffer(bytes: &[u8]) -> Result<FlowFile<Vec<u8>>, Error> {
+    Ok(FlowFile::parse(bytes)?.into_memory()?)
+}
+
+assert!(matches!(
+    buffer(&truncated),
+    Err(Error::SizeMismatch { expected: 5, actual: 3 })
+));
+```
+
+So both routes to the same condition match the same way: `from_bytes`,
+`FlowFiles` and `FlowFilesAsync` return `Error::SizeMismatch` directly, and an
+`io::Error` from the byte-moving half converts into it. Only a truncation is
+recovered that way — any other `io::Error` stays `Error::Io`, payload and all.
 
 ## Async I/O (`tokio` feature)
 
