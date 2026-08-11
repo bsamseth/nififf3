@@ -20,6 +20,27 @@ async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
     }
 }
 
+/// Async twin of [`crate::sync::read_declared`], which is where the reasoning
+/// for the reservation schedule lives.
+async fn read_declared<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: u64,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<u64> {
+    let mut done = 0u64;
+    while done < len {
+        let step = (len - done).min(done.max(crate::sync::RESERVE_AHEAD));
+        let step = usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
+        buf.reserve_exact(step);
+        let read = reader.take(step as u64).read_to_end(buf).await?;
+        if read == 0 {
+            break; // the source ended early
+        }
+        done += read as u64;
+    }
+    Ok(done)
+}
+
 async fn read_string<R: AsyncRead + Unpin>(
     reader: &mut R,
     budget: &mut crate::sync::Budget,
@@ -29,8 +50,8 @@ async fn read_string<R: AsyncRead + Unpin>(
     // Grow the buffer as bytes actually arrive instead of trusting the
     // declared length, so a crafted header cannot force a huge allocation.
     let mut buf = Vec::new();
-    let read = reader.take(len as u64).read_to_end(&mut buf).await?;
-    if read != len {
+    let read = read_declared(reader, len as u64, &mut buf).await?;
+    if read != len as u64 {
         return Err(
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attribute truncated").into(),
         );
@@ -651,10 +672,25 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// Whatever the writer returns — which, since it may have accepted part
     /// of the flow file first, also poisons the writer.
+    ///
+    /// # Panics
+    ///
+    /// As [`FlowFile::to_bytes`]: an attribute the wire format cannot express,
+    /// or a declared size disagreeing with the content.
     pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> std::io::Result<u64> {
         self.guard()?;
-        let bytes = flow_file.to_bytes();
-        let result = self.writer.write_all(&bytes).await;
+        // As the sync twin: header then content, rather than one buffer built
+        // by copying the whole content into it first.
+        assert_eq!(
+            flow_file.size,
+            flow_file.content.len() as u64,
+            "declared size does not match the content; see FlowFile::with_size"
+        );
+        let result = async {
+            self.writer.write_all(&flow_file.header_bytes()).await?;
+            self.writer.write_all(&flow_file.content).await
+        }
+        .await;
         self.poison_on_err(result)?;
         self.count += 1;
         Ok(flow_file.size)
@@ -818,10 +854,7 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// As [`FlowFile::into_memory`].
     pub async fn into_memory_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
-        let read = (&mut self.content)
-            .take(self.size)
-            .read_to_end(&mut content)
-            .await? as u64;
+        let read = read_declared(&mut self.content, self.size, &mut content).await?;
         if read != self.size {
             return Err(crate::error::truncated(self.size, read));
         }

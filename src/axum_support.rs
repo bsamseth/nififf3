@@ -746,11 +746,24 @@ impl FlowFilesResponse {
     ///
     /// assert!(response.headers().contains_key(header::CONTENT_LENGTH));
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// As [`FlowFile::to_bytes`]: an attribute the wire format cannot express,
+    /// or a part whose declared size disagrees with its content.
     #[must_use]
     pub fn buffered(parts: impl IntoIterator<Item = FlowFile<Vec<u8>>>) -> Self {
+        let parts = parts.into_iter();
         let mut bytes = Vec::new();
+        // The parts arrive one at a time, so the total is not known up front;
+        // reserving each one's exact length as it comes is the next best
+        // thing, and keeps the body out of the doubling sequence a plain
+        // `extend` would put it through.
         for part in parts {
-            bytes.extend_from_slice(&part.to_bytes());
+            let len = usize::try_from(part.serialized_len()).unwrap_or(usize::MAX);
+            bytes.reserve(len);
+            part.write_bytes_to(&mut bytes)
+                .expect("writing to a Vec cannot fail");
         }
         Self {
             source: Source::Bytes(bytes),

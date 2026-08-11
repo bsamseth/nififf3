@@ -18,11 +18,26 @@
 
 ### Performance
 
-- Serializing a header is 35–49% faster, and `to_bytes` and the writers 37–44%
+Measured with `cargo bench` against the generated corpus; see `benches/`.
+
+- Reading a stream of flow files is 40–67% faster, parsing a header 15–23%, and
+  `into_memory` 41%. Buffers for content and for attributes are now reserved
+  from what the reader has actually delivered rather than left to
+  `read_to_end`'s blind doubling, so ordinary content and every ordinary
+  attribute is allocated once at exactly its size. A declared length is still
+  never trusted: the first reservation is capped at 64 KiB and each one after it
+  at how much has already arrived.
+- Content buffered by `into_memory` and friends no longer sits in an allocation
+  of up to twice its size.
+- Serializing a header is 36–49% faster, and `to_bytes` and the writers 44–47%
   faster on attribute-heavy flow files. The header buffer is now allocated once
   at its exact size rather than grown into, and the attributes are sorted as
   borrowed pairs rather than as keys looked up again in the map — one hash and
   one probe per attribute saved.
+- `write_bytes_to`, `FlowFilesWriter::write_bytes` and their async twins no
+  longer serialize into a temporary buffer first, which copied the whole content
+  for nothing. Writing a stream of 4 MiB flow files into a `Vec` now costs what
+  `write_all` over the same bytes costs.
 
 ### Fixed
 

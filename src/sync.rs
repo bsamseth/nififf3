@@ -74,14 +74,59 @@ impl Budget {
     }
 }
 
+/// How much to reserve for a declared length before any of it has arrived to
+/// justify the allocation.
+///
+/// Nothing in this crate sizes a buffer from a declared length: a header can
+/// claim four gigabytes over a four-byte input, and allocating for the claim is
+/// the cheapest denial of service there is. But reserving *nothing*, which is
+/// what `read_to_end` does, is not free either — it starts from 32 bytes and
+/// doubles, so the bytes are copied through a sequence of allocations and land
+/// in one up to twice the size they needed.
+///
+/// So the first reservation is bounded by this, and every one after it by how
+/// much has already arrived — the part a header cannot fake. A lying header
+/// costs this much and no more, while anything at or under it, which is every
+/// ordinary attribute and most content, is allocated once at exactly its size.
+pub(crate) const RESERVE_AHEAD: u64 = 64 * 1024;
+
+/// Read up to `len` bytes into `buf`, returning how many arrived.
+///
+/// Falling short is not an error here — the callers report it differently — so
+/// this returns the count and leaves that to them.
+///
+/// See [`RESERVE_AHEAD`] for why this is not `take(len).read_to_end(buf)`.
+pub(crate) fn read_declared(
+    reader: &mut impl Read,
+    len: u64,
+    buf: &mut Vec<u8>,
+) -> io::Result<u64> {
+    let mut done = 0u64;
+    while done < len {
+        // Never more than what is left, and never more than has already been
+        // delivered — so the reservation is backed by bytes, not by a claim.
+        let step = (len - done).min(done.max(RESERVE_AHEAD));
+        let step = usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
+        // Exact rather than amortized: the sizes here already double, so
+        // leaving the growth to the allocator would overshoot the final one.
+        buf.reserve_exact(step);
+        let read = reader.take(step as u64).read_to_end(buf)?;
+        if read == 0 {
+            break; // the source ended early
+        }
+        done += read as u64;
+    }
+    Ok(done)
+}
+
 fn read_string(reader: &mut impl Read, budget: &mut Budget) -> Result<String> {
     let len = read_field_len(reader)?;
     budget.check(len)?;
     // Grow the buffer as bytes actually arrive instead of trusting the
     // declared length, so a crafted header cannot force a huge allocation.
     let mut buf = Vec::new();
-    let read = reader.take(len as u64).read_to_end(&mut buf)?;
-    if read != len {
+    let read = read_declared(reader, len as u64, &mut buf)?;
+    if read != len as u64 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "attribute truncated").into());
     }
     budget.spend(len);
@@ -399,9 +444,7 @@ impl<R: Read> FlowFile<R> {
     /// [`size`]: FlowFile::size
     pub fn into_memory(mut self) -> io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
-        let read = (&mut self.content)
-            .take(self.size)
-            .read_to_end(&mut content)? as u64;
+        let read = read_declared(&mut self.content, self.size, &mut content)?;
         if read != self.size {
             return Err(crate::error::truncated(self.size, read));
         }
@@ -435,16 +478,30 @@ impl FlowFile<Vec<u8>> {
     /// # Ok::<(), nififf3::Error>(())
     /// ```
     ///
+    /// The header and the content are written as two calls rather than one,
+    /// since building a single buffer would mean copying the whole content
+    /// into it first. That is the right trade for content of any size, but it
+    /// does mean an unbuffered writer sees two writes — wrap one in a
+    /// [`std::io::BufWriter`] if the syscalls matter more than the copy.
+    ///
     /// # Errors
     ///
-    /// Whatever the writer returns.
+    /// Whatever the writer returns. A failure after the header has gone out
+    /// leaves a partial flow file in the stream, as [`write_to`](FlowFile::write_to)
+    /// does; [`FlowFilesWriter`] is what tracks that.
     ///
     /// # Panics
     ///
     /// As [`to_bytes`](FlowFile::to_bytes): an attribute the wire format
     /// cannot express, or a declared size disagreeing with the content.
     pub fn write_bytes_to<W: Write>(&self, writer: &mut W) -> io::Result<u64> {
-        writer.write_all(&self.to_bytes())?;
+        assert_eq!(
+            self.size,
+            self.content.len() as u64,
+            "declared size does not match the content; see FlowFile::with_size"
+        );
+        writer.write_all(&self.header_bytes())?;
+        writer.write_all(&self.content)?;
         Ok(self.size)
     }
 }
@@ -851,11 +908,10 @@ impl<W: Write> FlowFilesWriter<W> {
     /// of the flow file first, also poisons the writer.
     pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> io::Result<u64> {
         self.guard()?;
-        let bytes = flow_file.to_bytes();
-        let result = self.writer.write_all(&bytes);
-        self.poison_on_err(result)?;
+        let result = flow_file.write_bytes_to(&mut self.writer);
+        let written = self.poison_on_err(result)?;
         self.count += 1;
-        Ok(flow_file.size)
+        Ok(written)
     }
 
     fn guard(&self) -> io::Result<()> {
@@ -1631,6 +1687,51 @@ mod tests {
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::AttributeTooLong { limit: 8, .. })
+        ));
+    }
+
+    /// Both halves of the reservation schedule, which exist in tension: it has
+    /// to size the buffer well for content that really arrives, without ever
+    /// sizing it from a number the input has not backed with bytes.
+    #[test]
+    fn content_is_buffered_at_its_exact_size_without_trusting_the_declaration() {
+        // Well past `RESERVE_AHEAD`, so several rounds of growth happen and
+        // the last one still has to land exactly rather than overshoot.
+        for size in [0, 1, 1024, 64 * 1024, 300 * 1024, 4 << 20] {
+            let bytes = FlowFile::builder().content(vec![7u8; size]).to_bytes();
+            let content = FlowFile::parse(bytes.as_slice())
+                .unwrap()
+                .into_memory()
+                .unwrap()
+                .into_content();
+
+            assert_eq!(content.len(), size);
+            assert_eq!(
+                content.capacity(),
+                size,
+                "{size} bytes should land in an allocation of exactly {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_size_no_input_backs_costs_no_allocation_for_it() {
+        // A header declaring 1 TiB of content over an empty one.
+        let mut bytes = FlowFile::builder().content(Vec::new()).to_bytes();
+        let declared = 1u64 << 40;
+        let size_at = bytes.len() - 8;
+        bytes[size_at..].copy_from_slice(&declared.to_be_bytes());
+
+        let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
+        assert_eq!(flow_file.size(), declared);
+
+        // The reservation follows the bytes that arrive, so this fails on the
+        // truncation rather than on a terabyte of memory.
+        let err = flow_file.into_memory().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(matches!(
+            err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+            Some(Error::SizeMismatch { actual: 0, .. })
         ));
     }
 
