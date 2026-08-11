@@ -10,6 +10,19 @@
   the parts were cut into, the run that produced them — and, in the other
   direction, for a parent attribute that does not survive being cut up. A part
   that sets the same key on its own builder still wins.
+- `FlowFile::serialized_len`: how many bytes the flow file serializes to,
+  computed from the attributes and the declared size without serializing
+  anything. Exact, and available for a reader-backed flow file that has not been
+  read — which is the case where a `Content-Length`, a size-limited sink or a
+  pre-sized buffer has no other way to find out.
+
+### Performance
+
+- Serializing a header is 35–49% faster, and `to_bytes` and the writers 37–44%
+  faster on attribute-heavy flow files. The header buffer is now allocated once
+  at its exact size rather than grown into, and the attributes are sorted as
+  borrowed pairs rather than as keys looked up again in the map — one hash and
+  one probe per attribute saved.
 
 ### Fixed
 

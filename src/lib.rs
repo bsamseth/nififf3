@@ -397,6 +397,51 @@ impl<R> FlowFile<R> {
         Fragments::new(&self.attributes)
     }
 
+    /// How many bytes this flow file serializes to: the header plus
+    /// [`size`](Self::size).
+    ///
+    /// Computed from the attributes and the declared size, without serializing
+    /// anything — so it answers the question a `Content-Length` header, a
+    /// size-limited sink, or a pre-sized buffer needs answered *before* the
+    /// bytes exist. Exact, not an estimate: it is what [`to_bytes`] produces
+    /// and what [`write_to`] and [`write_bytes_to`] write.
+    ///
+    /// Available for any content container, since neither part depends on the
+    /// content itself — including a reader-backed flow file that has not been
+    /// read, which is the case where it is least replaceable.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..]);
+    ///
+    /// assert_eq!(flow_file.serialized_len(), flow_file.to_bytes().len() as u64);
+    ///
+    /// // And without content to serialize: a reader is measured the same way.
+    /// let streamed = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .reader(&b"hello"[..], 5);
+    /// assert_eq!(streamed.serialized_len(), flow_file.serialized_len());
+    /// ```
+    ///
+    /// For a stream of flow files the totals add up, since the format
+    /// concatenates them with nothing in between.
+    ///
+    /// # Panics
+    ///
+    /// Never — but note that an attribute longer than `u32::MAX` bytes is
+    /// counted here and rejected by the serializers, so a length this reports
+    /// is not on its own a promise that the flow file can be written.
+    ///
+    /// [`to_bytes`]: FlowFile::to_bytes
+    /// [`write_to`]: FlowFile::write_to
+    /// [`write_bytes_to`]: FlowFile::write_bytes_to
+    pub fn serialized_len(&self) -> u64 {
+        format::header_len(&self.attributes) as u64 + self.size
+    }
+
     /// The serialized header (everything up to the content) for this flow file.
     ///
     /// # Panics
@@ -563,7 +608,10 @@ impl FlowFile<Vec<u8>> {
             self.content.len() as u64,
             "declared size does not match the content; see FlowFile::with_size"
         );
-        let mut buf = format::encode_header(&self.attributes, self.size);
+        // One allocation for header and content together: the length is known
+        // exactly before either is written, so nothing here grows.
+        let mut buf = Vec::with_capacity(format::header_len(&self.attributes) + self.content.len());
+        format::encode_header_into(&mut buf, &self.attributes, self.size);
         buf.extend_from_slice(&self.content);
         buf
     }
