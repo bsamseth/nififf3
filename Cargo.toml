@@ -71,6 +71,7 @@ predicates = "3"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 astral-tokio-tar = "0.6"
 tokio-stream = "0.1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bin]]
 name = "nififf3"
@@ -105,3 +106,7 @@ required-features = ["tokio", "uuid"]
 [[example]]
 name = "axum_service"
 required-features = ["axum", "uuid"]
+
+[[bench]]
+name = "flowfiles"
+harness = false
