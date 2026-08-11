@@ -11,6 +11,16 @@
   direction, for a parent attribute that does not survive being cut up. A part
   that sets the same key on its own builder still wins.
 
+### Fixed
+
+- `Limits::max_total_attribute_len` now bounds what the parser *buffers*, not
+  only what it accepts. Both attribute limits are applied to each declared field
+  length before its bytes are read, so an attribute larger than the remaining
+  budget is refused on its declaration. Previously the total was checked against
+  a running tally after each key-value pair, so one attribute could be read into
+  memory in full before anything fired — unbounded for a caller who set this
+  limit and no `max_attribute_len` beside it.
+
 ## 0.3.3
 
 ### Changed

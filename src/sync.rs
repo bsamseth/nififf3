@@ -19,13 +19,64 @@ fn read_field_len(reader: &mut impl Read) -> io::Result<usize> {
     }
 }
 
-fn read_string(reader: &mut impl Read, max_len: Option<usize>) -> Result<String> {
-    let len = read_field_len(reader)?;
-    if let Some(limit) = max_len
-        && len > limit
-    {
-        return Err(Error::AttributeTooLong { len, limit });
+/// What a single attribute key or value is still allowed to spend.
+///
+/// Two limits bear on one field, and both have to be applied to the *declared*
+/// length rather than to what arrives, or the field they are meant to bound is
+/// read into memory before either fires.
+#[derive(Clone, Copy)]
+pub(crate) struct Budget {
+    /// [`Limits::max_attribute_len`], which applies to each field alone.
+    per_field: Option<usize>,
+    /// [`Limits::max_total_attribute_len`], and how much of it the fields
+    /// before this one have already spent.
+    total: Option<(usize, usize)>,
+}
+
+impl Budget {
+    pub(crate) fn new(limits: Limits) -> Self {
+        Self {
+            per_field: limits.max_attribute_len,
+            total: limits.max_total_attribute_len.map(|limit| (0, limit)),
+        }
     }
+
+    /// Check a declared field length against both limits, before the bytes it
+    /// describes are read.
+    pub(crate) fn check(self, len: usize) -> Result<()> {
+        if let Some(limit) = self.per_field
+            && len > limit
+        {
+            return Err(Error::AttributeTooLong { len, limit });
+        }
+        // Against the projected total, not the running one: a single attribute
+        // larger than the whole budget has to be refused on its declaration.
+        // Checking only after it had been read would let one field overshoot
+        // the header limit by its own size, which for the caller who sets no
+        // per-attribute limit is any size at all.
+        if let Some((spent, limit)) = self.total {
+            let projected = spent.saturating_add(len);
+            if projected > limit {
+                return Err(Error::HeaderTooLarge {
+                    len: projected,
+                    limit,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a field that was accepted.
+    pub(crate) fn spend(&mut self, len: usize) {
+        if let Some((spent, _)) = &mut self.total {
+            *spent = spent.saturating_add(len);
+        }
+    }
+}
+
+fn read_string(reader: &mut impl Read, budget: &mut Budget) -> Result<String> {
+    let len = read_field_len(reader)?;
+    budget.check(len)?;
     // Grow the buffer as bytes actually arrive instead of trusting the
     // declared length, so a crafted header cannot force a huge allocation.
     let mut buf = Vec::new();
@@ -33,6 +84,7 @@ fn read_string(reader: &mut impl Read, max_len: Option<usize>) -> Result<String>
     if read != len {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "attribute truncated").into());
     }
+    budget.spend(len);
     String::from_utf8(buf).map_err(Error::InvalidAttribute)
 }
 
@@ -61,16 +113,10 @@ pub(crate) fn parse_header(
         return Err(Error::TooManyAttributes { count, limit });
     }
     let mut attributes = HashMap::with_capacity(count.min(1024));
-    let mut total = 0usize;
+    let mut budget = Budget::new(limits);
     for _ in 0..count {
-        let key = read_string(reader, limits.max_attribute_len)?;
-        let value = read_string(reader, limits.max_attribute_len)?;
-        total = total.saturating_add(key.len()).saturating_add(value.len());
-        if let Some(limit) = limits.max_total_attribute_len
-            && total > limit
-        {
-            return Err(Error::HeaderTooLarge { len: total, limit });
-        }
+        let key = read_string(reader, &mut budget)?;
+        let value = read_string(reader, &mut budget)?;
         attributes.insert(key, value);
     }
     let mut size = [0u8; 8];
@@ -1503,6 +1549,72 @@ mod tests {
                 Limits::UNLIMITED
                     .with_max_attributes(10)
                     .with_max_attribute_len(1024)
+            )
+            .is_ok()
+        );
+    }
+
+    /// The total limit has to bound what the parser *buffers*, not just what
+    /// it accepts. Checked against the running total after each pair, one
+    /// attribute could be read into memory in full before anything fired —
+    /// so a caller who set only this limit had no bound at all.
+    #[test]
+    fn the_total_limit_rejects_an_attribute_on_its_declared_length() {
+        // A header declaring an 8 MiB value against a 1 KiB total, with only
+        // four bytes of it actually present. If the length is being trusted,
+        // the parse ends on the truncation instead of on the limit.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NiFiFF3");
+        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
+        bytes.extend_from_slice(&[0x00, 0x01, b'k']); // key
+        bytes.extend_from_slice(&[0xFF, 0xFF]); // extended value length
+        bytes.extend_from_slice(&(8u32 << 20).to_be_bytes());
+        bytes.extend_from_slice(b"tiny");
+
+        let limits = Limits::UNLIMITED.with_max_total_attribute_len(1024);
+        assert!(
+            matches!(
+                FlowFile::parse_with_limits(bytes.as_slice(), limits),
+                Err(Error::HeaderTooLarge {
+                    len: 8_388_609,
+                    limit: 1024
+                })
+            ),
+            "the declaration alone must be refused, before the bytes are read"
+        );
+
+        // And the key is checked the same way, rather than only the pair.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NiFiFF3");
+        bytes.extend_from_slice(&[0x00, 0x01]);
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
+        bytes.extend_from_slice(&(8u32 << 20).to_be_bytes());
+        bytes.extend_from_slice(b"tiny");
+        assert!(matches!(
+            FlowFile::parse_with_limits(bytes.as_slice(), limits),
+            Err(Error::HeaderTooLarge { limit: 1024, .. })
+        ));
+    }
+
+    /// The budget is spent as it goes, so attributes that are each within it
+    /// still fail once they add up — the behaviour that was already right.
+    #[test]
+    fn the_total_limit_still_accumulates_across_attributes() {
+        let bytes = FlowFile::builder()
+            .attributes((0..10).map(|i| (format!("k{i}"), "v".repeat(100))))
+            .content(Vec::new())
+            .to_bytes();
+
+        let limits = Limits::UNLIMITED.with_max_total_attribute_len(256);
+        assert!(matches!(
+            FlowFile::parse_with_limits(bytes.as_slice(), limits),
+            Err(Error::HeaderTooLarge { limit: 256, .. })
+        ));
+        // A budget that fits every attribute is not tripped by the tally.
+        assert!(
+            FlowFile::parse_with_limits(
+                bytes.as_slice(),
+                Limits::UNLIMITED.with_max_total_attribute_len(2048)
             )
             .is_ok()
         );

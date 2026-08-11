@@ -50,6 +50,11 @@ use crate::{Error, Result};
 /// header alone is the attribute map, capped at 1024 entries however many the
 /// header claims — so unlimited parsing of a short input stays cheap.
 ///
+/// Both attribute limits are applied to each *declared* length before the bytes
+/// it describes are read, so what the total bounds is what the parser buffers
+/// and not merely what it accepts. An attribute larger than the whole remaining
+/// budget is refused on its declaration rather than after it has arrived.
+///
 /// # Content size
 ///
 /// [`max_content_len`](Self::max_content_len) is off by default, because the
@@ -138,6 +143,11 @@ impl Limits {
     /// attributes of 1 MiB each are individually fine and collectively
     /// enormous. Checked as the header is read, so it fails part-way through
     /// rather than after the whole header has been taken in.
+    ///
+    /// Each field is checked against what is left of the budget before its
+    /// bytes are read, so this bounds what the parser buffers on its way to
+    /// deciding — which makes it a useful limit on its own, with no
+    /// [`max_attribute_len`](Self::max_attribute_len) beside it.
     ///
     /// It counts key and value bytes only. The framing around them — two to
     /// six bytes of length prefix per field — is not included, so a header is

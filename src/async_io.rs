@@ -22,14 +22,10 @@ async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
 
 async fn read_string<R: AsyncRead + Unpin>(
     reader: &mut R,
-    max_len: Option<usize>,
+    budget: &mut crate::sync::Budget,
 ) -> Result<String> {
     let len = read_field_len(reader).await?;
-    if let Some(limit) = max_len
-        && len > limit
-    {
-        return Err(Error::AttributeTooLong { len, limit });
-    }
+    budget.check(len)?;
     // Grow the buffer as bytes actually arrive instead of trusting the
     // declared length, so a crafted header cannot force a huge allocation.
     let mut buf = Vec::new();
@@ -39,6 +35,7 @@ async fn read_string<R: AsyncRead + Unpin>(
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attribute truncated").into(),
         );
     }
+    budget.spend(len);
     String::from_utf8(buf).map_err(Error::InvalidAttribute)
 }
 
@@ -67,16 +64,10 @@ pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
         return Err(Error::TooManyAttributes { count, limit });
     }
     let mut attributes = HashMap::with_capacity(count.min(1024));
-    let mut total = 0usize;
+    let mut budget = crate::sync::Budget::new(limits);
     for _ in 0..count {
-        let key = read_string(reader, limits.max_attribute_len).await?;
-        let value = read_string(reader, limits.max_attribute_len).await?;
-        total = total.saturating_add(key.len()).saturating_add(value.len());
-        if let Some(limit) = limits.max_total_attribute_len
-            && total > limit
-        {
-            return Err(Error::HeaderTooLarge { len: total, limit });
-        }
+        let key = read_string(reader, &mut budget).await?;
+        let value = read_string(reader, &mut budget).await?;
         attributes.insert(key, value);
     }
     let mut size = [0u8; 8];
@@ -984,6 +975,29 @@ mod tests {
         assert!(matches!(
             FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
             Err(Error::AttributeTooLong { limit: 8, .. })
+        ));
+    }
+
+    /// The async parser shares the budget the sync one uses, so the total
+    /// limit bounds what it buffers here too. See the sync twin for why
+    /// checking the declared length rather than the running total matters.
+    #[tokio::test]
+    async fn async_total_limit_rejects_an_attribute_on_its_declared_length() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NiFiFF3");
+        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
+        bytes.extend_from_slice(&[0x00, 0x01, b'k']); // key
+        bytes.extend_from_slice(&[0xFF, 0xFF]); // extended value length
+        bytes.extend_from_slice(&(8u32 << 20).to_be_bytes());
+        bytes.extend_from_slice(b"tiny");
+
+        let limits = Limits::UNLIMITED.with_max_total_attribute_len(1024);
+        assert!(matches!(
+            FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
+            Err(Error::HeaderTooLarge {
+                len: 8_388_609,
+                limit: 1024
+            })
         ));
     }
 
