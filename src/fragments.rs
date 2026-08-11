@@ -131,6 +131,11 @@ impl Default for FragmentKeys {
 /// `segment.original.filename`, so that a parent with no `filename` of its
 /// own yields parts with no original filename rather than a grandparent's.
 ///
+/// What every part inherits is otherwise the parent's attributes, and
+/// [`attribute`](Self::attribute) and
+/// [`without_attribute`](Self::without_attribute) adjust that set once for the
+/// whole split rather than on each part.
+///
 /// ```
 /// use nififf3::FlowFile;
 ///
@@ -229,6 +234,88 @@ impl Fragments {
     #[must_use]
     pub fn with_keys(mut self, keys: FragmentKeys) -> Self {
         self.keys = keys;
+        self
+    }
+
+    /// Add an attribute that every part in this set carries, replacing any
+    /// value inherited from the parent.
+    ///
+    /// The same call as [`FlowFileBuilder::attribute`], made once for the set
+    /// instead of on each part — for what is true of the split rather than of
+    /// one fragment: the format the parts were cut into, the run that produced
+    /// them, the schema they follow.
+    ///
+    /// It joins the inherited attributes, so it applies to
+    /// [`terminate`](Self::terminate) too, and a part that sets the same key on
+    /// its own builder still wins.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "records.csv")
+    ///     .content(&b"a\nb"[..]);
+    ///
+    /// let mut parts = parent
+    ///     .fragments()
+    ///     .attribute("mime.type", "text/csv")
+    ///     .with_count(2);
+    ///
+    /// let first = parts.next_part().content(&b"a"[..]);
+    /// let second = parts.next_part().attribute("mime.type", "text/plain").content(&b"b"[..]);
+    ///
+    /// assert_eq!(first.attribute("mime.type"), Some("text/csv"));
+    /// assert_eq!(second.attribute("mime.type"), Some("text/plain"), "the part wins");
+    /// ```
+    ///
+    /// The four fragment attributes are not settable this way: they are
+    /// computed per part, so a value written here under one of
+    /// [`keys`](Self::keys) is replaced by the one the split produces.
+    #[must_use]
+    pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.attributes.insert(key.into(), value.into());
+        self
+    }
+
+    /// Add attributes from an iterator of key-value pairs to every part in
+    /// this set. The plural of [`attribute`](Self::attribute).
+    #[must_use]
+    pub fn attributes<K, V>(mut self, attributes: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.attributes
+            .extend(attributes.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Drop an inherited attribute from every part in this set.
+    ///
+    /// The counterpart to [`attribute`](Self::attribute), for a parent
+    /// attribute that does not describe the pieces it was cut into — a
+    /// checksum over the whole, a record count, an original size.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let parent = FlowFile::builder()
+    ///     .attribute("filename", "records.csv")
+    ///     .attribute("record.count", "2")
+    ///     .content(&b"a\nb"[..]);
+    ///
+    /// let part = parent
+    ///     .fragments()
+    ///     .without_attribute("record.count")
+    ///     .next_part()
+    ///     .content(&b"a"[..]);
+    ///
+    /// assert_eq!(part.attribute("record.count"), None);
+    /// assert_eq!(part.attribute("segment.original.filename"), Some("records.csv"));
+    /// ```
+    #[must_use]
+    pub fn without_attribute(mut self, key: &str) -> Self {
+        self.attributes.remove(key);
         self
     }
 
@@ -528,6 +615,106 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(declared, bundle.len());
+    }
+
+    /// The point of setting an attribute on the set: it reaches every part
+    /// without being repeated on each, the terminator included.
+    #[test]
+    fn a_set_wide_attribute_reaches_every_part() {
+        let parent = parent();
+        let mut parts = parent
+            .fragments()
+            .attribute("mime.type", "text/csv")
+            .attributes([("run", "42"), ("schema", "v3")]);
+
+        let first = parts.next_part().content(Vec::new());
+        let second = parts.next_part().content(Vec::new());
+        let terminator = parts.terminate();
+
+        for part in [&first, &second, &terminator] {
+            assert_eq!(part.attribute("mime.type"), Some("text/csv"));
+            assert_eq!(part.attribute("run"), Some("42"));
+            assert_eq!(part.attribute("schema"), Some("v3"));
+            // And the inherited and fragment attributes are untouched by it.
+            assert_eq!(part.attribute("path"), Some("/in"));
+            assert!(part.attributes().contains_key("fragment.identifier"));
+        }
+    }
+
+    /// Set-wide is a default, not an override: a part that says otherwise on
+    /// its own builder still wins, as it does over an inherited attribute.
+    #[test]
+    fn a_part_overrides_a_set_wide_attribute() {
+        let parent = parent();
+        let mut parts = parent.fragments().attribute("mime.type", "text/csv");
+
+        let plain = parts.next_part().content(Vec::new());
+        let special = parts
+            .next_part()
+            .attribute("mime.type", "text/plain")
+            .content(Vec::new());
+        let dropped = parts
+            .next_part()
+            .without_attribute("mime.type")
+            .content(Vec::new());
+
+        assert_eq!(plain.attribute("mime.type"), Some("text/csv"));
+        assert_eq!(special.attribute("mime.type"), Some("text/plain"));
+        assert_eq!(dropped.attribute("mime.type"), None);
+    }
+
+    #[test]
+    fn a_set_can_drop_an_inherited_attribute_from_every_part() {
+        let parent = FlowFile::builder()
+            .attribute("filename", "records.csv")
+            .attribute("record.count", "2")
+            .attribute("path", "/in")
+            .content(Vec::new());
+
+        let mut parts = parent.fragments().without_attribute("record.count");
+        let part = parts.next_part().content(Vec::new());
+        let terminator = parts.terminate();
+
+        for one in [&part, &terminator] {
+            assert_eq!(one.attribute("record.count"), None);
+            assert_eq!(one.attribute("path"), Some("/in"), "only the named one");
+        }
+        // Dropping `record.count` says nothing about the filename the split
+        // records, which is captured before any of this.
+        assert_eq!(
+            part.attribute("segment.original.filename"),
+            Some("records.csv")
+        );
+    }
+
+    /// The fragment attributes are computed per part, so writing one under a
+    /// fragment key here cannot stand: it would describe the wrong flow file
+    /// on every part but at most one.
+    #[test]
+    fn a_set_wide_attribute_cannot_displace_the_fragment_attributes() {
+        let parent = parent();
+        let mut parts = parent
+            .fragments()
+            .attribute("fragment.index", "99")
+            .attribute("fragment.identifier", "mine")
+            .with_count(2);
+
+        let first = parts.next_part().content(Vec::new());
+        assert_eq!(first.attribute("fragment.index"), "1".into());
+        assert_ne!(first.attribute("fragment.identifier"), Some("mine"));
+        assert_eq!(first.attribute("fragment.count"), Some("2"));
+    }
+
+    /// Under custom keys the same has to hold, since it is the configured key
+    /// that names a fragment attribute, not the default one.
+    #[test]
+    fn a_set_wide_attribute_cannot_displace_a_custom_fragment_attribute() {
+        let parent = parent();
+        let first = custom_keys(parent.fragments())
+            .attribute("split.n", "99")
+            .next_part()
+            .content(Vec::new());
+        assert_eq!(first.attribute("split.n"), Some("1"));
     }
 
     #[test]

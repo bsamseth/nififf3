@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `Fragments::attribute`, `attributes` and `without_attribute`: adjust the
+  attributes every part of a split carries, once for the set rather than on each
+  part. For what is true of the split rather than of one fragment — the format
+  the parts were cut into, the run that produced them — and, in the other
+  direction, for a parent attribute that does not survive being cut up. A part
+  that sets the same key on its own builder still wins.
+
+## 0.3.3
+
+### Changed
+
+- Published under the Unlicense.
+
 ## 0.3.2
 
 Streaming reads that keep the stream positioned for you, and the documentation
