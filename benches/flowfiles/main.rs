@@ -14,6 +14,17 @@
 //! Throughput is reported over the *serialized* size of the input in every
 //! case, including the write groups, so a given corpus's numbers can be
 //! compared across groups.
+//!
+//! # Reading the numbers
+//!
+//! Destinations are [`Consuming`], never `io::sink` — see there for why a sink
+//! turns a real 9% win into a reported 99.9% one.
+//!
+//! `few_large` moves 32 MiB per iteration and is dominated by page faults and
+//! the allocator, so it swings by tens of percent between runs on a machine
+//! that is doing anything else; `many_small` and `wide_attrs` reproduce to
+//! within a few points. Take a `few_large` result seriously only when it holds
+//! across runs, and check `uptime` before believing any of them.
 
 mod corpus;
 
@@ -31,7 +42,10 @@ struct Input {
     /// The same flow files, parsed.
     parsed: Vec<FlowFile<Vec<u8>>>,
     /// The same flow files, each serialized on its own — what the
-    /// single-flow-file entry points take.
+    /// single-flow-file entry points take. Shrunk to an exact fit, so that the
+    /// capacity of the input is not itself something a change can alter: how
+    /// `to_bytes` sizes its buffer is under measurement elsewhere, and must not
+    /// leak into what `from_bytes` and `from_vec` are handed.
     each: Vec<Vec<u8>>,
 }
 
@@ -43,7 +57,7 @@ fn inputs() -> Vec<Input> {
             let parsed: Vec<_> = FlowFiles::new(stream.as_slice())
                 .collect::<Result<_, _>>()
                 .expect("the generated corpus parses");
-            let each = parsed.iter().map(FlowFile::to_bytes).collect();
+            let each = parsed.iter().map(serialized_exactly).collect();
             Input {
                 name: shape.name,
                 stream,
@@ -57,6 +71,47 @@ fn inputs() -> Vec<Input> {
 /// Bytes, for a throughput figure. Corpora are far below `u64::MAX`.
 fn bytes(len: usize) -> Throughput {
     Throughput::Bytes(len as u64)
+}
+
+/// Serialize a flow file into a buffer of exactly its own length.
+///
+/// Every input built by `to_bytes` has to go through this, because how
+/// `to_bytes` sizes its buffer is itself under measurement: left alone, a
+/// change to it hands the parser inputs with different capacity, and for a
+/// corpus of twenty thousand small buffers the difference in how much address
+/// space they span moves the parse figure by twenty points. That is the
+/// allocator answering a question nobody asked.
+fn serialized_exactly(flow_file: &FlowFile<Vec<u8>>) -> Vec<u8> {
+    let mut bytes = flow_file.to_bytes();
+    bytes.shrink_to_fit();
+    bytes
+}
+
+/// A destination that costs what a destination costs: every byte handed to it
+/// is copied exactly once, and nothing is kept.
+///
+/// `io::sink` will not do. It *discards* rather than copying, so a change that
+/// removes a copy the crate was making for itself shows up against it as
+/// removing essentially all the work — which is true of the crate and false of
+/// the program, since the copy into a real destination is still to come. That
+/// turns a genuine 9% end-to-end win into a reported 99.9%.
+///
+/// This keeps a single scratch buffer and reuses it, so after the first write
+/// there is no allocation and no growth: what remains is the crate's work plus
+/// one `memcpy`, which is the floor a real writer cannot go below.
+#[derive(Default)]
+struct Consuming(Vec<u8>);
+
+impl Write for Consuming {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.clear();
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Reading a whole stream, by each of the three ways the crate offers.
@@ -94,14 +149,15 @@ fn read(c: &mut Criterion) {
 
     // Streaming the content out as it arrives, which is what the streaming
     // reader is actually for.
-    let mut group = c.benchmark_group("read/stream_to_sink");
+    let mut group = c.benchmark_group("read/stream_out");
     for input in &inputs {
         group.throughput(bytes(input.stream.len()));
         group.bench_function(input.name, |b| {
+            let mut out = Consuming::default();
             b.iter(|| {
                 let mut reader = FlowFilesReader::new(input.stream.as_slice());
                 while let Some(mut flow_file) = reader.next().expect("the corpus parses") {
-                    io::copy(flow_file.content_mut(), &mut io::sink()).expect("sink cannot fail");
+                    io::copy(flow_file.content_mut(), &mut out).expect("cannot fail");
                 }
             });
         });
@@ -161,16 +217,16 @@ fn write(c: &mut Criterion) {
     group.finish();
 
     // Straight to a writer, which need not build the serialized form at all.
-    let mut group = c.benchmark_group("write/to_sink");
+    // The destination copies but does not grow (see `Consuming`), so this is
+    // the crate's work plus the one copy no writer can avoid.
+    let mut group = c.benchmark_group("write/to_writer");
     for input in &inputs {
         group.throughput(bytes(input.stream.len()));
         group.bench_function(input.name, |b| {
+            let mut out = Consuming::default();
             b.iter(|| {
-                let mut sink = io::sink();
                 for flow_file in &input.parsed {
-                    flow_file
-                        .write_bytes_to(&mut sink)
-                        .expect("sink cannot fail");
+                    flow_file.write_bytes_to(&mut out).expect("cannot fail");
                 }
             });
         });
@@ -229,7 +285,11 @@ fn header(c: &mut Criterion) {
             .parsed
             .iter()
             .map(|flow_file| {
-                FlowFile::from_parts(0, flow_file.attributes().clone(), Vec::new()).to_bytes()
+                serialized_exactly(&FlowFile::from_parts(
+                    0,
+                    flow_file.attributes().clone(),
+                    Vec::new(),
+                ))
             })
             .collect();
         let total: usize = headers.iter().map(Vec::len).sum();
@@ -248,10 +308,11 @@ fn header(c: &mut Criterion) {
 /// Content movement with the header out of the way: one 4 MiB flow file
 /// through each of the reader-based operations.
 fn content(c: &mut Criterion) {
-    let one = FlowFile::builder()
-        .attribute("filename", "big.dat")
-        .content(vec![0x5a; 4 << 20])
-        .to_bytes();
+    let one = serialized_exactly(
+        &FlowFile::builder()
+            .attribute("filename", "big.dat")
+            .content(vec![0x5a; 4 << 20]),
+    );
 
     let mut group = c.benchmark_group("content/4MiB");
     group.throughput(bytes(one.len()));
@@ -270,17 +331,17 @@ fn content(c: &mut Criterion) {
         });
     });
     group.bench_function("write_to", |b| {
+        let mut out = Consuming::default();
         b.iter(|| {
             let flow_file = FlowFile::parse(one.as_slice()).expect("parses");
-            flow_file.write_to(&mut io::sink()).expect("sink cannot fail");
+            flow_file.write_to(&mut out).expect("cannot fail");
         });
     });
     group.bench_function("write_bytes_to", |b| {
         let parsed = FlowFile::from_bytes(&one).expect("parses");
+        let mut out = Consuming::default();
         b.iter(|| {
-            parsed
-                .write_bytes_to(&mut io::sink())
-                .expect("sink cannot fail");
+            parsed.write_bytes_to(&mut out).expect("cannot fail");
         });
     });
     group.finish();
