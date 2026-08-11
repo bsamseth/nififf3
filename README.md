@@ -47,6 +47,11 @@ let flow_file = flow_file.into_memory().unwrap();
 assert_eq!(flow_file.content().as_slice(), b"streamed");
 ```
 
+When the content is wanted in memory anyway — a file on disk, a small request
+body — `FlowFile::from_reader` is those last two lines in one call, and reports
+a truncated content the way `from_bytes` does rather than as a bare I/O error.
+It reads exactly one flow file and leaves the reader on the byte after it.
+
 NiFi concatenates multiple flow files back-to-back in a single stream;
 `FlowFile::parse_next` reads them one at a time and returns `None` on a clean
 end of input:
@@ -164,6 +169,9 @@ assert_eq!(flow_file.size(), 3);
 let bytes = flow_file.to_bytes();
 ```
 
+`empty()` finishes a build with no content, for the flow files that are only
+attributes — a signal, a marker, the terminator of a fragment set.
+
 ### Content of unknown length
 
 The binary format stores the content size *before* the content, so nothing can
@@ -215,6 +223,11 @@ The targets mirror the parsing sources, one per content type:
 The two streaming ones consume the flow file because they leave its content
 reader exhausted — a second call would write a second header and then fail,
 after committing those bytes.
+
+`serialized_len()` reports how many bytes any of them will produce, computed
+from the attributes and the declared size without serializing anything — which
+is what a `Content-Length` needs before the bytes exist, and the only way to
+ask a reader-backed flow file that has not been read.
 
 One name to watch: `to_bytes` serializes a *whole flow file*, header included,
 while `into_memory` reads a reader-backed flow file's *content* into memory and
@@ -347,6 +360,32 @@ assert_eq!(children[0].attributes()["segment.original.filename"], "pair.txt");
 
 Each part also gets its own `uuid` and a `fragment.identifier` shared across
 the set. The attribute keys are configurable if you need different ones.
+
+Parts inherit the parent's attributes, and `attribute` / `without_attribute` on
+the `Fragments` itself adjust that once for the whole split instead of on every
+part — for what describes the split rather than one fragment, and for the parent
+attributes that do not survive being cut up:
+
+```rust
+# #[cfg(feature = "uuid")] {
+use nififf3::FlowFile;
+
+let parent = FlowFile::builder()
+    .attribute("filename", "records.csv")
+    .attribute("record.count", "2") // true of the whole, of no part
+    .content(&b"a\nb"[..]);
+
+let part = parent
+    .fragments()
+    .attribute("mime.type", "text/csv")
+    .without_attribute("record.count")
+    .next_part()
+    .content(&b"a"[..]);
+
+assert_eq!(part.attribute("mime.type"), Some("text/csv"));
+assert_eq!(part.attribute("record.count"), None);
+# }
+```
 
 ### Declaring the count
 

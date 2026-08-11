@@ -760,7 +760,11 @@ impl FlowFilesResponse {
         // thing, and keeps the body out of the doubling sequence a plain
         // `extend` would put it through.
         for part in parts {
-            let len = usize::try_from(part.serialized_len()).unwrap_or(usize::MAX);
+            // A part whose length does not fit a `usize` cannot be in memory to
+            // begin with, so this is unreachable; reserving nothing is still
+            // the right fallback, since `write_bytes_to` grows the buffer on
+            // its own and asking for `usize::MAX` would abort the process.
+            let len = usize::try_from(part.serialized_len()).unwrap_or(0);
             bytes.reserve(len);
             part.write_bytes_to(&mut bytes)
                 .expect("writing to a Vec cannot fail");
