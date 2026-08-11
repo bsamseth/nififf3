@@ -1862,6 +1862,11 @@ mod tests {
         bytes.extend_from_slice(b"tiny");
         let err = FlowFile::parse(bytes.as_slice()).unwrap_err();
         assert!(matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof));
+        // Reaching this at all is the assertion: a buffer sized from the
+        // declared length would have asked for 4 GiB. What it does reserve is
+        // bounded by `RESERVE_AHEAD` and then by bytes that actually arrived,
+        // which here is four of them.
+        assert_eq!(RESERVE_AHEAD, 64 * 1024, "the bound this test relies on");
     }
 
     #[test]

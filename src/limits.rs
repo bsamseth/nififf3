@@ -44,11 +44,13 @@ use crate::{Error, Result};
 /// axum's `DefaultBodyLimit`'s job, and raising it to accept large content does
 /// not raise the header budget with it — that is the point of the total.
 ///
-/// Regardless of limits, an attribute buffer grows as bytes arrive rather than
-/// to the length the header declares, so a header claiming a 4 GiB key over a
-/// short input fails without allocating for it. The one thing sized from the
-/// header alone is the attribute map, capped at 1024 entries however many the
-/// header claims — so unlimited parsing of a short input stays cheap.
+/// Regardless of limits, no buffer is sized from a declared length. An
+/// attribute or content buffer is reserved at most 64 KiB ahead, and after that
+/// only as far as bytes have actually arrived, so a header claiming a 4 GiB key
+/// over a short input costs 64 KiB rather than 4 GiB. The only other thing
+/// sized from the header alone is the attribute map, capped at 1024 entries
+/// however many the header claims — so unlimited parsing of a short input stays
+/// cheap.
 ///
 /// Both attribute limits are applied to each *declared* length before the bytes
 /// it describes are read, so what the total bounds is what the parser buffers
