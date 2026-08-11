@@ -158,6 +158,29 @@ impl FlowFileBuilder {
         FlowFile::from_raw_parts(content.len() as u64, self.attributes, content)
     }
 
+    /// Finish the build with no content at all.
+    ///
+    /// `content(Vec::new())` says the same thing, and says it less well: a flow
+    /// file that is only attributes is a normal thing in NiFi — a signal, a
+    /// marker, the terminator of a fragment set — rather than an empty buffer
+    /// that happens to be empty.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let done = FlowFile::builder()
+    ///     .attribute("filename", "batch-17")
+    ///     .attribute("status", "complete")
+    ///     .empty();
+    ///
+    /// assert_eq!(done.size(), 0);
+    /// assert_eq!(done.attribute("status"), Some("complete"));
+    /// ```
+    #[must_use]
+    pub fn empty(self) -> FlowFile<Vec<u8>> {
+        self.content(Vec::new())
+    }
+
     /// Finish the build with content from a reader.
     ///
     /// The V3 format stores the content size before the content itself, so

@@ -10,6 +10,16 @@
   the parts were cut into, the run that produced them — and, in the other
   direction, for a parent attribute that does not survive being cut up. A part
   that sets the same key on its own builder still wins.
+- `FlowFile::from_reader`, `from_reader_with_limits` and `from_reader_async`:
+  read one whole flow file from a reader, content included. The eager
+  counterpart to `parse`, filling the one empty cell in the entry-point table —
+  in memory, from a reader — with the two error types already reconciled, so a
+  truncated content arrives as `Error::SizeMismatch` rather than wrapped in
+  `Error::Io`. Unlike `from_bytes` it reads exactly one flow file and leaves the
+  reader positioned after it, so trailing bytes are not an error.
+- `FlowFileBuilder::empty`: finish a build with no content. A flow file that is
+  only attributes is a normal thing in NiFi, and `content(Vec::new())` said so
+  badly.
 - `FlowFile::serialized_len`: how many bytes the flow file serializes to,
   computed from the attributes and the declared size without serializing
   anything. Exact, and available for a reader-backed flow file that has not been

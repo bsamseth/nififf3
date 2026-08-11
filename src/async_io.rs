@@ -102,6 +102,44 @@ pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
     Ok((attributes, size))
 }
 
+impl FlowFile<Vec<u8>> {
+    /// Async version of [`FlowFile::from_reader`]: reads one whole flow file,
+    /// content included.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
+    /// let flow_file = FlowFile::from_reader_async(bytes.as_slice()).await.unwrap();
+    /// assert_eq!(flow_file.content().as_slice(), b"hello");
+    /// # });
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::from_reader`].
+    pub async fn from_reader_async<R: AsyncRead + Unpin>(reader: R) -> Result<Self> {
+        Self::from_reader_async_with_limits(reader, Limits::UNLIMITED).await
+    }
+
+    /// Async version of [`FlowFile::from_reader_with_limits`]. Use this for
+    /// untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::from_reader_with_limits`].
+    pub async fn from_reader_async_with_limits<R: AsyncRead + Unpin>(
+        reader: R,
+        limits: Limits,
+    ) -> Result<Self> {
+        Ok(FlowFile::parse_async_with_limits(reader, limits)
+            .await?
+            .into_memory_async()
+            .await?)
+    }
+}
+
 impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// Async version of [`FlowFile::parse`]: consumes only the header and
     /// returns the content as a reader limited to the declared size.
@@ -995,6 +1033,32 @@ mod tests {
             })
         ));
         assert!(flow_files.next().await.unwrap().is_none(), "fused");
+    }
+
+    #[tokio::test]
+    async fn from_reader_async_matches_the_sync_one() {
+        let bytes = sample().to_bytes();
+        assert_eq!(
+            FlowFile::from_reader_async(bytes.as_slice()).await.unwrap(),
+            FlowFile::from_reader(bytes.as_slice()).unwrap()
+        );
+
+        let truncated = &bytes[..bytes.len() - 2];
+        assert!(matches!(
+            FlowFile::from_reader_async(truncated).await,
+            Err(Error::SizeMismatch {
+                expected: 5,
+                actual: 3
+            })
+        ));
+        assert!(matches!(
+            FlowFile::from_reader_async_with_limits(
+                bytes.as_slice(),
+                Limits::recommended().with_max_content_len(4)
+            )
+            .await,
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
     }
 
     #[tokio::test]

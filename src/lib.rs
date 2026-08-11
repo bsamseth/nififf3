@@ -78,11 +78,11 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 ///
 /// | | in memory | from a reader | many, concatenated |
 /// | --- | --- | --- | --- |
-/// | **parse** | [`from_bytes`] | [`parse`] | [`FlowFiles`] buffers, [`FlowFilesReader`] streams, [`parse_next`] is the primitive |
+/// | **parse** | [`from_bytes`], [`from_vec`] | [`from_reader`] buffers, [`parse`] streams | [`FlowFiles`] buffers, [`FlowFilesReader`] streams, [`parse_next`] is the primitive |
 /// | **serialize** | [`to_bytes`] | [`write_to`] | [`FlowFilesWriter`] |
 #[cfg_attr(
     feature = "tokio",
-    doc = "| **parse, async** | — | [`parse_async`] | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
+    doc = "| **parse, async** | — | [`from_reader_async`] buffers, [`parse_async`] streams | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
 )]
 #[cfg_attr(
     feature = "tokio",
@@ -94,11 +94,17 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 /// point take [`Limits`], and are what to use on untrusted input.
 ///
 /// [`from_bytes`]: Self::from_bytes
+/// [`from_vec`]: Self::from_vec
+/// [`from_reader`]: Self::from_reader
 /// [`parse`]: Self::parse
 /// [`parse_next`]: Self::parse_next
 /// [`to_bytes`]: Self::to_bytes
 /// [`write_to`]: Self::write_to
 #[cfg_attr(feature = "tokio", doc = "[`parse_async`]: Self::parse_async")]
+#[cfg_attr(
+    feature = "tokio",
+    doc = "[`from_reader_async`]: Self::from_reader_async"
+)]
 #[cfg_attr(
     feature = "tokio",
     doc = "[`parse_next_async`]: Self::parse_next_async"

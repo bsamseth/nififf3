@@ -457,6 +457,64 @@ impl<R: Read> FlowFile<R> {
 }
 
 impl FlowFile<Vec<u8>> {
+    /// Read one whole flow file from a reader, content included.
+    ///
+    /// The eager counterpart to [`parse`](FlowFile::parse), which stops at the
+    /// header and leaves the content as a reader. Use this when the content is
+    /// wanted in memory anyway: it is [`parse`](FlowFile::parse) followed by
+    /// [`into_memory`](FlowFile::into_memory), with the two error types already
+    /// reconciled, so a truncated content arrives as [`Error::SizeMismatch`]
+    /// the way [`from_bytes`](FlowFile::from_bytes) reports it.
+    ///
+    /// Exactly one flow file is read, and the reader is left positioned at the
+    /// byte after it — so unlike [`from_bytes`](FlowFile::from_bytes), which is
+    /// given a buffer that must hold one flow file and nothing else, trailing
+    /// bytes here are simply not this flow file's business. To read several in
+    /// a row, use [`FlowFiles`], which is this in a loop.
+    ///
+    /// The header is read in small increments, so wrap unbuffered sources
+    /// (files, sockets) in a [`std::io::BufReader`].
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let bytes = FlowFile::builder()
+    ///     .attribute("filename", "greeting.txt")
+    ///     .content(&b"hello"[..])
+    ///     .to_bytes();
+    ///
+    /// let flow_file = FlowFile::from_reader(bytes.as_slice())?;
+    /// assert_eq!(flow_file.content().as_slice(), b"hello");
+    /// assert_eq!(flow_file.attribute("filename"), Some("greeting.txt"));
+    /// # Ok::<(), nififf3::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`parse`](FlowFile::parse) for the header, plus
+    /// [`Error::SizeMismatch`] if the content ends before the declared
+    /// [`size`](FlowFile::size).
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
+        Self::from_reader_with_limits(reader, Limits::UNLIMITED)
+    }
+
+    /// Like [`from_reader`](Self::from_reader), but enforcing [`Limits`] on the
+    /// header. Use this for untrusted input.
+    ///
+    /// Worth more here than on [`from_bytes`](FlowFile::from_bytes): the
+    /// content is about to be buffered and a reader puts no bound on how much
+    /// of it there is, which is what
+    /// [`max_content_len`](Limits::max_content_len) is for.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_reader`](Self::from_reader), plus the limit variants —
+    /// [`Error::TooManyAttributes`], [`Error::AttributeTooLong`],
+    /// [`Error::HeaderTooLarge`] or [`Error::ContentTooLarge`].
+    pub fn from_reader_with_limits<R: Read>(reader: R, limits: Limits) -> Result<Self> {
+        Ok(FlowFile::parse_with_limits(reader, limits)?.into_memory()?)
+    }
+
     /// Serialize the flow file to a writer.
     ///
     /// The in-memory counterpart to [`write_to`](FlowFile::write_to), which is
@@ -1264,6 +1322,65 @@ mod tests {
             "the skip must notice the content ran out"
         );
         assert!(flow_files.next().unwrap().is_none(), "fused after the error");
+    }
+
+    /// The eager reader has to agree with the two buffer-based entry points
+    /// exactly, since the only difference is meant to be where the bytes come
+    /// from.
+    #[test]
+    fn from_reader_matches_from_bytes() {
+        let bytes = sample_bytes();
+        assert_eq!(
+            FlowFile::from_reader(bytes.as_slice()).unwrap(),
+            FlowFile::from_bytes(&bytes).unwrap()
+        );
+
+        // A truncated content is the same structured error, not `Io` wrapping
+        // it -- the reconciliation is the point of the method.
+        let truncated = &bytes[..bytes.len() - 2];
+        assert!(matches!(
+            FlowFile::from_reader(truncated),
+            Err(Error::SizeMismatch {
+                expected: 5,
+                actual: 3
+            })
+        ));
+
+        // Limits reach the header, as on every other parsing entry point.
+        assert!(matches!(
+            FlowFile::from_reader_with_limits(
+                bytes.as_slice(),
+                Limits::recommended().with_max_content_len(4)
+            ),
+            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+        ));
+    }
+
+    /// Where it deliberately differs: a reader may hold more than one flow
+    /// file, so trailing bytes are not this one's problem, and the reader is
+    /// left on the byte after it.
+    #[test]
+    fn from_reader_takes_one_flow_file_and_leaves_the_rest() {
+        let mut bytes = sample_bytes();
+        bytes.extend_from_slice(b"and then something else");
+
+        let mut reader = bytes.as_slice();
+        let flow_file = FlowFile::from_reader(&mut reader).unwrap();
+        assert_eq!(flow_file.content().as_slice(), b"hello");
+        assert_eq!(reader, b"and then something else");
+
+        // Which is exactly where `from_bytes` refuses instead.
+        assert!(matches!(
+            FlowFile::from_bytes(&bytes),
+            Err(Error::TrailingData(23))
+        ));
+    }
+
+    #[test]
+    fn empty_finishes_a_build_with_no_content() {
+        let done = FlowFile::builder().attribute("k", "v").empty();
+        assert_eq!(done, FlowFile::builder().attribute("k", "v").content(Vec::new()));
+        assert_eq!(done.size(), 0);
     }
 
     #[test]
