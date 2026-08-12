@@ -1,17 +1,17 @@
 //! Generative checks over the parser.
 //!
 //! Every other test names a specific input. These two say something about all
-//! of them: hostile bytes must be *rejected* rather than panic, and anything
-//! this crate serializes must parse back identically.
+//! of them: hostile bytes must be rejected rather than cause a panic, and
+//! anything this crate serializes must parse back identically.
 //!
-//! Deterministic by construction — a fixed-seed generator rather than a
-//! fuzzing dependency — so a failure reproduces on the next run instead of
-//! being a one-off nobody can chase.
+//! They are deterministic by construction, because they use a fixed-seed
+//! generator rather than a fuzzing dependency. So a failure reproduces on the
+//! next run, instead of being a one-off nobody can chase.
 
 use nififf3::{FlowFile, FlowFiles, Limits};
 
-/// A small linear congruential generator. Not good randomness; adequate
-/// coverage, and the same sequence every run.
+/// A small linear congruential generator. The randomness is poor, but the
+/// coverage is adequate and the sequence is the same every run.
 struct Rng(u64);
 
 impl Rng {
@@ -63,14 +63,14 @@ fn plausible(rng: &mut Rng) -> Vec<u8> {
         .to_bytes()
 }
 
-/// The parser's contract for untrusted input: it may reject anything, but it
-/// may not panic, hang, or allocate beyond what the input provides.
+/// The parser's contract for untrusted input is that it may reject anything,
+/// but it may not panic, hang, or allocate beyond what the input provides.
 ///
 /// Pure noise mostly dies on the magic or on an absurd attribute count, which
-/// says little. So two thirds of these are *damaged* flow files instead — a
-/// well-formed one with bytes flipped, or cut short at an arbitrary offset —
-/// which is what carries the generator past the header and into the field
-/// lengths, the UTF-8 decoding and the declared content size.
+/// says little. So two thirds of these are damaged flow files instead: a
+/// well-formed one with bytes flipped, or one cut short at an arbitrary
+/// offset. That is what carries the generator past the header and into the
+/// field lengths, the UTF-8 decoding, and the declared content size.
 #[test]
 fn arbitrary_input_is_rejected_rather_than_fatal() {
     let mut rng = Rng(0x5eed_1234);
@@ -117,8 +117,8 @@ fn arbitrary_input_is_rejected_rather_than_fatal() {
     }
 }
 
-/// Anything this crate writes, it can read back — attributes and content
-/// alike, whatever they contain.
+/// Anything this crate writes, it can read back. That holds for attributes and
+/// content alike, whatever they contain.
 #[test]
 fn what_is_serialized_parses_back_identically() {
     let mut rng = Rng(0xd0d0_5678);

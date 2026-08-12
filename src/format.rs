@@ -1,22 +1,23 @@
 //! Encoding primitives for the FlowFile V3 binary format.
 //!
-//! Layout, matching NiFi's `FlowFilePackagerV3`:
+//! The layout matches NiFi's `FlowFilePackagerV3`:
 //!
 //! 1. Magic header: the 7 ASCII bytes `NiFiFF3`.
-//! 2. Attribute count as a *field length*.
+//! 2. Attribute count, as a field length.
 //! 3. For each attribute: key, then value, each as a field length followed
 //!    by that many UTF-8 bytes.
-//! 4. Content size as an 8-byte big-endian integer.
+//! 4. Content size, as an 8-byte big-endian integer.
 //! 5. The content bytes.
 //!
-//! A *field length* is 2 bytes big-endian; values >= 0xFFFF are written as
-//! the marker `0xFF 0xFF` followed by the value as 4 bytes big-endian.
+//! A field length is 2 bytes big-endian. A value of 0xFFFF or above is
+//! written as the marker `0xFF 0xFF`, followed by the value as 4 bytes
+//! big-endian.
 //!
-//! The extended form encodes a `u32`, but NiFi reads it into a Java `int`, so
-//! a length at or above `i32::MAX` comes back negative there and fails on the
-//! array allocation. The interoperable ceiling is half the encodable one —
-//! which matters to nobody with a sane attribute, and is worth knowing before
-//! trusting the 4 GiB the format appears to offer.
+//! The extended form encodes a `u32`, but NiFi reads it into a Java `int`. So
+//! a length at or above `i32::MAX` comes back negative there, and fails on the
+//! array allocation. The interoperable ceiling is half the encodable one. No
+//! ordinary attribute comes near either, but the format appears to offer 4
+//! GiB, and only 2 GiB of that travels.
 
 use std::collections::HashMap;
 
@@ -40,19 +41,19 @@ pub(crate) fn write_string(buf: &mut Vec<u8>, value: &str) {
     buf.extend_from_slice(value.as_bytes());
 }
 
-/// How many bytes [`write_field_len`] writes for `len`: two, or six in the
-/// extended form.
+/// How many bytes [`write_field_len`] writes for `len`. That is two bytes, or
+/// six in the extended form.
 const fn field_len_bytes(len: usize) -> usize {
     if len < MAX_VALUE_2_BYTES { 2 } else { 6 }
 }
 
 /// The exact number of bytes [`encode_header`] will produce.
 ///
-/// Cheap — a pass over the attributes doing arithmetic — and worth a pass,
-/// because it lets both a header buffer and a whole serialized flow file be
-/// allocated once at the right size instead of grown into. It is also what
-/// [`FlowFile::serialized_len`](crate::FlowFile::serialized_len) answers,
-/// which is the reason it is a function rather than a local sum.
+/// This costs one pass over the attributes doing arithmetic, and the pass pays
+/// for itself. A header buffer and a whole serialized flow file can both be
+/// allocated once at the right size, rather than grown into. It is also the
+/// answer [`FlowFile::serialized_len`](crate::FlowFile::serialized_len) gives,
+/// so it lives here rather than being written out again at each site.
 pub(crate) fn header_len(attributes: &HashMap<String, String>) -> usize {
     let fields: usize = attributes
         .iter()
@@ -63,21 +64,21 @@ pub(crate) fn header_len(attributes: &HashMap<String, String>) -> usize {
     MAGIC.len() + field_len_bytes(attributes.len()) + fields + size_of::<u64>()
 }
 
-/// Serialize the header (everything before the content bytes).
+/// Serialize the header, meaning everything before the content bytes.
 ///
-/// Attributes are written in sorted key order so the output is
-/// deterministic; NiFi itself does not require any particular order.
+/// Attributes are written in sorted key order, so the output is
+/// deterministic. NiFi itself accepts any order.
 pub(crate) fn encode_header(attributes: &HashMap<String, String>, size: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(header_len(attributes));
     encode_header_into(&mut buf, attributes, size);
     buf
 }
 
-/// [`encode_header`], appending to a buffer the caller has already sized.
+/// Serialize the header into a buffer the caller has already sized.
 ///
-/// For serializing a whole flow file into one allocation: the header and the
-/// content go into the same buffer rather than the header into its own and
-/// then a copy.
+/// Use this to serialize a whole flow file into one allocation. The header and
+/// the content go into the same buffer, so the header does not need a buffer
+/// of its own and a copy out of it.
 pub(crate) fn encode_header_into(
     buf: &mut Vec<u8>,
     attributes: &HashMap<String, String>,
@@ -85,12 +86,13 @@ pub(crate) fn encode_header_into(
 ) {
     buf.extend_from_slice(&MAGIC);
     write_field_len(buf, attributes.len());
-    // Taken as pairs rather than as keys to look up again: sorting borrowed
-    // entries costs one small allocation, while sorting the keys and indexing
-    // the map costs a hash and a probe per attribute, which for a wide header
-    // is most of the work of writing it. `sort_unstable` because map keys are
-    // distinct, so there are no equal elements for stability to preserve —
-    // and unlike `sort` it needs no scratch buffer of its own.
+    // Taken as pairs rather than as keys to look up again. Sorting borrowed
+    // entries costs one small allocation. Sorting the keys and indexing the
+    // map costs a hash and a probe per attribute, and on a header with many
+    // attributes that is most of the work of writing one. The sort is
+    // `sort_unstable` because map keys are distinct, so there are no equal
+    // elements whose order stability could preserve. It also needs no scratch
+    // buffer of its own, where `sort` does.
     let mut entries: Vec<(&str, &str)> = attributes
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -126,9 +128,10 @@ mod tests {
         assert_eq!(field_len(70_000), [0xFF, 0xFF, 0x00, 0x01, 0x11, 0x70]);
     }
 
-    /// The predicted length has to be the produced length exactly, or every
-    /// buffer sized from it either reallocates or over-reserves — and
-    /// `serialized_len` lies to callers computing a `Content-Length`.
+    /// The predicted length has to be the produced length exactly. If it is
+    /// not, every buffer sized from it either reallocates or over-reserves,
+    /// and `serialized_len` gives the wrong answer to a caller computing a
+    /// `Content-Length`.
     #[test]
     fn the_predicted_header_length_is_the_produced_one() {
         let cases: [Vec<(String, String)>; 5] = [
@@ -157,7 +160,8 @@ mod tests {
     }
 
     /// A header with enough attributes to cross the two-byte boundary on the
-    /// *count* as well, which is a different branch of the same arithmetic.
+    /// attribute count as well. That is a different branch of the same
+    /// arithmetic from the one the case above covers.
     #[test]
     fn the_predicted_length_holds_across_the_count_boundary() {
         for count in [0xFFFE, 0xFFFF, 0x1_0000] {

@@ -39,10 +39,11 @@ pub use async_io::{
     FlowFilesAsync, FlowFilesReaderAsync, FlowFilesWriterAsync, StreamedContentAsync,
 };
 
-/// The [`Stream`] trait
-/// [`FlowFilesAsync::into_stream`] returns, re-exported so that naming the
-/// bound does not mean adding a `futures-core` dependency of your own — and
-/// one whose version has to match this crate's.
+/// The [`Stream`] trait [`FlowFilesAsync::into_stream`] returns.
+///
+/// It is re-exported so that naming the bound does not mean adding a
+/// `futures-core` dependency of your own, whose version would then have to
+/// match this crate's.
 #[cfg(feature = "stream")]
 pub use futures_core::Stream;
 
@@ -72,9 +73,9 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 ///
 /// # Where to start
 ///
-/// That genericity spreads the entry points over several `impl` blocks below,
-/// each headed by a `Self` type rather than by what it is for. This is the
-/// index:
+/// Being generic spreads the entry points over several `impl` blocks below,
+/// and each block is headed by a `Self` type rather than by what it is for.
+/// This table indexes them by what they do:
 ///
 /// | | in memory | from a reader | many, concatenated |
 /// | --- | --- | --- | --- |
@@ -82,16 +83,17 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 /// | **serialize** | [`to_bytes`] | [`write_to`] | [`FlowFilesWriter`] |
 #[cfg_attr(
     feature = "tokio",
-    doc = "| **parse, async** | — | [`from_reader_async`] buffers, [`parse_async`] streams | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
+    doc = "| **parse, async** | | [`from_reader_async`] buffers, [`parse_async`] streams | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
 )]
 #[cfg_attr(
     feature = "tokio",
-    doc = "| **serialize, async** | — | [`write_to_async`] | [`FlowFilesWriterAsync`] |"
+    doc = "| **serialize, async** | | [`write_to_async`] | [`FlowFilesWriterAsync`] |"
 )]
 ///
-/// [`builder`](Self::builder) creates one from scratch, `derive` from another flow file's attributes, and `fragments`
-/// splits one into many. The `*_with_limits` variants of every parsing entry
-/// point take [`Limits`], and are what to use on untrusted input.
+/// [`builder`](Self::builder) creates a flow file from scratch, `derive`
+/// creates one from another flow file's attributes, and `fragments` splits one
+/// into many. Every parsing entry point has a `*_with_limits` variant that
+/// takes [`Limits`], and those are what to use on untrusted input.
 ///
 /// [`from_bytes`]: Self::from_bytes
 /// [`from_vec`]: Self::from_vec
@@ -142,10 +144,10 @@ impl<R> FlowFile<R> {
     ///
     /// This is the single source of truth for how many content bytes every
     /// serializer writes and every reader-based operation consumes. Every
-    /// constructor in this crate keeps it in step with the content; the one
-    /// way to break that is [`map_content`](Self::map_content) with a
-    /// function that changes the length, which is what
-    /// [`with_size`](Self::with_size) is for.
+    /// constructor in this crate keeps it in step with the content. The one
+    /// way to break that is [`map_content`](Self::map_content) with a function
+    /// that changes the length, and [`with_size`](Self::with_size) is how you
+    /// put it right again.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -170,9 +172,9 @@ impl<R> FlowFile<R> {
 
     /// The attributes of the flow file.
     ///
-    /// For a single value, [`attribute`](Self::attribute) says what a missing
-    /// one means instead of panicking; the [`attr`] module names the
-    /// well-known keys.
+    /// For a single value, use [`attribute`](Self::attribute). It returns
+    /// `None` for a missing key, where indexing this map panics. The [`attr`]
+    /// module names the well-known keys.
     pub fn attributes(&self) -> &HashMap<String, String> {
         &self.attributes
     }
@@ -189,9 +191,9 @@ impl<R> FlowFile<R> {
 
     /// Mutable access to the content container.
     ///
-    /// The way to read a reader-backed flow file's content incrementally
-    /// while keeping the flow file — and so its attributes — around;
-    /// [`into_content`](Self::into_content) gives up the latter.
+    /// Use this to read a reader-backed flow file's content incrementally
+    /// while keeping the flow file itself, and so its attributes.
+    /// [`into_content`](Self::into_content) gives the flow file up instead.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -226,11 +228,11 @@ impl<R> FlowFile<R> {
     /// Build a flow file from the parts [`into_parts`](Self::into_parts)
     /// yields, for putting one back together after taking it apart.
     ///
-    /// Like [`FlowFileBuilder::reader`], this takes `size` on trust: it must be
-    /// the number of bytes `content` will yield, since it is what every
-    /// serializer declares and every reader-based operation consumes. Prefer
-    /// [`FlowFile::builder`] when building one from scratch — the builder's
-    /// finishers derive the size rather than asking for it.
+    /// This takes `size` on trust, as [`FlowFileBuilder::reader`] does. It must
+    /// be the number of bytes `content` will yield, because it is what every
+    /// serializer declares and every reader-based operation consumes. When you
+    /// build a flow file from scratch, prefer [`FlowFile::builder`], whose
+    /// finishers derive the size instead of asking you for it.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -253,9 +255,9 @@ impl<R> FlowFile<R> {
 
     /// Transform the content container, keeping size and attributes.
     ///
-    /// The declared [`size`](Self::size) is carried over unchanged, so `f`
-    /// must produce a container holding the same *number of bytes* — wrapping
-    /// one reader in another, as `Cursor::new` or `BufReader::new` do.
+    /// The declared [`size`](Self::size) is carried over unchanged, so `f` must
+    /// produce a container holding the same number of bytes. Wrapping one
+    /// reader in another does that, as `Cursor::new` and `BufReader::new` do.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -265,9 +267,9 @@ impl<R> FlowFile<R> {
     /// assert_eq!(flow_file.size(), 2);
     /// ```
     ///
-    /// For a transform that changes the length — a decoder, a decompressor —
-    /// chain [`with_size`](Self::with_size), since the format needs the new
-    /// size before it can write any of the new content:
+    /// For a transform that changes the length, such as a decoder or a
+    /// decompressor, chain [`with_size`](Self::with_size). The format needs the
+    /// new size before it can write any of the new content:
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -290,10 +292,10 @@ impl<R> FlowFile<R> {
     /// Transform the content container and its declared [`size`](Self::size)
     /// together, for a transform that changes the length.
     ///
-    /// The checked form of [`map_content`](Self::map_content) plus
-    /// [`with_size`](Self::with_size): `f` returns the new container *and* how
-    /// many bytes it holds, so the two cannot drift apart by forgetting the
-    /// second call.
+    /// `f` returns the new container along with how many bytes it holds, so the
+    /// size and the content cannot drift apart. Doing the same thing as
+    /// [`map_content`](Self::map_content) followed by
+    /// [`with_size`](Self::with_size) leaves you to remember the second call.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -321,11 +323,11 @@ impl<R> FlowFile<R> {
     /// Declare a different content [`size`](Self::size), keeping attributes
     /// and content.
     ///
-    /// Needed after a [`map_content`](Self::map_content) that changed the
-    /// content's length, and only then: everything else in this crate keeps
-    /// the size correct on its own. Declaring a size the content does not
-    /// match is how a flow file is corrupted, so `size` must be the exact
-    /// number of bytes the new container yields.
+    /// You need this after a [`map_content`](Self::map_content) that changed
+    /// the content's length, and at no other time, because everything else in
+    /// this crate keeps the size correct on its own. `size` must be the exact
+    /// number of bytes the new container yields. Declaring a size the content
+    /// does not match is how a flow file becomes corrupt.
     #[must_use]
     pub fn with_size(mut self, size: u64) -> Self {
         self.size = size;
@@ -335,10 +337,10 @@ impl<R> FlowFile<R> {
     /// Start building a new flow file carrying this one's attributes.
     ///
     /// The [`uuid`](attr::UUID) attribute is replaced with a freshly generated
-    /// one, since in NiFi it identifies a single flow file — use
+    /// one, because in NiFi it identifies a single flow file. Use
     /// [`derive_keep_uuid`](Self::derive_keep_uuid) to copy it verbatim. Every
-    /// other attribute is inherited as-is; set one on the returned builder to
-    /// override it, or
+    /// other attribute is inherited as it is. Set one on the returned builder
+    /// to override it, or call
     /// [`without_attribute`](FlowFileBuilder::without_attribute) to drop it.
     ///
     /// Only the attributes are borrowed, so the parent stays available to have
@@ -369,11 +371,12 @@ impl<R> FlowFile<R> {
             .attribute(attr::UUID, uuid::Uuid::new_v4().to_string())
     }
 
-    /// Like `derive`, but copying the [`uuid`](attr::UUID) attribute unchanged
-    /// rather than generating a new one.
+    /// Start building a new flow file carrying this one's attributes,
+    /// including its [`uuid`](attr::UUID) unchanged.
     ///
-    /// Appropriate when the result represents the *same* flow file rather
-    /// than a new one — a re-encoded or re-compressed payload, say.
+    /// Use it when the result represents the same flow file rather than a new
+    /// one, such as a re-encoded or re-compressed payload. `derive` generates
+    /// a fresh `uuid` instead.
     pub fn derive_keep_uuid(&self) -> FlowFileBuilder {
         FlowFileBuilder::new().attributes(self.attributes.clone())
     }
@@ -406,15 +409,17 @@ impl<R> FlowFile<R> {
     /// How many bytes this flow file serializes to: the header plus
     /// [`size`](Self::size).
     ///
-    /// Computed from the attributes and the declared size, without serializing
-    /// anything — so it answers the question a `Content-Length` header, a
-    /// size-limited sink, or a pre-sized buffer needs answered *before* the
-    /// bytes exist. Exact, not an estimate: it is what [`to_bytes`] produces
-    /// and what [`write_to`] and [`write_bytes_to`] write.
+    /// It is computed from the attributes and the declared size, without
+    /// serializing anything. So it answers the question a `Content-Length`
+    /// header, a size-limited sink, or a pre-sized buffer has to answer before
+    /// the bytes exist. The answer is exact rather than an estimate: it is the
+    /// length [`to_bytes`] produces, and the number of bytes [`write_to`] and
+    /// [`write_bytes_to`] write.
     ///
-    /// Available for any content container, since neither part depends on the
-    /// content itself — including a reader-backed flow file that has not been
-    /// read, which is the case where it is least replaceable.
+    /// Neither part of the sum depends on the content itself, so this works
+    /// for any content container. That includes a reader-backed flow file that
+    /// has not been read, and there is no other way to measure one of those
+    /// without reading it.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -437,9 +442,9 @@ impl<R> FlowFile<R> {
     ///
     /// # Panics
     ///
-    /// Never — but note that an attribute longer than `u32::MAX` bytes is
-    /// counted here and rejected by the serializers, so a length this reports
-    /// is not on its own a promise that the flow file can be written.
+    /// This never panics. Note though that an attribute longer than `u32::MAX`
+    /// bytes is counted here and rejected by the serializers. So a length this
+    /// reports is not on its own a promise that the flow file can be written.
     ///
     /// [`to_bytes`]: FlowFile::to_bytes
     /// [`write_to`]: FlowFile::write_to
@@ -454,8 +459,8 @@ impl<R> FlowFile<R> {
     ///
     /// If an attribute key or value is longer than `u32::MAX` bytes. A field
     /// length in this format is at most 4 bytes, so such an attribute cannot
-    /// be written at all — the builder accepts any `String`, and this is
-    /// where the format's ceiling is enforced.
+    /// be written at all. The builder accepts any `String`, and this is where
+    /// the format's ceiling is enforced.
     pub(crate) fn header_bytes(&self) -> Vec<u8> {
         format::encode_header(&self.attributes, self.size)
     }
@@ -497,9 +502,9 @@ impl FlowFile<Vec<u8>> {
     /// header. Use this for untrusted input.
     ///
     /// The buffer already bounds how much there is to read, so this matters
-    /// less here than for the streaming parsers — but a 1 KiB buffer can
-    /// still declare tens of thousands of attributes, and
-    /// [`max_content_len`](Limits::max_content_len) rejects an oversized
+    /// less here than it does for the streaming parsers. Even so, a 1 KiB
+    /// buffer can declare tens of thousands of attributes.
+    /// [`max_content_len`](Limits::max_content_len) also rejects an oversized
     /// declared size without walking the header first.
     ///
     /// # Errors
@@ -526,11 +531,11 @@ impl FlowFile<Vec<u8>> {
     /// Parse a flow file from a `Vec` holding exactly one, reusing its
     /// allocation for the content.
     ///
-    /// The owning counterpart to [`from_bytes`](Self::from_bytes), which
-    /// copies the content out of the slice it is given. Here the header is
-    /// parsed and then removed from the front of `bytes`, leaving the content
-    /// in the same allocation it arrived in — worth having when the bytes are
-    /// already owned, which is the common case for anything read into memory.
+    /// The header is parsed and then removed from the front of `bytes`, so the
+    /// content stays in the allocation it arrived in. Use this when the bytes
+    /// are already owned, which is the common case for anything read into
+    /// memory. [`from_bytes`](Self::from_bytes) copies the content out of the
+    /// slice it is given instead.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -581,12 +586,12 @@ impl FlowFile<Vec<u8>> {
 
     /// Serialize the flow file to the binary V3 format.
     ///
-    /// The whole flow file, header included — as against
-    /// [`into_memory`](Self::into_memory), which reads a reader-backed
-    /// *content* into memory and serializes nothing.
+    /// This writes the whole flow file, header included.
+    /// [`into_memory`](Self::into_memory) does something different: it reads a
+    /// reader-backed content into memory, and serializes nothing.
     ///
-    /// Declares [`size`](Self::size) bytes of content, the same value
-    /// [`write_to`](Self::write_to) would stream.
+    /// The output declares [`size`](Self::size) bytes of content, the same
+    /// value [`write_to`](Self::write_to) would stream.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -602,11 +607,11 @@ impl FlowFile<Vec<u8>> {
     /// in this format is at most 4 bytes, so such an attribute cannot be
     /// written at all.
     ///
-    /// Also if `size` disagrees with the content's actual length — only
-    /// reachable by breaking [`map_content`](Self::map_content)'s contract,
-    /// and checked in every build rather than only in debug, because the
-    /// alternative is emitting a flow file that only the reader at the far end
-    /// finds to be corrupt.
+    /// It also panics if `size` disagrees with the content's actual length.
+    /// You can only reach that by breaking
+    /// [`map_content`](Self::map_content)'s contract. The check runs in every
+    /// build rather than only in debug, because the alternative is emitting a
+    /// flow file that only the reader at the far end finds to be corrupt.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         assert_eq!(
@@ -625,10 +630,11 @@ impl FlowFile<Vec<u8>> {
     /// Transform in-memory content, deriving the new [`size`](Self::size) from
     /// what `f` returns.
     ///
-    /// The common length-changing case — decompress, re-encode, rewrite —
-    /// where the length is simply the new content's, so nothing has to declare
-    /// it. Use [`map_content_sized`](Self::map_content_sized) when the result
-    /// is a reader whose length only the caller knows.
+    /// This is the common length-changing case, such as decompressing,
+    /// re-encoding, or rewriting. The new length is simply the new content's,
+    /// so nothing has to declare it. Use
+    /// [`map_content_sized`](Self::map_content_sized) when the result is a
+    /// reader whose length only you know.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -673,7 +679,7 @@ impl FlowFile<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// A length-changing `map_content` needs `with_size`; once it has one,
+    /// A length-changing `map_content` needs `with_size`. Once it has one,
     /// every serializer agrees on how much content there is.
     #[test]
     fn with_size_keeps_the_serializers_in_step() {
@@ -711,9 +717,9 @@ mod tests {
         assert_eq!(flow_file.to_bytes(), streamed);
     }
 
-    /// Checked in every build, not just debug: a flow file whose declared
-    /// size disagrees with its content serializes to bytes that only the
-    /// reader at the far end discovers to be corrupt.
+    /// The check runs in every build, not only in debug. A flow file whose
+    /// declared size disagrees with its content serializes to bytes that only
+    /// the reader at the far end discovers to be corrupt.
     #[test]
     #[should_panic(expected = "declared size does not match the content")]
     fn to_bytes_refuses_a_size_that_disagrees_with_the_content() {
@@ -723,7 +729,7 @@ mod tests {
             .to_bytes();
     }
 
-    /// The point of the sized forms: the size follows the content instead of
+    /// The sized forms exist so that the size follows the content, instead of
     /// being a second thing to remember.
     #[test]
     fn the_sized_maps_keep_the_size_with_the_content() {

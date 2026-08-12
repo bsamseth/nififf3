@@ -1,4 +1,4 @@
-//! One flow file in, many flow files out — synchronously.
+//! One flow file in, many flow files out, synchronously.
 //!
 //! Splits a record-per-line payload into a flow file per record, numbering
 //! them with NiFi's fragment attributes so `merge.rs` (or NiFi's
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let records: Vec<&[u8]> = parent.content().split(|byte| *byte == b'\n').collect();
 
-    // The count is optional — supply it only when it is known up front, as it
+    // The count is optional. Supply it only when it is known up front, as it
     // is here. Each part inherits the parent's attributes, gets its own
     // `uuid`, and is numbered from 1.
     let mut parts = parent.fragments().with_count(records.len() as u64);

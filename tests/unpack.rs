@@ -113,7 +113,7 @@ async fn unpack(
 /// Reading an entry to the end first means a truncated entry is discovered
 /// while nothing has been committed for it yet, so it can be reported as an
 /// error flow file instead of poisoning the response. The cost is holding one
-/// entry in memory at a time — the trade the streaming [`unpack`] avoids.
+/// entry in memory at a time, which the streaming [`unpack`] does not pay.
 async fn unpack_lenient(
     StrictFlowFileRequest(parent): StrictFlowFileRequest,
 ) -> Result<FlowFilesResponse, Error> {
@@ -158,8 +158,8 @@ async fn unpack_lenient(
                 }
             };
         }
-        // As in `unpack`: the bundle declares its own size on the way out, so
-        // what did arrive is still mergeable — the failure report included.
+        // As in `unpack`, the bundle declares its own size on the way out,
+        // so what did arrive is still mergeable, the failure report included.
         writer.write_bytes(&parts.terminate()).await?;
         Ok(())
     }))

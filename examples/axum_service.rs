@@ -2,13 +2,14 @@
 //!
 //! Two handlers on one `Router`:
 //!
-//! - `POST /transform` — one flow file in, one out. `StrictFlowFileRequest`
-//!   parses the header and streams the body; the answer is a flow file, which
-//!   is itself an `IntoResponse`.
-//! - `POST /split` — one flow file in, many out, via `FlowFilesResponse`.
+//! - `POST /transform` takes one flow file in and sends one out.
+//!   `StrictFlowFileRequest` parses the header and streams the body, and the
+//!   answer is a flow file, which is itself an `IntoResponse`.
+//! - `POST /split` takes one flow file in and sends many out, through
+//!   `FlowFilesResponse`.
 //!
-//! The router is driven in-process with `tower`'s `oneshot` so the example
-//! runs without binding a port; in a real service the same `Router` goes to
+//! The router is driven in-process with `tower`'s `oneshot`, so the example
+//! runs without binding a port. In a real service the same `Router` goes to
 //! `axum::serve`.
 //!
 //!     cargo run --features axum --example axum_service
@@ -33,12 +34,12 @@ async fn transform(
         .into_reader())
 }
 
-/// One in, many out: a flow file per record.
+/// One flow file in, many out: one per record.
 ///
 /// Everything that can fail the request as a whole is checked before the
-/// `FlowFilesResponse` is returned — past that point the status is already
-/// 200, so a problem with one record belongs in the body as attributes on its
-/// own flow file.
+/// `FlowFilesResponse` is returned. Past that point the status is already 200,
+/// so a problem with one record belongs in the body, as attributes on a flow
+/// file of its own.
 async fn split(
     StrictFlowFileRequest(flow_file): StrictFlowFileRequest,
 ) -> Result<FlowFilesResponse, Error> {

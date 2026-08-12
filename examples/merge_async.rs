@@ -1,4 +1,4 @@
-//! Many flow files in, one flow file out — asynchronously.
+//! Many flow files in, one flow file out, asynchronously.
 //!
 //! The `tokio` mirror of `merge.rs`. `FlowFilesAsync` reads a concatenated
 //! stream one flow file at a time, so the parts arrive as they come off the

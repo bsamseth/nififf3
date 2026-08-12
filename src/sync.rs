@@ -21,9 +21,9 @@ fn read_field_len(reader: &mut impl Read) -> io::Result<usize> {
 
 /// What a single attribute key or value is still allowed to spend.
 ///
-/// Two limits bear on one field, and both have to be applied to the *declared*
-/// length rather than to what arrives, or the field they are meant to bound is
-/// read into memory before either fires.
+/// Two limits bear on one field. Both have to be applied to the length the
+/// field declares, rather than to what arrives. Otherwise the field they are
+/// meant to bound is read into memory before either one fires.
 #[derive(Clone, Copy)]
 pub(crate) struct Budget {
     /// [`Limits::max_attribute_len`], which applies to each field alone.
@@ -49,11 +49,11 @@ impl Budget {
         {
             return Err(Error::AttributeTooLong { len, limit });
         }
-        // Against the projected total, not the running one: a single attribute
-        // larger than the whole budget has to be refused on its declaration.
-        // Checking only after it had been read would let one field overshoot
-        // the header limit by its own size, which for the caller who sets no
-        // per-attribute limit is any size at all.
+        // Checked against the projected total rather than the running one, so
+        // that a single attribute larger than the whole budget is refused on
+        // its declaration. Checking only after it had been read would let one
+        // field overshoot the header limit by its own size. For a caller who
+        // sets no per-attribute limit, that is any size at all.
         if let Some((spent, limit)) = self.total {
             let projected = spent.saturating_add(len);
             if projected > limit {
@@ -77,23 +77,24 @@ impl Budget {
 /// How much to reserve for a declared length before any of it has arrived to
 /// justify the allocation.
 ///
-/// Nothing in this crate sizes a buffer from a declared length: a header can
+/// Nothing in this crate sizes a buffer from a declared length. A header can
 /// claim four gigabytes over a four-byte input, and allocating for the claim is
-/// the cheapest denial of service there is. But reserving *nothing*, which is
-/// what `read_to_end` does, is not free either — it starts from 32 bytes and
-/// doubles, so the bytes are copied through a sequence of allocations and land
-/// in one up to twice the size they needed.
+/// the cheapest denial of service there is. Reserving nothing at all is not
+/// free either, and that is what `read_to_end` does. It starts from 32 bytes
+/// and doubles, so the bytes are copied through a sequence of allocations and
+/// land in one up to twice the size they needed.
 ///
-/// So the first reservation is bounded by this, and every one after it by how
-/// much has already arrived — the part a header cannot fake. A lying header
-/// costs this much and no more, while anything at or under it, which is every
-/// ordinary attribute and most content, is allocated once at exactly its size.
+/// So this bounds the first reservation, and every one after it is bounded by
+/// how much has already arrived. Bytes that have arrived are the part a header
+/// cannot fake. A lying header costs this much and no more. Anything at or
+/// under this size is allocated once, at exactly its size, and that covers
+/// every ordinary attribute and most content.
 pub(crate) const RESERVE_AHEAD: u64 = 64 * 1024;
 
 /// Read up to `len` bytes into `buf`, returning how many arrived.
 ///
-/// Falling short is not an error here — the callers report it differently — so
-/// this returns the count and leaves that to them.
+/// Falling short is not an error here, because the callers report it in
+/// different ways. This returns the count and leaves that to them.
 ///
 /// See [`RESERVE_AHEAD`] for why this is not `take(len).read_to_end(buf)`.
 pub(crate) fn read_declared(
@@ -104,11 +105,12 @@ pub(crate) fn read_declared(
     let mut done = 0u64;
     while done < len {
         // Never more than what is left, and never more than has already been
-        // delivered — so the reservation is backed by bytes, not by a claim.
+        // delivered, so bytes back the reservation rather than a claim.
         let step = (len - done).min(done.max(RESERVE_AHEAD));
         let step = usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
-        // Exact rather than amortized: the sizes here already double, so
-        // leaving the growth to the allocator would overshoot the final one.
+        // Reserved exactly rather than amortized. The sizes here already
+        // double, so leaving the growth to the allocator would overshoot the
+        // final one.
         buf.reserve_exact(step);
         let read = reader.take(step as u64).read_to_end(buf)?;
         if read == 0 {
@@ -178,13 +180,12 @@ pub(crate) fn parse_header(
 impl<R: Read> FlowFile<io::Take<R>> {
     /// Parse a flow file from a reader, consuming only the header.
     ///
-    /// The returned flow file's content is the reader, limited to the
-    /// declared content size. Reading fewer bytes than [`size`] before the
-    /// reader ends means the input was truncated; [`FlowFile::into_memory`]
-    /// checks this for you.
+    /// The returned flow file's content is the reader, limited to the declared
+    /// content size. If the reader ends before [`size`] bytes have been read,
+    /// the input was truncated. [`FlowFile::into_memory`] checks that for you.
     ///
-    /// The header is read in small increments, so wrap unbuffered sources
-    /// (files, sockets) in a [`std::io::BufReader`].
+    /// The header is read in small increments, so wrap an unbuffered source in
+    /// a [`std::io::BufReader`]. A file or a socket is unbuffered.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -250,26 +251,26 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     ///
     /// # Every flow file's content must be consumed
     ///
-    /// The returned flow file's content *is* the reader, positioned at the
+    /// The returned flow file's content is the reader itself, positioned at the
     /// first content byte. Nothing else can read the stream until that content
-    /// is dealt with, and the next flow file begins where it ends — so each one
-    /// has to be consumed before the next is parsed:
+    /// is dealt with, and the next flow file begins where it ends. So you have
+    /// to consume each content before parsing the next flow file:
     ///
-    /// - [`into_memory`](FlowFile::into_memory) reads it into a buffer;
-    /// - [`write_to`](FlowFile::write_to) copies it straight out;
-    /// - [`skip_content`](FlowFile::skip_content) throws it away, which is what
-    ///   to call when only the attributes were wanted.
+    /// - [`into_memory`](FlowFile::into_memory) reads it into a buffer.
+    /// - [`write_to`](FlowFile::write_to) copies it straight out.
+    /// - [`skip_content`](FlowFile::skip_content) discards it, which is what to
+    ///   call when only the attributes were wanted.
     ///
-    /// Holding a flow file past the next call is a compile error — it borrows
-    /// the reader — but *dropping* one with its content unread is not, and that
-    /// is the mistake to watch for. The reader is then left where the content
-    /// starts, so the next call parses the content as though it were a flow
-    /// file. Usually that is an error. It is worse when it is not: a flow file
-    /// whose content begins with a valid header — an envelope carrying another
-    /// flow file, say — yields something plausible that was never sent. What
-    /// happens after that depends on the rest of the content, so the damage
-    /// ranges from one phantom record in a stream that otherwise reads fine to
-    /// losing everything that followed.
+    /// Holding a flow file past the next call is a compile error, because it
+    /// borrows the reader. Dropping one with its content unread compiles, and
+    /// goes wrong at run time instead. The reader is then left where the
+    /// content starts, so the next call parses the content as though it were a
+    /// flow file. Usually that fails with an error. It does not fail when the
+    /// content itself begins with a valid header, which happens when one flow
+    /// file carries another. In that case you get back a plausible flow file
+    /// that was never sent. What happens after that depends on the rest of the
+    /// content, so the damage ranges from one phantom record in a stream that
+    /// otherwise reads fine, to losing everything that followed.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -289,24 +290,24 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// assert_eq!(seen, ["envelope", "second"]);
     ///
     /// // Without that `skip_content`, the second read starts inside the
-    /// // envelope's content and finds the flow file nested in it — while the
-    /// // one that really came next is never reached.
+    /// // envelope's content and finds the flow file nested in it. The one
+    /// // that really came next is never reached.
     /// # Ok::<(), nififf3::Error>(())
     /// ```
     ///
-    /// Two types remove the question entirely, and one of them should usually
-    /// be preferred to calling this directly: [`FlowFiles`] reads each content
-    /// into memory as it goes, and [`FlowFilesReader`] streams the content but
-    /// keeps the stream positioned for you, skipping whatever a flow file left
-    /// unread. `parse_next` is the primitive underneath them — reach for it
-    /// when you need the reader back between flow files, or are driving the
-    /// stream yourself.
+    /// Two types do that bookkeeping for you, and one of them is usually a
+    /// better choice than calling this directly. [`FlowFiles`] reads each
+    /// content into memory as it goes. [`FlowFilesReader`] streams the content
+    /// and keeps the stream positioned for you, skipping whatever a flow file
+    /// left unread. `parse_next` is the primitive underneath them. Reach for it
+    /// when you need the reader back between flow files, or when you are
+    /// driving the stream yourself.
     ///
     /// # Errors
     ///
     /// As [`FlowFile::parse`]. Note that a stream ending part-way through a
-    /// header is [`Error::Io`], not `Ok(None)` — only a clean boundary ends
-    /// the iteration.
+    /// header is [`Error::Io`] rather than `Ok(None)`, because only a clean
+    /// boundary ends the iteration.
     pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
         Self::parse_next_with_limits(reader, Limits::UNLIMITED)
     }
@@ -322,7 +323,7 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
         let mut first = [0u8; 1];
         loop {
             match reader.read(&mut first) {
-                // A one-byte buffer, so this is the end of the stream: a
+                // A one-byte buffer, so this is the end of the stream. A
                 // reader returning `Ok(0)` with room to fill is buggy, and
                 // retrying one would spin rather than recover.
                 Ok(0) => return Ok(None),
@@ -344,10 +345,10 @@ impl<R: Read> FlowFile<R> {
     /// Serialize the flow file to a writer, reading exactly [`size`] bytes
     /// from the content reader.
     ///
-    /// Returns the number of content bytes copied. This consumes the flow
-    /// file, because it is a one-shot: the content reader is left exhausted,
-    /// so a second call would write a second header and then fail — after
-    /// committing those bytes to the stream. Read whatever you need from
+    /// Returns the number of content bytes copied. It takes `self`, so you can
+    /// only call it once. It reads the content to the end, and a second call
+    /// would write a second header and then fail. By that point the first write
+    /// has already gone out. Read whatever you need from
     /// [`attributes`](FlowFile::attributes) first.
     ///
     /// ```
@@ -363,12 +364,12 @@ impl<R: Read> FlowFile<R> {
     ///
     /// # Errors
     ///
-    /// Only I/O: nothing here inspects the flow file's structure. A content
-    /// reader that ends before `size` bytes is
+    /// Only I/O, because nothing here inspects the flow file's structure. A
+    /// content reader that ends before `size` bytes gives an
     /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
-    /// [`Error::SizeMismatch`]; anything else comes from the writer. Either
-    /// way the header — and whatever content was copied before the failure —
-    /// has already been written.
+    /// [`Error::SizeMismatch`], and anything else comes from the writer. Either
+    /// way, the header has already been written, along with whatever content
+    /// was copied before the failure.
     ///
     /// # Panics
     ///
@@ -387,11 +388,11 @@ impl<R: Read> FlowFile<R> {
 
     /// Discard the content, consuming exactly [`size`] bytes from the reader.
     ///
-    /// What to call when only the attributes were wanted. For a flow file
-    /// parsed out of a stream by [`parse_next`](FlowFile::parse_next), leaving
-    /// the content unread is not free: the reader stays where the content
-    /// begins, and the next parse starts from there. See that method for what
-    /// goes wrong.
+    /// Call this when only the attributes were wanted. For a flow file parsed
+    /// out of a stream by [`parse_next`](FlowFile::parse_next), leaving the
+    /// content unread has a cost: the reader stays where the content begins,
+    /// and the next parse starts from there. See that method for what goes
+    /// wrong.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -427,17 +428,17 @@ impl<R: Read> FlowFile<R> {
 
     /// Read the content to completion, producing an in-memory flow file.
     ///
-    /// The inverse of [`into_reader`](FlowFile::into_reader), and not to be
-    /// confused with [`to_bytes`](FlowFile::to_bytes): this moves the *content*
-    /// into memory and serializes nothing, while `to_bytes` serializes the
-    /// whole flow file — header and all — to the wire format.
+    /// This moves the content into memory, and serializes nothing. It is the
+    /// inverse of [`into_reader`](FlowFile::into_reader). The similarly named
+    /// [`to_bytes`](FlowFile::to_bytes) does something else: it serializes the
+    /// whole flow file, header and all, to the wire format.
     ///
-    /// Validates that exactly [`size`] bytes of content were available.
+    /// It validates that exactly [`size`] bytes of content were available.
     ///
     /// # Errors
     ///
-    /// Only I/O; the header was already validated by whatever produced this
-    /// flow file. Content that ends early is
+    /// Only I/O, because whatever produced this flow file already validated the
+    /// header. Content that ends early is
     /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
     /// [`Error::SizeMismatch`].
     ///
@@ -459,21 +460,22 @@ impl<R: Read> FlowFile<R> {
 impl FlowFile<Vec<u8>> {
     /// Read one whole flow file from a reader, content included.
     ///
-    /// The eager counterpart to [`parse`](FlowFile::parse), which stops at the
-    /// header and leaves the content as a reader. Use this when the content is
-    /// wanted in memory anyway: it is [`parse`](FlowFile::parse) followed by
+    /// Use this when you want the content in memory anyway. It is
+    /// [`parse`](FlowFile::parse) followed by
     /// [`into_memory`](FlowFile::into_memory), with the two error types already
     /// reconciled, so a truncated content arrives as [`Error::SizeMismatch`]
     /// the way [`from_bytes`](FlowFile::from_bytes) reports it.
+    /// [`parse`](FlowFile::parse) stops at the header and leaves the content as
+    /// a reader instead.
     ///
-    /// Exactly one flow file is read, and the reader is left positioned at the
-    /// byte after it — so unlike [`from_bytes`](FlowFile::from_bytes), which is
-    /// given a buffer that must hold one flow file and nothing else, trailing
-    /// bytes here are simply not this flow file's business. To read several in
-    /// a row, use [`FlowFiles`], which is this in a loop.
+    /// Exactly one flow file is read, and the reader is left on the byte after
+    /// it, so trailing bytes are not this flow file's business.
+    /// [`from_bytes`](FlowFile::from_bytes) differs there: it is given a buffer
+    /// that must hold one flow file and nothing else. To read several in a row,
+    /// use [`FlowFiles`], which is this call in a loop.
     ///
-    /// The header is read in small increments, so wrap unbuffered sources
-    /// (files, sockets) in a [`std::io::BufReader`].
+    /// The header is read in small increments, so wrap an unbuffered source in
+    /// a [`std::io::BufReader`]. A file or a socket is unbuffered.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -501,14 +503,14 @@ impl FlowFile<Vec<u8>> {
     /// Like [`from_reader`](Self::from_reader), but enforcing [`Limits`] on the
     /// header. Use this for untrusted input.
     ///
-    /// Worth more here than on [`from_bytes`](FlowFile::from_bytes): the
-    /// content is about to be buffered and a reader puts no bound on how much
-    /// of it there is, which is what
+    /// Limits matter more here than on [`from_bytes`](FlowFile::from_bytes).
+    /// The content is about to be buffered, and a reader puts no bound on how
+    /// much of it there is. That is what
     /// [`max_content_len`](Limits::max_content_len) is for.
     ///
     /// # Errors
     ///
-    /// As [`from_reader`](Self::from_reader), plus the limit variants —
+    /// As [`from_reader`](Self::from_reader), plus the limit variants:
     /// [`Error::TooManyAttributes`], [`Error::AttributeTooLong`],
     /// [`Error::HeaderTooLarge`] or [`Error::ContentTooLarge`].
     pub fn from_reader_with_limits<R: Read>(reader: R, limits: Limits) -> Result<Self> {
@@ -517,13 +519,14 @@ impl FlowFile<Vec<u8>> {
 
     /// Serialize the flow file to a writer.
     ///
-    /// The in-memory counterpart to [`write_to`](FlowFile::write_to), which is
-    /// bounded on `R: Read` and so does not apply here — `Vec<u8>` is not a
-    /// reader, and two inherent methods of the same name cannot coexist even
-    /// though only one of them could ever apply. Hence the name.
+    /// This is the in-memory counterpart to [`write_to`](FlowFile::write_to).
+    /// That method is bounded on `R: Read`, and `Vec<u8>` is not a reader, so
+    /// it does not apply here. The name differs because two inherent methods
+    /// cannot share one name, even though only one of them could ever apply.
     ///
-    /// Takes `&self` rather than consuming, since nothing is exhausted by
-    /// writing in-memory content. Returns the number of content bytes written.
+    /// It takes `&self` rather than consuming the flow file, because writing
+    /// in-memory content does not exhaust it. It returns the number of content
+    /// bytes written.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -537,21 +540,23 @@ impl FlowFile<Vec<u8>> {
     /// ```
     ///
     /// The header and the content are written as two calls rather than one,
-    /// since building a single buffer would mean copying the whole content
+    /// because building a single buffer would mean copying the whole content
     /// into it first. That is the right trade for content of any size, but it
-    /// does mean an unbuffered writer sees two writes — wrap one in a
+    /// does mean an unbuffered writer sees two writes. Wrap one in a
     /// [`std::io::BufWriter`] if the syscalls matter more than the copy.
     ///
     /// # Errors
     ///
     /// Whatever the writer returns. A failure after the header has gone out
-    /// leaves a partial flow file in the stream, as [`write_to`](FlowFile::write_to)
-    /// does; [`FlowFilesWriter`] is what tracks that.
+    /// leaves a partial flow file in the stream, as
+    /// [`write_to`](FlowFile::write_to) does. [`FlowFilesWriter`] tracks that
+    /// for you.
     ///
     /// # Panics
     ///
-    /// As [`to_bytes`](FlowFile::to_bytes): an attribute the wire format
-    /// cannot express, or a declared size disagreeing with the content.
+    /// As [`to_bytes`](FlowFile::to_bytes) panics: for an attribute the wire
+    /// format cannot express, or a declared size that disagrees with the
+    /// content.
     pub fn write_bytes_to<W: Write>(&self, writer: &mut W) -> io::Result<u64> {
         assert_eq!(
             self.size,
@@ -567,17 +572,17 @@ impl FlowFile<Vec<u8>> {
 /// Iterator over a stream of concatenated flow files.
 ///
 /// Yields each flow file with its content buffered in memory, and ends on a
-/// clean end of input. After an error the iterator is fused (keeps returning
-/// `None`), since the stream position is no longer trustworthy.
+/// clean end of input. After an error the iterator is fused, meaning it keeps
+/// returning `None`, because the stream position is no longer trustworthy.
 ///
-/// Buffering is the trade: it is what lets this be an ordinary [`Iterator`]
+/// Buffering each content is what lets this be an ordinary [`Iterator`]
 /// yielding owned flow files. When a content is too large for that, use
-/// [`FlowFilesReader`], which streams instead and is just as safe; see its
-/// docs for the three-way choice between them and [`FlowFile::parse_next`].
+/// [`FlowFilesReader`], which streams instead and is just as safe. Its docs
+/// compare the three ways to read, including [`FlowFile::parse_next`].
 ///
 /// Because this buffers, it reports a content that ends before its declared
-/// size as [`Error::SizeMismatch`] directly, the way
-/// [`FlowFile::from_bytes`] does — not wrapped in [`Error::Io`].
+/// size as [`Error::SizeMismatch`] directly, the way [`FlowFile::from_bytes`]
+/// does, rather than wrapped in [`Error::Io`].
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFiles};
@@ -600,8 +605,8 @@ pub struct FlowFiles<R> {
 impl<R: Read> FlowFiles<R> {
     /// Iterate over the flow files in `reader`, without header limits.
     ///
-    /// The header parsing reads in small increments, so wrap unbuffered
-    /// sources (files, sockets) in a [`std::io::BufReader`].
+    /// The header parsing reads in small increments, so wrap an unbuffered
+    /// source in a [`std::io::BufReader`]. A file or a socket is unbuffered.
     pub fn new(reader: R) -> Self {
         Self::with_limits(reader, Limits::UNLIMITED)
     }
@@ -628,11 +633,11 @@ impl<R: Read> FlowFiles<R> {
 
     /// Consume the iterator, returning the underlying reader.
     ///
-    /// The reader is left wherever iteration stopped: after a `None` that is
-    /// the end of the flow files and the start of whatever follows them, which
-    /// is what makes this useful — a trailer, or the next section of a
-    /// multiplexed stream. Stopping early instead leaves it part-way through a
-    /// flow file, and after an error the position is not meaningful at all.
+    /// The reader is left wherever iteration stopped. After a `None` that is
+    /// the end of the flow files and the start of whatever follows them, such
+    /// as a trailer or the next section of a multiplexed stream. Stopping
+    /// early leaves the reader part-way through a flow file, and after an
+    /// error its position is not meaningful at all.
     ///
     /// ```
     /// use nififf3::{FlowFile, FlowFiles};
@@ -677,17 +682,16 @@ impl<R: Read> Iterator for FlowFiles<R> {
 
 impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 
-/// Reads a stream of concatenated flow files *without* buffering their
-/// content, keeping the stream positioned for you.
+/// Reads a stream of concatenated flow files, streaming their content and
+/// keeping the stream positioned for you.
 ///
-/// The streaming counterpart to [`FlowFiles`], and the one to reach for when a
-/// flow file's content is too big to hold in memory. Where `FlowFiles` reads
-/// each content into a `Vec` and hands you an owned flow file, this hands you
-/// one whose content is the stream itself — so it is read as you read it, and
-/// never twice.
+/// This is the streaming counterpart to [`FlowFiles`]. Reach for it when a flow
+/// file's content is too big to hold in memory. `FlowFiles` reads each content
+/// into a `Vec` and hands you an owned flow file. This hands you one whose
+/// content is the stream itself, so it is read as you read it, and never twice.
 ///
-/// That laziness is what makes [`FlowFile::parse_next`] sharp to use directly:
-/// there, a flow file dropped with its content unread leaves the stream inside
+/// That laziness is what makes [`FlowFile::parse_next`] hard to use directly.
+/// There, a flow file dropped with its content unread leaves the stream inside
 /// that content, and the next parse reads it as though it were a flow file.
 /// Here it does not matter. Each call picks up whatever the last flow file left
 /// behind and skips it, so reading none of the content, some of it, or all of
@@ -718,13 +722,14 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 /// | `FlowFilesReader` | streamed, positioned for you | a content may be too large to buffer |
 /// | [`FlowFile::parse_next`] | streamed, positioned by you | you need the reader back between flow files, or are driving the stream yourself |
 ///
-/// Only `FlowFiles` implements [`Iterator`]: the flow files this yields borrow
-/// the stream they came from, which no `Iterator` can express. In a `while let`
-/// loop that costs nothing, and it is what stops one being held past the next
-/// call — that is a compile error, not a corrupt read.
+/// Only `FlowFiles` implements [`Iterator`]. The flow files this yields borrow
+/// the stream they came from, and no `Iterator` can express that. In a
+/// `while let` loop the borrow costs nothing, and it has a useful side effect:
+/// if you try to hold a flow file past the next call, the code does not
+/// compile.
 ///
-/// After an error, `next` keeps returning `None`, as [`FlowFiles`] does: the
-/// position in the stream is no longer trustworthy.
+/// After an error, `next` keeps returning `None`, as [`FlowFiles`] does,
+/// because the position in the stream is no longer trustworthy.
 #[derive(Debug)]
 pub struct FlowFilesReader<R> {
     reader: R,
@@ -738,11 +743,11 @@ pub struct FlowFilesReader<R> {
     done: bool,
 }
 
-/// The content of a flow file from a [`FlowFilesReader`]: the stream itself,
-/// limited to this flow file's content.
+/// The content of a flow file from a [`FlowFilesReader`], which is the stream
+/// itself, limited to this flow file's content.
 ///
-/// Reading it is optional. Whatever is left goes when the next flow file is
-/// asked for.
+/// Reading it is optional. Whatever is left is skipped when the next flow file
+/// is asked for.
 #[derive(Debug)]
 pub struct StreamedContent<'a, R> {
     inner: io::Take<&'a mut R>,
@@ -760,8 +765,8 @@ impl<R: Read> Read for StreamedContent<'_, R> {
 impl<R: Read> FlowFilesReader<R> {
     /// Read flow files from `reader`, without header limits.
     ///
-    /// The header parsing reads in small increments, so wrap unbuffered
-    /// sources (files, sockets) in a [`std::io::BufReader`].
+    /// The header parsing reads in small increments, so wrap an unbuffered
+    /// source in a [`std::io::BufReader`]. A file or a socket is unbuffered.
     pub fn new(reader: R) -> Self {
         Self::with_limits(reader, Limits::UNLIMITED)
     }
@@ -781,12 +786,12 @@ impl<R: Read> FlowFilesReader<R> {
     /// The next flow file, or `None` at the end of the stream.
     ///
     /// Anything left unread of the previous flow file's content is skipped
-    /// first, so the caller is never responsible for the stream's position.
+    /// first, so you are never responsible for the stream's position.
     ///
-    /// Returns `Result<Option<_>>` rather than the `Option<Result<_>>` an
-    /// [`Iterator`] would, matching [`FlowFile::parse_next`] — which this
-    /// replaces — so that `while let Some(flow_file) = reader.next()?` reads
-    /// with one `?` and no inner match.
+    /// It returns `Result<Option<_>>` rather than the `Option<Result<_>>` an
+    /// [`Iterator`] would, matching the [`FlowFile::parse_next`] it replaces.
+    /// So `while let Some(flow_file) = reader.next()?` reads with one `?` and
+    /// no inner match.
     ///
     /// # Errors
     ///
@@ -794,11 +799,12 @@ impl<R: Read> FlowFilesReader<R> {
     /// ends part-way through content this call had to skip.
     #[expect(
         clippy::should_implement_trait,
-        reason = "`Iterator` cannot yield an item borrowing the iterator, which \
-                  is the whole point here; `next` is what a lending iterator's \
-                  method is called, it is what the async twin already calls it, \
-                  and `while let Some(..) = reader.next()?` does work — unlike \
-                  `Fragments::next_part`, which was renamed because it did not"
+        reason = "`Iterator` cannot yield an item that borrows the iterator, \
+                  and that is the whole point here. A lending iterator calls \
+                  its method `next`, the async twin already calls it that, and \
+                  `while let Some(..) = reader.next()?` works. \
+                  `Fragments::next_part` was renamed because that pattern did \
+                  not work for it."
     )]
     pub fn next(&mut self) -> Result<Option<FlowFile<StreamedContent<'_, R>>>> {
         if self.done {
@@ -878,8 +884,9 @@ impl<R: Read> FlowFilesReader<R> {
     /// A mutable reference to the underlying reader.
     ///
     /// Note that the stream may be positioned part-way through a flow file's
-    /// content — whatever the last one handed out did not read. [`next`](Self::next)
-    /// accounts for that; anything reading around it does not.
+    /// content, at whatever the last one handed out did not read.
+    /// [`next`](Self::next) accounts for that, and anything reading around it
+    /// does not.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.reader
     }
@@ -895,10 +902,10 @@ impl<R: Read> FlowFilesReader<R> {
 /// [`FlowFiles`].
 ///
 /// A failed write leaves a partial flow file in the stream, so the writer
-/// refuses every write after one, the way [`FlowFiles`] stops reading after an
-/// error — appending to a stream that is mid-record would bury the failure
-/// rather than report it, since the next record's header is indistinguishable
-/// from the content the truncated one still expects. See
+/// refuses every write after one. [`FlowFiles`] stops reading after an error
+/// for the same reason. If the writer appended instead, the next flow file's
+/// header would be read back as the truncated flow file's content, which buries
+/// the failure rather than reporting it. See
 /// [`is_poisoned`](Self::is_poisoned).
 ///
 /// # Finishing
@@ -906,9 +913,9 @@ impl<R: Read> FlowFilesReader<R> {
 /// This type writes straight through and buffers nothing of its own, but the
 /// writer underneath it may, and neither writing nor dropping this one flushes
 /// it. Finish with [`finish`](Self::finish), which flushes and hands the writer
-/// back; [`flush`](Self::flush) does it without giving up the writer, and
-/// [`into_inner`](Self::into_inner) deliberately skips it, for discarding a
-/// stream rather than completing it.
+/// back. [`flush`](Self::flush) flushes without giving up the writer.
+/// [`into_inner`](Self::into_inner) does not flush at all, on purpose, so you
+/// can discard a stream rather than complete it.
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesWriter};
@@ -946,7 +953,7 @@ impl<W: Write> FlowFilesWriter<W> {
     ///
     /// # Errors
     ///
-    /// As [`FlowFile::write_to`]: a content reader that ends early leaves a
+    /// As [`FlowFile::write_to`]. A content reader that ends early leaves a
     /// truncated flow file behind, and poisons the writer. Use
     /// [`write_bytes`](Self::write_bytes) for content whose length must be
     /// verified before anything is committed.
@@ -962,8 +969,8 @@ impl<W: Write> FlowFilesWriter<W> {
     ///
     /// # Errors
     ///
-    /// Whatever the writer returns — which, since it may have accepted part
-    /// of the flow file first, also poisons the writer.
+    /// Whatever the writer returns. That also poisons this writer, because the
+    /// one underneath may have accepted part of the flow file first.
     pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> io::Result<u64> {
         self.guard()?;
         let result = flow_file.write_bytes_to(&mut self.writer);
@@ -1048,12 +1055,12 @@ impl<W: Write> FlowFilesWriter<W> {
         &mut self.writer
     }
 
-    /// Consume the writer, returning the underlying one *without flushing it*.
+    /// Consume the writer, returning the underlying one without flushing it.
     ///
-    /// For finishing a stream, use [`finish`](Self::finish). This is the
+    /// To finish a stream, use [`finish`](Self::finish) instead. This is the
     /// escape hatch for the other case: taking the writer back after a failure
-    /// in order to discard or truncate what was produced, where flushing the
-    /// tail of a truncated flow file is the last thing wanted.
+    /// in order to discard or truncate what was produced. There, flushing the
+    /// tail of a truncated flow file is the last thing you want.
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -1063,9 +1070,9 @@ impl<W: Write> FlowFilesWriter<W> {
 mod tests {
     use super::*;
 
-    /// A poisoned write is recognisable by its payload rather than its
-    /// message: the point of `Error::WriterPoisoned` is that a caller can tell
-    /// it from any other write failure without matching on text.
+    /// A poisoned write is recognized by its payload rather than by its
+    /// message. `Error::WriterPoisoned` exists so that a caller can tell it
+    /// from any other write failure without matching on text.
     fn is_poisoned_error(err: &io::Error) -> bool {
         err.kind() == io::ErrorKind::BrokenPipe
             && matches!(
@@ -1178,11 +1185,11 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    /// The documented hazard, pinned: a flow file dropped with its content
-    /// unread leaves the reader inside that content, and an envelope — a flow
-    /// file carrying another — turns that into a plausible wrong answer rather
-    /// than an error. If this ever stops being true, the warning on
-    /// `parse_next` needs to change with it.
+    /// This checks the hazard the docs describe. A flow file dropped with its
+    /// content unread leaves the reader inside that content. When the content
+    /// is an envelope, meaning one flow file carrying another, that produces a
+    /// plausible wrong answer rather than an error. If this ever stops being
+    /// true, the warning on `parse_next` needs to change with it.
     #[test]
     fn dropping_content_unread_reparses_the_content_itself() {
         let inner = FlowFile::builder()
@@ -1206,9 +1213,9 @@ mod tests {
             seen.push(flow_file.attribute("who").unwrap().to_string());
             // Deliberately no `skip_content`.
         }
-        // The nested flow file surfaces as though it had been sent; parsing
-        // then lands inside *its* content, fails, and the flow file that
-        // really came second is never reached.
+        // The nested flow file surfaces as though it had been sent. Parsing
+        // then lands inside that flow file's own content, fails, and the flow
+        // file that really came second is never reached.
         assert_eq!(seen, ["envelope", "inner"]);
 
         // Skipping instead walks the stream that was actually sent.
@@ -1221,8 +1228,8 @@ mod tests {
         assert_eq!(seen, ["envelope", "second"]);
     }
 
-    /// The whole point: reading none, some or all of a content must leave the
-    /// stream in the same place — the one the next flow file starts at.
+    /// Reading none of a content, some of it, or all of it must leave the
+    /// stream in the same place, which is where the next flow file starts.
     #[test]
     fn the_streaming_reader_positions_the_stream_however_much_is_read() {
         let mut bytes = FlowFile::builder()
@@ -1432,7 +1439,7 @@ mod tests {
             })
         ));
         // `into_memory` parses nothing, so it reports the same condition as an
-        // io error — with the structured error still recoverable from it.
+        // io error, with the structured error still recoverable from it.
         let parsed = FlowFile::parse(truncated).unwrap();
         let err = parsed.into_memory().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
@@ -1494,7 +1501,7 @@ mod tests {
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
         // The check is on the declared size, so it fires before any content
-        // is read — a header alone is enough to trip it.
+        // is read. A header on its own is enough to trip it.
         let header_only = &bytes[..bytes.len() - 5];
         assert!(matches!(
             FlowFile::parse_with_limits(header_only, limits),
@@ -1561,8 +1568,8 @@ mod tests {
         assert_eq!(FlowFiles::new(out.as_slice()).count(), 2);
     }
 
-    /// A writer that records what it was asked to do, standing in for one
-    /// that buffers — a `BufWriter`, a compressor, a socket.
+    /// A writer that records what it was asked to do, standing in for one that
+    /// buffers, such as a `BufWriter` or a compressor.
     #[derive(Default)]
     struct Recording {
         bytes: Vec<u8>,
@@ -1727,10 +1734,10 @@ mod tests {
         );
     }
 
-    /// The total limit has to bound what the parser *buffers*, not just what
-    /// it accepts. Checked against the running total after each pair, one
-    /// attribute could be read into memory in full before anything fired —
-    /// so a caller who set only this limit had no bound at all.
+    /// The total limit has to bound how much the parser buffers, and not only
+    /// what it accepts. Checked against the running total after each pair, one
+    /// attribute could be read into memory in full before anything fired. A
+    /// caller who set only this limit then had no bound at all.
     #[test]
     fn the_total_limit_rejects_an_attribute_on_its_declared_length() {
         // A header declaring an 8 MiB value against a 1 KiB total, with only
@@ -1770,7 +1777,7 @@ mod tests {
     }
 
     /// The budget is spent as it goes, so attributes that are each within it
-    /// still fail once they add up — the behaviour that was already right.
+    /// still fail once they add up. That behavior was already right.
     #[test]
     fn the_total_limit_still_accumulates_across_attributes() {
         let bytes = FlowFile::builder()

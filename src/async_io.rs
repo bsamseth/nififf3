@@ -189,10 +189,10 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     ///
     /// Returns `Ok(None)` on a clean end of input.
     ///
-    /// Every flow file's content must be consumed before the next is parsed —
-    /// with [`into_memory_async`](FlowFile::into_memory_async),
+    /// Every flow file's content must be consumed before the next is parsed.
+    /// Use [`into_memory_async`](FlowFile::into_memory_async),
     /// [`write_to_async`](FlowFile::write_to_async) or
-    /// [`skip_content_async`](FlowFile::skip_content_async). See
+    /// [`skip_content_async`](FlowFile::skip_content_async) for that. See
     /// [`FlowFile::parse_next`] for what dropping one unread does to the
     /// stream, which is the same here.
     ///
@@ -362,8 +362,9 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
     #[cfg(feature = "stream")]
     pub fn into_stream(self) -> impl futures_core::Stream<Item = Result<FlowFile<Vec<u8>>>> {
         // `next` borrows `self`, so the future cannot be stored beside it.
-        // Passing ownership through each step keeps the state machine flat,
-        // at one boxed future per flow file — noise next to buffering one.
+        // Passing ownership through each step keeps the state machine flat, at
+        // the cost of one boxed future per flow file. That cost is small next
+        // to buffering a flow file.
         futures_unfold(self, |mut reader| async move {
             let item = reader.next().await?;
             Some((item, reader))
@@ -408,9 +409,9 @@ where
         _item: std::marker::PhantomData<fn() -> I>,
     }
 
-    // Nothing here is structurally pinned: the in-flight future is boxed, so
-    // its address is stable no matter where the stream itself lives, and
-    // every other field is moved in and out by value.
+    // Nothing here is structurally pinned. The in-flight future is boxed, so
+    // its address is stable wherever the stream itself lives, and every other
+    // field is moved in and out by value.
     impl<T, F, Fut, I> Unpin for Unfold<T, F, Fut, I> {}
 
     impl<T, F, Fut, I> futures_core::Stream for Unfold<T, F, Fut, I>
@@ -506,7 +507,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for StreamedContentAsync<'_, R> {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         // Delegate the `ReadBuf` handling to `Take`, then measure what it
-        // filled — the crate forbids the unsafe that doing it by hand needs.
+        // filled. Doing it by hand needs unsafe, which this crate forbids.
         let before = buf.filled().len();
         std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, buf))?;
         let read = buf.filled().len() - before;
@@ -642,10 +643,9 @@ impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
 /// An [`AsyncWrite`] typically has to be told when it is done, and neither
 /// writing nor dropping this type tells it:
 ///
-/// - [`shutdown`](Self::shutdown) is what finalizes a writer that has an
-///   ending of its own — a compressor's trailer, a TLS `close_notify`, a
-///   buffered writer's tail. Skipping it on one of those silently truncates
-///   the output, and the flow files come back corrupt.
+/// - [`shutdown`](Self::shutdown) finalizes a writer that has an ending of its
+///   own, such as a compressor's trailer. Skipping it on one of those
+///   silently truncates the output, and the flow files come back corrupt.
 /// - [`finish`](Self::finish) flushes and returns the writer, for one that
 ///   only buffers.
 /// - [`into_inner`](Self::into_inner) does neither, for discarding a stream
@@ -708,8 +708,8 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// # Errors
     ///
-    /// Whatever the writer returns — which, since it may have accepted part
-    /// of the flow file first, also poisons the writer.
+    /// Whatever the writer returns. That also poisons this writer, because the
+    /// one underneath may have accepted part of the flow file first.
     ///
     /// # Panics
     ///
@@ -762,12 +762,11 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
 
     /// Shut the underlying writer down, finalizing it.
     ///
-    /// For a plain sink this is [`flush`](Self::flush) and little else, but a
-    /// writer that encodes — a compressor, a TLS session, a framed transport —
-    /// emits its ending here and nowhere else. Dropping the writer does not
-    /// produce it, so a stream that skips this is truncated in a way the
-    /// reader on the far end will report as a corrupt flow file, not as a
-    /// missing trailer.
+    /// For a plain sink this is [`flush`](Self::flush) and little else. A
+    /// writer that encodes, such as a compressor or a TLS session, emits its
+    /// ending here and nowhere else. Dropping the writer does not produce it,
+    /// so a stream that skips this is truncated. The reader on the far end
+    /// reports that as a corrupt flow file rather than as a missing trailer.
     ///
     /// # Errors
     ///
@@ -781,8 +780,9 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// Flush and return the underlying writer.
     ///
     /// For a writer that finalizes itself, call [`shutdown`](Self::shutdown)
-    /// first — or instead, followed by [`into_inner`](Self::into_inner), since
-    /// shutting down and then flushing is the wrong order.
+    /// first. You can also call `shutdown` on its own and then
+    /// [`into_inner`](Self::into_inner), because shutting down and then
+    /// flushing is the wrong order.
     ///
     /// # Errors
     ///

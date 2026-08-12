@@ -1,4 +1,4 @@
-//! Many flow files in, one flow file out — synchronously.
+//! Many flow files in, one flow file out, synchronously.
 //!
 //! The inverse of `split.rs`. NiFi's `MergeContent` reassembles a split in
 //! `defragment` mode by binning on `fragment.identifier`, ordering by
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // At least one flow file must declare the total, and the bin must be
     // complete. The count is over flow files in the bundle, so a terminator
-    // counts towards it — which is exactly why it can declare it at all.
+    // counts towards it. That is why a terminator can declare it at all.
     let expected: usize = parts
         .iter()
         .find_map(|part| part.attributes().get(attr::FRAGMENT_COUNT))
@@ -87,17 +87,18 @@ fn index_of(part: &FlowFile<Vec<u8>>) -> u64 {
 }
 
 /// Whether `part` is the empty flow file `Fragments::terminate` adds to carry
-/// the count: the last in the bundle, with nothing in it.
+/// the count. It is the last in the bundle, and it has nothing in it.
 ///
-/// A convention rather than a guarantee — a split whose real last part happens
-/// to be empty looks identical. A producer that emits empty parts and needs
-/// them told apart should mark its terminator with an attribute of its own.
+/// This is a convention rather than a guarantee, because a split whose real
+/// last part happens to be empty looks identical. A producer that emits empty
+/// parts and needs them told apart should mark its terminator with an
+/// attribute of its own.
 fn is_terminator(part: &FlowFile<Vec<u8>>, count: usize) -> bool {
     part.size() == 0 && index_of(part) == count as u64
 }
 
-/// The output of `split_async.rs` — a bundle whose count arrives on a
-/// terminator, since that is the form that needs the extra handling. Swapping
+/// The output of `split_async.rs`, which is a bundle whose count arrives on a
+/// terminator. That is the form needing the extra handling. Swapping
 /// `fragments()` for `fragments().with_count(3)` and dropping the terminator
 /// gives `split.rs`'s output, which merges through the same code.
 ///

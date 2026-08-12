@@ -81,8 +81,8 @@ async fn the_batch_extractor_reads_every_flow_file_in_the_body() {
     assert_eq!(body_text(response).await, "5,7,0");
 }
 
-/// An empty body is a batch of none, not a failure — the same reading
-/// `FlowFiles` gives a stream that ends immediately.
+/// An empty body is a batch of none rather than a failure. `FlowFiles` reads
+/// a stream that ends immediately the same way.
 #[tokio::test]
 async fn the_batch_extractor_accepts_an_empty_body() {
     let response = app()
@@ -95,7 +95,7 @@ async fn the_batch_extractor_accepts_an_empty_body() {
 }
 
 /// Nothing is read at extraction time, so a malformed body surfaces from
-/// `next` — which the handler turns into the same 400 as anywhere else.
+/// `next`. The handler turns that into the same 400 as anywhere else.
 #[tokio::test]
 async fn the_batch_extractor_reports_a_malformed_body_from_the_handler() {
     let response = app()
@@ -112,8 +112,8 @@ async fn the_batch_extractor_reports_a_malformed_body_from_the_handler() {
 }
 
 /// The batch extractor reads through the same limited body the single one
-/// does, so an over-large body is a 413 there too — and it is caught while
-/// reading, not after the whole batch has been taken in.
+/// does, so an over-large body is a 413 there too. It is caught while reading,
+/// rather than after the whole batch is in memory.
 #[tokio::test]
 async fn the_batch_extractor_honours_the_default_body_limit() {
     let app = app().layer(DefaultBodyLimit::max(64));
@@ -201,8 +201,8 @@ async fn extracts_and_responds_with_flow_files() {
 }
 
 /// A response commits to a `Content-Length` computed from the declared size
-/// before a single content byte is read, so a reader that ends early can only
-/// be reported by breaking the body — completing it would hand the client a
+/// before a single content byte is read. So a reader that ends early can only
+/// be reported by breaking the body. Completing it would hand the client a
 /// flow file whose header declares more content than it carries.
 #[tokio::test]
 async fn a_response_whose_content_reader_ends_early_fails_the_body() {
@@ -376,7 +376,8 @@ async fn strict_extractor_rejects_missing_or_wrong_content_type() {
 }
 
 /// The rejected content type is attacker-controlled, so the 415 body must name
-/// enough of it to debug with and no more — not however much the client sent.
+/// enough of it to debug with and no more, rather than however much the client
+/// sent.
 #[tokio::test]
 async fn strict_extractor_does_not_echo_an_unbounded_content_type() {
     let long = format!("application/{}", "a".repeat(4000));

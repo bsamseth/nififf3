@@ -4,7 +4,7 @@ use crate::{FlowFile, FragmentKeys, attr};
 
 /// Builder for [`FlowFile`]s.
 ///
-/// Attributes are added first; supplying the content finishes the build.
+/// Add attributes first. Supplying the content finishes the build.
 ///
 /// ```
 /// use nififf3::FlowFile;
@@ -71,15 +71,15 @@ impl FlowFileBuilder {
         self
     }
 
-    /// Undo what `Fragments` added: drop the fragment
-    /// attributes and restore [`filename`](crate::attr::FILENAME) from
+    /// Undo what `Fragments` added, dropping the fragment attributes and
+    /// restoring [`filename`](crate::attr::FILENAME) from
     /// [`segment.original.filename`](crate::attr::SEGMENT_ORIGINAL_FILENAME).
     ///
-    /// The tail of a merge. Having reassembled the content of a fragment set,
-    /// build the result from any one part — the parts carry the parent's
-    /// attributes — and call this to make it look like the flow file the
-    /// split started from, the way NiFi's `MergeContent` does in `defragment`
-    /// mode.
+    /// Use it at the tail of a merge. Once you have reassembled the content of
+    /// a fragment set, build the result from any one part, because every part
+    /// carries the parent's attributes. Calling this then makes the result look
+    /// like the flow file the split started from, the way NiFi's
+    /// `MergeContent` does in `defragment` mode.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -102,7 +102,7 @@ impl FlowFileBuilder {
     /// assert_eq!(merged.attribute("segment.original.filename"), None);
     /// ```
     ///
-    /// This handles the default attribute keys; for a split that used custom
+    /// This handles the default attribute keys. For a split that used custom
     /// ones, hand the same [`FragmentKeys`] to
     /// [`defragment_with`](Self::defragment_with).
     #[must_use]
@@ -110,12 +110,11 @@ impl FlowFileBuilder {
         self.defragment_with(&FragmentKeys::default())
     }
 
-    /// [`defragment`](Self::defragment) for a split that numbered its parts
-    /// with custom keys.
+    /// Undo a split that numbered its parts with custom keys.
     ///
-    /// The other end of `Fragments::with_keys`: the same value that decided
-    /// what to write decides what to undo, so a custom split is as reversible
-    /// as a default one.
+    /// This is the other end of `Fragments::with_keys`. The same value that
+    /// decided what to write decides what to undo, so a custom split is as
+    /// reversible as a default one.
     ///
     /// ```
     /// use nififf3::{FlowFile, FragmentKeys};
@@ -151,7 +150,8 @@ impl FlowFileBuilder {
         self
     }
 
-    /// Finish the build with in-memory content; the size is the content length.
+    /// Finish the build with in-memory content. The size is the content's
+    /// length.
     #[must_use]
     pub fn content(self, content: impl Into<Vec<u8>>) -> FlowFile<Vec<u8>> {
         let content = content.into();
@@ -160,10 +160,10 @@ impl FlowFileBuilder {
 
     /// Finish the build with no content at all.
     ///
-    /// `content(Vec::new())` says the same thing, and says it less well: a flow
-    /// file that is only attributes is a normal thing in NiFi — a signal, a
-    /// marker, the terminator of a fragment set — rather than an empty buffer
-    /// that happens to be empty.
+    /// A flow file that carries only attributes is a normal thing in NiFi. The
+    /// terminator of a fragment set is one example. `content(Vec::new())`
+    /// builds the same value, but it reads as a buffer that happens to have
+    /// nothing in it.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -183,12 +183,13 @@ impl FlowFileBuilder {
 
     /// Finish the build with content from a reader.
     ///
-    /// The V3 format stores the content size before the content itself, so
-    /// the size must be known up front; `size` is the number of bytes that
-    /// will be read from `content` when the flow file is serialized.
+    /// The V3 format stores the content size before the content itself, so the
+    /// size has to be known up front. `size` is the number of bytes that will
+    /// be read from `content` when the flow file is serialized.
     ///
-    /// If the size is not known, use [`buffered`](Self::buffered) or, with
-    /// the `tempfile` feature, `tempfile`/`spooled` to spool the reader first.
+    /// If you don't know the size, use [`buffered`](Self::buffered) to read the
+    /// content into memory first. With the `tempfile` feature, `tempfile` and
+    /// `spooled` spool it to disk instead.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -205,10 +206,9 @@ impl FlowFileBuilder {
 
     /// Finish the build by reading `content` to completion into memory.
     ///
-    /// Useful when the content size is not known up front. The whole
-    /// content is held in memory; for large content prefer `tempfile`, or
-    /// `spooled` to stay in memory up to a bound — both behind the `tempfile`
-    /// feature.
+    /// Use it when the content size is not known up front. The whole content is
+    /// held in memory. For large content prefer `tempfile`, or `spooled` to
+    /// stay in memory up to a bound. Both are behind the `tempfile` feature.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -230,9 +230,9 @@ impl FlowFileBuilder {
     /// Finish the build by spooling `content` into an anonymous temporary
     /// file, which becomes the flow file's content.
     ///
-    /// Useful when the content size is not known up front and may be too
-    /// large to buffer in memory. The file is deleted when the returned
-    /// flow file (or its content) is dropped.
+    /// Use it when the content size is not known up front, and may be too large
+    /// to buffer in memory. The file is deleted when the returned flow file is
+    /// dropped, or when its content is.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -262,13 +262,13 @@ impl FlowFileBuilder {
     }
 
     /// Finish the build by spooling `content` into a
-    /// [`SpooledTempFile`](tempfile::SpooledTempFile): the content is held
-    /// in memory up to `max_memory` bytes, and rolled over to an anonymous
+    /// [`SpooledTempFile`](tempfile::SpooledTempFile). The content is held in
+    /// memory up to `max_memory` bytes, and rolled over to an anonymous
     /// temporary file beyond that.
     ///
-    /// A middle ground between [`buffered`](Self::buffered) (always memory)
-    /// and [`tempfile`](Self::tempfile) (always disk) for content of
-    /// unknown size that is usually small.
+    /// Use it for content of unknown size that is usually small.
+    /// [`buffered`](Self::buffered) always stays in memory, and
+    /// [`tempfile`](Self::tempfile) always goes to disk.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -298,8 +298,9 @@ impl FlowFileBuilder {
         Ok(FlowFile::from_raw_parts(size, self.attributes, file))
     }
 
-    /// Async version of [`buffered`](Self::buffered): reads an
-    /// [`AsyncRead`](tokio::io::AsyncRead) to completion into memory.
+    /// Finish the build by reading an [`AsyncRead`](tokio::io::AsyncRead) to
+    /// completion into memory. This is the async version of
+    /// [`buffered`](Self::buffered).
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -326,8 +327,9 @@ impl FlowFileBuilder {
         Ok(self.content(buf))
     }
 
-    /// Async version of [`tempfile`](Self::tempfile): spools an
-    /// [`AsyncRead`](tokio::io::AsyncRead) into an anonymous temporary file.
+    /// Finish the build by spooling an [`AsyncRead`](tokio::io::AsyncRead) into
+    /// an anonymous temporary file. This is the async version of
+    /// [`tempfile`](Self::tempfile).
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -387,7 +389,7 @@ mod tests {
         }
     }
 
-    /// A custom split has to be as reversible as a default one: the same
+    /// A custom split has to be as reversible as a default one. The same
     /// `FragmentKeys` writes the parts and undoes them.
     #[cfg(feature = "uuid")]
     #[test]
@@ -423,7 +425,7 @@ mod tests {
         }
     }
 
-    /// And the default keys are just the default value of the same thing.
+    /// The default keys are the default value of the same thing.
     #[cfg(feature = "uuid")]
     #[test]
     fn defragment_is_defragment_with_the_default_keys() {

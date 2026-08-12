@@ -194,7 +194,7 @@ fn limit_flags_reject_oversized_headers() {
 }
 
 /// The limit flags are global, so they have to mean the same thing on every
-/// subcommand — including the two that never run a header parser.
+/// subcommand, including the two that never run a header parser.
 #[test]
 fn limit_flags_apply_to_the_json_path_too() {
     let json = r#"{"attributes": {"k": "a value longer than the limit"}, "content": ""}"#;
@@ -222,10 +222,10 @@ fn limit_flags_apply_to_the_json_path_too() {
         .success();
 }
 
-/// `--max-content-len` has to bound the read, not judge it afterwards: the
-/// point of the flag is not to buffer an unbounded stdin in the first place.
-/// A limit of 0 makes that observable — one byte of input is already over it,
-/// so nothing after the first byte can have been needed to decide.
+/// `--max-content-len` has to bound the read rather than judge it afterwards,
+/// because the point of the flag is to avoid buffering an unbounded stdin at
+/// all. A limit of 0 makes that observable. One byte of input is already over
+/// it, so nothing after the first byte can have been needed to decide.
 #[test]
 fn create_stops_reading_at_the_content_limit() {
     nififf3()

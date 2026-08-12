@@ -1,4 +1,4 @@
-//! One flow file in, one flow file out — asynchronously.
+//! One flow file in, one flow file out, asynchronously.
 //!
 //! The `tokio` mirror of `transform.rs`: the same API with `_async` spellings,
 //! reading and writing over `AsyncRead`/`AsyncWrite`.

@@ -23,10 +23,10 @@ use crate::{
 
 /// A flow file extracted from an axum request.
 ///
-/// The content is an [`AsyncRead`] streaming the request body, limited to
-/// the size declared in the flow file header — the content is never
-/// buffered in memory by the extractor, so arbitrarily large flow files can
-/// be processed incrementally.
+/// The content is an [`AsyncRead`] streaming the request body, limited to the
+/// size declared in the flow file header. The extractor never buffers the
+/// content in memory, so you can process a flow file of any size
+/// incrementally.
 ///
 /// Request bodies are untrusted, so the header is parsed with
 /// [`Limits::recommended`]. To use different limits, extract the raw
@@ -36,11 +36,11 @@ use crate::{
 /// # Body size
 ///
 /// The body is read through axum's
-/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit), like any other
-/// extractor's — so it is capped at 2 MiB unless the router says otherwise.
-/// That cap is on the bytes the client actually sends, which is the only
-/// bound that means anything for a server: [`Limits`] governs the header,
-/// and the header's declared content size is a claim, not a promise.
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit), as any other
+/// extractor's body is, so it is capped at 2 MiB unless the router says
+/// otherwise. That cap is on the bytes the client actually sends, and that is
+/// the bound worth trusting on a server. [`Limits`] governs the header alone,
+/// and the size in the header is only a claim.
 ///
 /// Streaming a flow file larger than the limit therefore has to say so:
 ///
@@ -86,14 +86,14 @@ impl std::ops::DerefMut for FlowFileRequest {
 
 /// [`AsyncRead`] adapter over an axum request body.
 ///
-/// The extractors build one for you. Construct it directly — with
-/// [`from_body`](Self::from_body) or the equivalent `From` — to parse a body
-/// some other way than they do: different [`Limits`], say, or a flow file
-/// followed by something that is not one.
+/// The extractors build one for you. Construct it yourself with
+/// [`from_body`](Self::from_body) or the equivalent `From` when you want to
+/// parse a body some other way, such as with different [`Limits`], or when a
+/// flow file is followed by something that is not one.
 ///
-/// Note that a [`Body`] taken straight off a request has *not* been through
-/// axum's [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit); the
-/// extractors apply it by calling
+/// Note that a [`Body`] taken straight off a request has not been through
+/// axum's [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit). The extractors
+/// apply it by calling
 /// [`RequestExt::with_limited_body`](axum::RequestExt::with_limited_body)
 /// first, and anything reading a body by hand should do the same.
 pub struct FlowFileBody {
@@ -102,8 +102,8 @@ pub struct FlowFileBody {
     /// Whether `stream` has already reported the end of the body. Polling a
     /// [`Stream`] after it returns `None` is contractually undefined, and a
     /// reader is free to keep reading past an end it has already been told
-    /// about — a flow file declaring more content than the body carries makes
-    /// that the ordinary case, not a pathological one.
+    /// about. A flow file declaring more content than the body carries makes
+    /// that an ordinary case rather than a pathological one.
     ended: bool,
 }
 
@@ -208,8 +208,8 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
 /// `415 Unsupported Media Type` before the body is parsed. Media type
 /// parameters (e.g. a `charset`) are ignored in the comparison.
 ///
-/// Wraps the same flow file [`FlowFileRequest`] does, and is used the same
-/// way — destructured, or dereferenced:
+/// It wraps the same flow file [`FlowFileRequest`] does, and is used the same
+/// way. Destructure it, or dereference it:
 ///
 /// ```no_run
 /// use nififf3::StrictFlowFileRequest;
@@ -258,7 +258,8 @@ fn abbreviated(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
-/// Reject the request unless it carries `Content-Type: application/flowfile-v3`.
+/// Reject the request unless it carries the content type
+/// `application/flowfile-v3`.
 ///
 /// Compares the media type only, ignoring any parameters. The comparison sees
 /// the whole header; only what travels back to the client is abbreviated.
@@ -321,8 +322,8 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
 /// `application/flowfile-v3` request. [`FlowFileRequest`] parses exactly one
 /// and rejects a body with more.
 ///
-/// Each flow file's content is buffered in memory as it is yielded — the
-/// number of them is unbounded, the size of any one is bounded by
+/// Each flow file's content is buffered in memory as it is yielded. The number
+/// of flow files is unbounded, and the size of any one is bounded by
 /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) as usual. To stream
 /// the contents instead, build a [`FlowFileBody`] and drive
 /// [`FlowFile::parse_next_async`] over it yourself.
@@ -412,11 +413,11 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFilesRequest {
 /// computed from the header and the declared content size. Exactly
 /// [`size`](FlowFile::size) bytes are read from the content reader.
 ///
-/// The bound is on the *content*, so this covers every reader-backed flow
-/// file but not an in-memory `FlowFile<Vec<u8>>`, since `Vec<u8>` is not an
-/// [`AsyncRead`] (and coherence forbids a second impl for it). Call
-/// [`into_reader`](FlowFile::into_reader) on those — it wraps the content in
-/// a [`std::io::Cursor`], which is one:
+/// The bound is on the content, so this covers every reader-backed flow file.
+/// It does not cover an in-memory `FlowFile<Vec<u8>>`, because `Vec<u8>` is not
+/// an [`AsyncRead`], and coherence forbids a second impl for it. Call
+/// [`into_reader`](FlowFile::into_reader) on one of those first. It wraps the
+/// content in a [`std::io::Cursor`], which is an [`AsyncRead`]:
 ///
 /// ```
 /// use axum::response::IntoResponse;
@@ -431,11 +432,11 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFilesRequest {
 ///
 /// The `Content-Length` is committed before a content byte has been read, so a
 /// reader that ends before [`size`](FlowFile::size) cannot be reported as a
-/// status — by then the headers are gone. It fails the body instead, the way
-/// [`FlowFilesResponse`] does for a producer error: the client sees an aborted
-/// response rather than a complete one carrying a flow file whose header
-/// declares more content than it holds. A reader with *more* than `size` is
-/// cut to it, as everywhere else in this crate.
+/// status. The headers are gone by then. It fails the body instead, the way
+/// [`FlowFilesResponse`] does for a producer error. The client then sees an
+/// aborted response, rather than a complete one carrying a flow file whose
+/// header declares more content than it holds. A reader that yields more than
+/// `size` is cut to it, as everywhere else in this crate.
 impl<R> IntoResponse for FlowFile<R>
 where
     R: AsyncRead + Send + 'static,
@@ -515,9 +516,9 @@ impl Stream for ExactLength {
 ///
 /// That makes this a guess about how axum nests its errors, checked against
 /// axum 0.8 and http-body-util 0.1. If either re-wraps `LengthLimitError` the
-/// check stops matching and an over-large body silently becomes a 400 rather
-/// than a 413 — `extractor_honours_the_default_body_limit` in `tests/axum.rs`
-/// is what notices.
+/// check stops matching, and an over-large body silently becomes a 400 rather
+/// than a 413. The test that notices is
+/// `extractor_honours_the_default_body_limit` in `tests/axum.rs`.
 fn is_body_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     // Matches `io::Error::get_ref`; the chain itself drops the auto traits.
     let err: &(dyn std::error::Error + 'static) = err;
@@ -525,10 +526,10 @@ fn is_body_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool 
         .any(<dyn std::error::Error + 'static>::is::<http_body_util::LengthLimitError>)
 }
 
-/// Respond with the error message as the body, under `400 Bad Request` —
-/// except for the size failures, which are `413 Payload Too Large`, since the
-/// input was well-formed and merely too big. Those are the [`Limits`] ones,
-/// plus a body that ran past axum's
+/// Respond with the error message as the body, under `400 Bad Request`. The
+/// size failures get `413 Payload Too Large` instead, because that input was
+/// well-formed and only too big. Those are the [`Limits`] failures, plus a body
+/// that ran past axum's
 /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit).
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -578,32 +579,33 @@ enum Source {
 ///
 /// # Status codes
 ///
-/// Returning a `FlowFilesResponse` *is* the commitment to a 2xx: by the time
-/// the producer runs, the status line has been sent. Validate up front, while
-/// a real status code is still available, and report a problem with an
-/// individual part *as a part* — a flow file whose attributes say what went
-/// wrong — so the good parts still arrive. Returning `Err` from the producer
-/// instead aborts the body, leaving the client with a truncated response and
-/// no status to explain it.
+/// Returning a `FlowFilesResponse` commits you to a 2xx status, because the
+/// status line has been sent by the time the producer runs. So validate up
+/// front, while a real status code is still available. Report a problem with
+/// an individual part as a part of its own, meaning a flow file whose
+/// attributes say what went wrong, and the good parts still arrive. Returning
+/// `Err` from the producer aborts the body instead, leaving the client with a
+/// truncated response and no status to explain it.
 ///
-/// Which failures can be reported as a part follows from the format writing a
-/// part's size *before* its content:
+/// Which failures you can report as a part follows from the format writing a
+/// part's size before its content:
 ///
-/// - Found before the part is written — a bad archive header, an entry that
-///   will not open — always reportable.
-/// - Found while [`write`](FlowFilesWriterAsync::write) streams a part's
-///   content — not reportable, since the size is already on the wire.
+/// - A failure found before the part is written is always reportable. A bad
+///   archive header, or an entry that will not open, is found there.
+/// - A failure found while [`write`](FlowFilesWriterAsync::write) streams a
+///   part's content is not reportable, because the size is already on the
+///   wire.
 ///
 /// To vouch for a part's content, read it into memory and use
 /// [`write_bytes`](FlowFilesWriterAsync::write_bytes) instead, which learns of
-/// the failure before committing to anything. That is worth deciding per part:
-/// stream the large ones, buffer the ones whose integrity matters.
+/// the failure before committing to anything. Decide that per part: stream the
+/// large ones, and buffer the ones whose integrity matters.
 ///
 /// # Panics
 ///
 /// Turning one of the streaming variants into a response spawns the producer,
-/// so it must happen inside a tokio runtime — which an axum handler always is.
-/// Converting one by hand outside a runtime panics.
+/// so it has to happen inside a tokio runtime. An axum handler always is one.
+/// Converting a response by hand outside a runtime panics.
 /// [`buffered`](Self::buffered) spawns nothing and is fine anywhere.
 pub struct FlowFilesResponse {
     source: Source,
@@ -622,18 +624,17 @@ impl FlowFilesResponse {
     /// Stream flow files from an async producer.
     ///
     /// `producer` is handed a [`FlowFilesWriterAsync`] and writes parts to it
-    /// in whatever shape it likes; the response ends when the future
-    /// completes. A write resolves once its bytes are in the response body,
-    /// which runs at most [`buffer_size`](Self::buffer_size) ahead of the
-    /// socket — so a slow client applies backpressure within a buffer rather
+    /// in whatever shape it likes, and the response ends when the future
+    /// completes. A write resolves once its bytes are in the response body, and
+    /// the body runs at most [`buffer_size`](Self::buffer_size) ahead of the
+    /// socket. So a slow client applies backpressure within a buffer rather
     /// than filling memory, and writing a part from a reader never buffers its
     /// content.
     ///
-    /// Failure is reported as a [`BoxError`], so `?` works directly on
-    /// whatever a decoder, plain I/O or this crate returns — a producer never
-    /// has to convert between error types to satisfy this signature. A
-    /// producer that already has its own error type can adapt with
-    /// `.map_err(Into::into)`.
+    /// Failure is reported as a [`BoxError`], so `?` works directly on whatever
+    /// a decoder, plain I/O, or this crate returns. A producer never has to
+    /// convert between error types to satisfy this signature. One that already
+    /// has its own error type can adapt with `.map_err(Into::into)`.
     ///
     /// ```
     /// use axum::response::IntoResponse;
@@ -703,9 +704,9 @@ impl FlowFilesResponse {
 
     /// Stream flow files from a [`Stream`] of in-memory parts.
     ///
-    /// A convenience for producers that already yield whole flow files. The
-    /// stream's error type is free — it only has to convert into a
-    /// [`BoxError`] — and a `Stream` error ends the response the same way an
+    /// This is a convenience for producers that already yield whole flow
+    /// files. The stream's error type can be anything that converts into a
+    /// [`BoxError`], and a `Stream` error ends the response the same way an
     /// error from [`new`](Self::new)'s producer does.
     pub fn from_stream<S, E>(parts: S) -> Self
     where
@@ -838,7 +839,7 @@ fn streamed(body: DuplexStream, producer: JoinHandle<Result<(), BoxError>>) -> R
 /// The response body: serialized bytes as the producer writes them, followed
 /// by the producer's own outcome.
 ///
-/// Draining the pipe is not enough to call the response complete — a producer
+/// Draining the pipe is not enough to call the response complete. A producer
 /// that failed after its last successful write must still poison the stream,
 /// so that the client sees a truncated body rather than a plausible one.
 struct ProducerStream {

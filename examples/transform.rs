@@ -1,4 +1,4 @@
-//! One flow file in, one flow file out — synchronously.
+//! One flow file in, one flow file out, synchronously.
 //!
 //! The everyday case: receive a flow file, rewrite its content, and pass it on
 //! with the attributes intact.

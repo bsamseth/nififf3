@@ -20,10 +20,10 @@ use crate::{Error, FlowFile};
 /// # Panics
 ///
 /// If `size` disagrees with the content's actual length, as
-/// [`FlowFile::to_bytes`](crate::FlowFile::to_bytes) does — only reachable by
-/// breaking [`map_content`](crate::FlowFile::map_content)'s contract. The check
-/// is here because `Deserialize` rejects that mismatch, so without it this
-/// would emit JSON its own reader refuses.
+/// [`FlowFile::to_bytes`](crate::FlowFile::to_bytes) does. You can only reach
+/// that by breaking [`map_content`](crate::FlowFile::map_content)'s contract.
+/// The check is here because `Deserialize` rejects that mismatch, so without it
+/// this would emit JSON its own reader refuses.
 impl Serialize for FlowFile<Vec<u8>> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -52,10 +52,10 @@ impl Serialize for FlowFile<Vec<u8>> {
 }
 
 /// Deserializes the structure produced by the `Serialize` impl. The `size`
-/// field may be omitted; when present it must match the decoded content
-/// length. Missing `attributes` default to an empty map, and missing `content`
-/// to no content — so `{}` is a valid empty flow file, and every value this
-/// impl can produce round-trips.
+/// field may be omitted, and when it is present it must match the decoded
+/// content length. Missing `attributes` default to an empty map, and missing
+/// `content` to no content. So `{}` is a valid empty flow file, and every value
+/// this impl can produce round-trips.
 impl<'de> Deserialize<'de> for FlowFile<Vec<u8>> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -92,9 +92,9 @@ impl<'de> Deserialize<'de> for FlowFile<Vec<u8>> {
 ///
 /// [`Serialize`] is implemented for `FlowFile<Vec<u8>>` only, because
 /// serializing takes `&self` and reading a reader takes `&mut`. This wrapper
-/// bridges that, and streams the content through the base64 encoder as it goes
-/// — so what is held in memory is the encoded string, not the content *and*
-/// its encoding.
+/// bridges that. It streams the content through the base64 encoder as it goes,
+/// so what it holds in memory is the encoded string, rather than the content
+/// and its encoding at once.
 ///
 /// ```
 /// use nififf3::{FlowFile, StreamingFlowFile};
@@ -234,8 +234,8 @@ mod tests {
     }
 
     /// Content that ends early would otherwise serialize to a flow file whose
-    /// declared size does not match what it carries — which this impl's own
-    /// `Deserialize` would then reject.
+    /// declared size does not match what it carries. This impl's own
+    /// `Deserialize` would then reject it.
     #[test]
     fn streaming_a_truncated_content_fails() {
         use crate::StreamingFlowFile;

@@ -152,7 +152,7 @@ fn from_json(reader: Box<dyn BufRead>, limits: Limits) -> Result<()> {
     for flow_file in serde_json::Deserializer::from_reader(reader).into_iter::<FlowFile<Vec<u8>>>()
     {
         // The JSON path never goes through a parser, so the limits have to be
-        // applied to the decoded flow file instead — otherwise `--max-*` would
+        // applied to the decoded flow file instead. Otherwise `--max-*` would
         // mean something on one input format and nothing on the other.
         let flow_file = flow_file?;
         limits.check(flow_file.attributes(), flow_file.size())?;

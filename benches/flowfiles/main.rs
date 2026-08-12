@@ -5,24 +5,23 @@
 //! generates them from a fixed seed and caches them on disk, so numbers are
 //! comparable between runs on the same machine.
 //!
-//! Each group is measured against three shapes of input — see
-//! [`corpus::CORPORA`] — because they stress different things: per-flow-file
+//! Each group is measured against three shapes of input, listed in
+//! [`corpus::CORPORA`], because they stress different things: per-flow-file
 //! overhead, header work, and moving content. A change that helps one can
-//! easily do nothing for the others, which is exactly what these are here to
-//! show.
+//! easily do nothing for the others, and showing that is what these are for.
 //!
-//! Throughput is reported over the *serialized* size of the input in every
-//! case, including the write groups, so a given corpus's numbers can be
-//! compared across groups.
+//! Throughput is reported over the serialized size of the input in every case,
+//! including the write groups, so a given corpus's numbers can be compared
+//! across groups.
 //!
 //! # Reading the numbers
 //!
-//! Destinations are [`Consuming`], never `io::sink` — see there for why a sink
-//! turns a real 9% win into a reported 99.9% one.
+//! Destinations are [`Consuming`] rather than `io::sink`. See there for why a
+//! sink turns a real 9% win into a reported 99.9% one.
 //!
 //! `few_large` moves 32 MiB per iteration and is dominated by page faults and
 //! the allocator, so it swings by tens of percent between runs on a machine
-//! that is doing anything else; `many_small` and `wide_attrs` reproduce to
+//! that is doing anything else. `many_small` and `wide_attrs` reproduce to
 //! within a few points. Take a `few_large` result seriously only when it holds
 //! across runs, and check `uptime` before believing any of them.
 
@@ -41,7 +40,7 @@ struct Input {
     stream: Vec<u8>,
     /// The same flow files, parsed.
     parsed: Vec<FlowFile<Vec<u8>>>,
-    /// The same flow files, each serialized on its own — what the
+    /// The same flow files, each serialized on its own, which is what the
     /// single-flow-file entry points take. Shrunk to an exact fit, so that the
     /// capacity of the input is not itself something a change can alter: how
     /// `to_bytes` sizes its buffer is under measurement elsewhere, and must not
@@ -90,15 +89,15 @@ fn serialized_exactly(flow_file: &FlowFile<Vec<u8>>) -> Vec<u8> {
 /// A destination that costs what a destination costs: every byte handed to it
 /// is copied exactly once, and nothing is kept.
 ///
-/// `io::sink` will not do. It *discards* rather than copying, so a change that
-/// removes a copy the crate was making for itself shows up against it as
-/// removing essentially all the work — which is true of the crate and false of
-/// the program, since the copy into a real destination is still to come. That
-/// turns a genuine 9% end-to-end win into a reported 99.9%.
+/// `io::sink` will not do. It discards the bytes rather than copying them, so
+/// a change that removes a copy the crate was making for itself shows up
+/// against it as removing essentially all the work. That is true of the crate
+/// and false of the program, because the copy into a real destination is still
+/// to come. It turns a genuine 9% end-to-end win into a reported 99.9%.
 ///
 /// This keeps a single scratch buffer and reuses it, so after the first write
-/// there is no allocation and no growth: what remains is the crate's work plus
-/// one `memcpy`, which is the floor a real writer cannot go below.
+/// there is no allocation and no growth. What remains is the crate's work plus
+/// one `memcpy`, and a real writer cannot do less than that.
 #[derive(Default)]
 struct Consuming(Vec<u8>);
 
@@ -349,10 +348,10 @@ fn content(c: &mut Criterion) {
 
 /// What the crate costs on top of moving the same bytes with `std` alone.
 ///
-/// Not a target to beat — the parser has real work to do that these do not —
-/// but a scale for the numbers above: if buffering a stream of flow files is
-/// far off `read_to_end` over the same bytes, the gap is the crate's, and
-/// worth knowing the size of.
+/// This is a scale for the numbers above rather than a target to beat, because
+/// the parser has real work to do that these do not. If buffering a stream of
+/// flow files is far off `read_to_end` over the same bytes, the gap is the
+/// crate's, and worth knowing the size of.
 fn baseline(c: &mut Criterion) {
     let inputs = inputs();
 

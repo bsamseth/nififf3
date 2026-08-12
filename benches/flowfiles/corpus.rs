@@ -3,9 +3,9 @@
 //!
 //! Benchmarks want inputs big enough to measure and identical between runs,
 //! which rules out both committing them and building them fresh each time. So
-//! they are generated from a fixed-seed generator — the same one
-//! `tests/robustness.rs` uses — into `benches/corpus/`, which is gitignored,
-//! and reused on every later run.
+//! they are generated into `benches/corpus/`, which is gitignored, and reused
+//! on every later run. The generator has a fixed seed, and it is the same one
+//! `tests/robustness.rs` uses.
 //!
 //! Cache validity is keyed on [`VERSION`] through the file name. Changing a
 //! generator means bumping it, so stale files stop being found rather than
@@ -20,7 +20,7 @@ use nififf3::{FlowFile, FlowFilesWriter};
 const VERSION: u32 = 1;
 
 /// A small linear congruential generator: not good randomness, but the same
-/// sequence every run, which is what a benchmark needs.
+/// sequence every run, and a benchmark needs that.
 pub struct Rng(u64);
 
 impl Rng {
@@ -103,7 +103,7 @@ pub fn load(corpus: &Corpus) -> Vec<u8> {
     // Only on the run that generates it, so it says what the numbers about to
     // appear were measured over without repeating itself on every later run.
     eprintln!(
-        "generated {} ({} KiB) — {}",
+        "generated {} ({} KiB): {}",
         corpus.name,
         bytes.len() / 1024,
         corpus.about,

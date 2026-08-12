@@ -1,8 +1,8 @@
 //! Well-known flow file attribute names used by NiFi.
 //!
 //! NiFi treats these as ordinary attributes, so nothing forces you to use
-//! them — `Fragments` writes them by default but takes
-//! different keys if you need them.
+//! them. `Fragments` writes them by default, and takes different keys if you
+//! need it to.
 
 /// The per-flow-file unique identifier. Replaced with a fresh value by
 /// `FlowFile::derive`.

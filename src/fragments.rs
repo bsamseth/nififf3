@@ -9,16 +9,16 @@ use crate::attr;
 
 /// The attribute keys a fragment set is numbered with.
 ///
-/// Defaults to NiFi's own — [`fragment.identifier`](attr::FRAGMENT_ID),
+/// The defaults are NiFi's own: [`fragment.identifier`](attr::FRAGMENT_ID),
 /// [`fragment.index`](attr::FRAGMENT_INDEX),
 /// [`fragment.count`](attr::FRAGMENT_COUNT) and
-/// [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) — which is
-/// what to use for anything `MergeContent` will see.
+/// [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME). Use those
+/// for anything `MergeContent` will see.
 ///
-/// Worth naming as a value when they are *not* the defaults, because both ends
-/// of a split need the same set: `Fragments::with_keys` to write them and
+/// Hold the keys as a value when they are something else, because both ends of
+/// a split need the same set. `Fragments::with_keys` writes them, and
 /// [`FlowFileBuilder::defragment_with`](crate::FlowFileBuilder::defragment_with)
-/// to undo them.
+/// undoes them.
 ///
 /// ```
 /// # #[cfg(feature = "uuid")] {
@@ -110,31 +110,33 @@ impl Default for FragmentKeys {
 
 /// A counter for splitting one flow file into many.
 ///
-/// Created with [`FlowFile::fragments`](crate::FlowFile::fragments). Each call
-/// to [`next_part`](Self::next_part) yields a [`FlowFileBuilder`] carrying the parent's
-/// attributes — with a fresh [`uuid`](attr::UUID), as
-/// [`derive`](crate::FlowFile::derive) does — plus NiFi's fragment attributes,
-/// which let `MergeContent` reassemble the parent in `defragment` mode:
+/// [`FlowFile::fragments`](crate::FlowFile::fragments) creates one. Each call
+/// to [`next_part`](Self::next_part) yields a [`FlowFileBuilder`] carrying the
+/// parent's attributes, with a fresh [`uuid`](attr::UUID) as
+/// [`derive`](crate::FlowFile::derive) gives it. On top of those it sets NiFi's
+/// fragment attributes, which let `MergeContent` reassemble the parent in
+/// `defragment` mode:
 ///
-/// - [`fragment.identifier`](attr::FRAGMENT_ID) — a random UUID shared by the
+/// - [`fragment.identifier`](attr::FRAGMENT_ID) is a random UUID shared by the
 ///   whole set.
-/// - [`fragment.index`](attr::FRAGMENT_INDEX) — a one-up counter from 1.
-/// - [`fragment.count`](attr::FRAGMENT_COUNT) — only after
-///   [`with_count`](Self::with_count); the total is rarely known up front.
-///   See *Declaring the count* below, because `MergeContent` cannot reassemble
-///   a bundle that never declares one.
-/// - [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) — the
+/// - [`fragment.index`](attr::FRAGMENT_INDEX) is a one-up counter from 1.
+/// - [`fragment.count`](attr::FRAGMENT_COUNT) is set only after
+///   [`with_count`](Self::with_count), because the total is rarely known up
+///   front. See "Declaring the count" below, because `MergeContent` cannot
+///   reassemble a bundle that never declares one.
+/// - [`segment.original.filename`](attr::SEGMENT_ORIGINAL_FILENAME) is the
 ///   parent's [`filename`](attr::FILENAME), if it had one.
 ///
 /// All four are dropped from the inherited attributes rather than carried
-/// over, since a new split supersedes the old one — including
-/// `segment.original.filename`, so that a parent with no `filename` of its
-/// own yields parts with no original filename rather than a grandparent's.
+/// over, because a new split supersedes the old one. That includes
+/// `segment.original.filename`. So a parent with no `filename` of its own
+/// yields parts with no original filename, rather than parts carrying a
+/// grandparent's.
 ///
-/// What every part inherits is otherwise the parent's attributes, and
+/// Every part otherwise inherits the parent's attributes.
 /// [`attribute`](Self::attribute) and
 /// [`without_attribute`](Self::without_attribute) adjust that set once for the
-/// whole split rather than on each part.
+/// whole split, rather than on each part.
 ///
 /// ```
 /// use nififf3::FlowFile;
@@ -156,18 +158,19 @@ impl Default for FragmentKeys {
 ///
 /// # Declaring the count
 ///
-/// A bundle has to say how big it is. NiFi's `MergeContent` fills a bin when it
-/// holds as many flow files as the [`fragment.count`](attr::FRAGMENT_COUNT) of
-/// one of them says, and a bundle that never declares a count is not merged at
-/// all — the bin times out and every flow file in it is routed to `failure`.
-/// There are two ways to declare it, and a split uses exactly one:
+/// A bundle has to say how many flow files it holds. NiFi's `MergeContent`
+/// fills a bin once the bin holds as many flow files as the
+/// [`fragment.count`](attr::FRAGMENT_COUNT) of one of them says. If a bundle
+/// never declares a count, the bin times out and every flow file in it is
+/// routed to `failure`. There are two ways to declare it, and a split uses
+/// exactly one:
 ///
-/// - The total is known before the parts are built: [`with_count`](Self::with_count),
-///   and every part carries it.
-/// - The total is only known once the input is exhausted — a stream, an
-///   archive, a decoder: [`terminate`](Self::terminate), which ends the set
-///   with an empty flow file carrying the count. Nothing has to be held back
-///   or rewritten, so the parts can be streamed as they are produced.
+/// - If you know the total before you build the parts, use
+///   [`with_count`](Self::with_count), and every part carries it.
+/// - If you only learn the total once the input is exhausted, as with a
+///   stream, an archive, or a decoder, use [`terminate`](Self::terminate). It
+///   ends the set with an empty flow file carrying the count. Nothing has to
+///   be held back or rewritten, so the parts can stream as they are produced.
 #[cfg_attr(docsrs, doc(cfg(feature = "uuid")))]
 #[cfg(feature = "uuid")]
 #[derive(Debug)]
@@ -186,8 +189,8 @@ impl Fragments {
         let keys = FragmentKeys::default();
         let original_filename = attributes.get(attr::FILENAME).cloned();
         // A fresh split supersedes any the parent was itself part of, under
-        // the default keys. The configured keys are not known yet — they are
-        // set on the returned counter — so `part` drops those as well.
+        // the default keys. The configured keys are not known yet, because
+        // they are set on the returned counter, so `part` drops those as well.
         let mut attributes = attributes.clone();
         for key in keys.all() {
             attributes.remove(key.as_str());
@@ -228,8 +231,8 @@ impl Fragments {
 
     /// Use `keys` for all four fragment attributes.
     ///
-    /// The form to reach for when the same keys have to be undone later:
-    /// hold a [`FragmentKeys`] and hand it to both this and
+    /// Reach for this when the same keys have to be undone later. Hold a
+    /// [`FragmentKeys`], and hand it to both this call and
     /// [`defragment_with`](crate::FlowFileBuilder::defragment_with).
     #[must_use]
     pub fn with_keys(mut self, keys: FragmentKeys) -> Self {
@@ -240,14 +243,14 @@ impl Fragments {
     /// Add an attribute that every part in this set carries, replacing any
     /// value inherited from the parent.
     ///
-    /// The same call as [`FlowFileBuilder::attribute`], made once for the set
-    /// instead of on each part — for what is true of the split rather than of
-    /// one fragment: the format the parts were cut into, the run that produced
-    /// them, the schema they follow.
+    /// This is the same call as [`FlowFileBuilder::attribute`], made once for
+    /// the set instead of on each part. Use it for something that is true of
+    /// the split rather than of one fragment, such as the format the parts
+    /// were cut into or the run that produced them.
     ///
-    /// It joins the inherited attributes, so it applies to
-    /// [`terminate`](Self::terminate) too, and a part that sets the same key on
-    /// its own builder still wins.
+    /// The value joins the inherited attributes, so it applies to
+    /// [`terminate`](Self::terminate) too. If a part sets the same key on its
+    /// own builder, the part's value wins.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -268,9 +271,9 @@ impl Fragments {
     /// assert_eq!(second.attribute("mime.type"), Some("text/plain"), "the part wins");
     /// ```
     ///
-    /// The four fragment attributes are not settable this way: they are
-    /// computed per part, so a value written here under one of
-    /// [`keys`](Self::keys) is replaced by the one the split produces.
+    /// You cannot set the four fragment attributes this way. They are computed
+    /// per part, so a value written here under one of [`keys`](Self::keys) is
+    /// replaced by the one the split produces.
     #[must_use]
     pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.attributes.insert(key.into(), value.into());
@@ -292,9 +295,9 @@ impl Fragments {
 
     /// Drop an inherited attribute from every part in this set.
     ///
-    /// The counterpart to [`attribute`](Self::attribute), for a parent
-    /// attribute that does not describe the pieces it was cut into — a
-    /// checksum over the whole, a record count, an original size.
+    /// Use it for a parent attribute that says nothing true about the pieces
+    /// the parent was cut into, such as a record count or a checksum over the
+    /// whole. [`attribute`](Self::attribute) is the counterpart that adds one.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -381,8 +384,9 @@ impl Fragments {
     ///
     /// If more fragments are produced than [`with_count`](Self::with_count)
     /// declared. NiFi's `MergeContent` bins on `fragment.count`, so an index
-    /// past it describes a set that cannot be reassembled — a panic is louder
-    /// than shipping a bundle that times out to `failure` in production.
+    /// past it describes a set that cannot be reassembled. Panicking here is
+    /// louder than shipping a bundle that times out to `failure` in
+    /// production.
     #[must_use]
     pub fn next_part(&mut self) -> FlowFileBuilder {
         self.index += 1;
@@ -395,27 +399,27 @@ impl Fragments {
         self.part(self.index, self.count)
     }
 
-    /// Finish the set with a terminator: an empty flow file carrying the
+    /// Finish the set with a terminator, an empty flow file carrying the
     /// [`fragment.count`](attr::FRAGMENT_COUNT) the parts could not know.
     ///
-    /// For a split whose total is only known once the input runs out — the
-    /// streaming case, where the earlier parts are on the wire long before the
-    /// last one is read. NiFi's `MergeContent` needs `fragment.count` on *at
-    /// least one* flow file in the bundle and fills a bin when it holds that
-    /// many flow files, so a final flow file that declares the count
-    /// reassembles correctly: it is one of the flow files in the bin, and
-    /// contributes no content to the merge.
+    /// Use it for a split whose total is only known once the input runs out.
+    /// That is the streaming case, where the earlier parts are on the wire long
+    /// before the last one is read. NiFi's `MergeContent` needs
+    /// `fragment.count` on one flow file in the bundle, and it fills a bin once
+    /// the bin holds that many flow files. So a final flow file that declares
+    /// the count reassembles correctly. It is one of the flow files in the bin,
+    /// and it contributes no content to the merge.
     ///
-    /// The count therefore includes the terminator itself. After `n` parts the
-    /// terminator carries `fragment.index = fragment.count = n + 1`, and this
-    /// consumes the counter — a part emitted afterwards would put `n + 2` flow
-    /// files in a bin declared to hold `n + 1`, which never fills and, once the
-    /// bin times out, routes the whole set to `MergeContent`'s `failure`
+    /// The count therefore includes the terminator itself. After `n` parts, the
+    /// terminator carries `fragment.index = fragment.count = n + 1`. This call
+    /// consumes the counter. A part emitted afterwards would put `n + 2` flow
+    /// files in a bin declared to hold `n + 1`. That bin never fills, and once
+    /// it times out the whole set goes to `MergeContent`'s `failure`
     /// relationship.
     ///
-    /// Use this *or* [`with_count`](Self::with_count), not both: when the total
-    /// is known up front the parts can declare it themselves and no terminator
-    /// is needed.
+    /// Use this or [`with_count`](Self::with_count), and not both. When the
+    /// total is known up front, the parts can declare it themselves and no
+    /// terminator is needed.
     ///
     /// ```
     /// use nififf3::{FlowFile, FlowFiles, FlowFilesWriter};
@@ -447,11 +451,11 @@ impl Fragments {
     ///
     /// A consumer doing its own reassembly can recognize the terminator as the
     /// part whose index equals the declared count and whose content is empty.
-    /// That is a convention, not a guarantee: an ordinary last part can look
-    /// the same, so a producer that emits empty parts *and* needs them told
-    /// apart should set an attribute of its own here — the returned flow file
-    /// is an ordinary one, and
-    /// [`attributes_mut`](crate::FlowFile::attributes_mut) still works.
+    /// That is a convention rather than a guarantee, because an ordinary last
+    /// part can look the same. If your producer emits empty parts and needs
+    /// them told apart, set an attribute of your own on the terminator. The
+    /// returned flow file is an ordinary one, so
+    /// [`attributes_mut`](crate::FlowFile::attributes_mut) works on it.
     ///
     /// # Panics
     ///
@@ -473,10 +477,10 @@ impl Fragments {
     /// `count` if it is to declare one.
     fn part(&self, index: u64, count: Option<u64>) -> FlowFileBuilder {
         let mut builder = FlowFileBuilder::new().attributes(self.attributes.clone());
-        // The parent's values under *these* keys, which `Fragments::new` could
-        // not know. Dropping them first rather than relying on the writes
-        // below matters for the two that are conditional: a set that declares
-        // no count, or a parent with no filename, must not leave the
+        // The parent's values under these keys, which `Fragments::new` could
+        // not know. Dropping them first, rather than relying on the writes
+        // below, matters for the two writes that are conditional. A set that
+        // declares no count, or a parent with no filename, must not leave the
         // grandparent's answer standing in for the one this split would give.
         for key in self.keys.all() {
             builder = builder.without_attribute(key);
@@ -617,8 +621,8 @@ mod tests {
         assert_eq!(declared, bundle.len());
     }
 
-    /// The point of setting an attribute on the set: it reaches every part
-    /// without being repeated on each, the terminator included.
+    /// An attribute set on the whole split reaches every part without being
+    /// repeated on each one, and it reaches the terminator too.
     #[test]
     fn a_set_wide_attribute_reaches_every_part() {
         let parent = parent();
@@ -641,8 +645,9 @@ mod tests {
         }
     }
 
-    /// Set-wide is a default, not an override: a part that says otherwise on
-    /// its own builder still wins, as it does over an inherited attribute.
+    /// Attributes set on the whole split act as defaults. If a part sets the
+    /// same key on its own builder, the part's value wins, just as it does
+    /// over an inherited attribute.
     #[test]
     fn a_part_overrides_a_set_wide_attribute() {
         let parent = parent();
@@ -687,9 +692,9 @@ mod tests {
         );
     }
 
-    /// The fragment attributes are computed per part, so writing one under a
-    /// fragment key here cannot stand: it would describe the wrong flow file
-    /// on every part but at most one.
+    /// The fragment attributes are computed per part, so a value written here
+    /// under a fragment key cannot stand. It would describe the wrong flow
+    /// file on every part but one.
     #[test]
     fn a_set_wide_attribute_cannot_displace_the_fragment_attributes() {
         let parent = parent();
@@ -705,8 +710,8 @@ mod tests {
         assert_eq!(first.attribute("fragment.count"), Some("2"));
     }
 
-    /// Under custom keys the same has to hold, since it is the configured key
-    /// that names a fragment attribute, not the default one.
+    /// The same has to hold under custom keys, because there the configured key
+    /// is the one that names a fragment attribute.
     #[test]
     fn a_set_wide_attribute_cannot_displace_a_custom_fragment_attribute() {
         let parent = parent();
@@ -786,10 +791,10 @@ mod tests {
         );
     }
 
-    /// The custom keys are configured *after* the counter is created, so the
+    /// The custom keys are configured after the counter is created, so the
     /// inherited values under them can only be dropped where the parts are
-    /// built. A part must never inherit a fragment attribute that does not
-    /// describe the split it belongs to.
+    /// built. A part must never inherit a fragment attribute that describes
+    /// some other split.
     #[test]
     fn a_new_split_replaces_the_parents_custom_fragment_attributes() {
         let parent = FlowFile::builder()
@@ -804,7 +809,7 @@ mod tests {
         assert_ne!(child.attributes()["split.id"], "old");
         assert_eq!(child.attributes()["split.n"], "1");
         // This split declared no count, and the parent has no `filename`, so
-        // neither attribute applies to it — the parent's values must not stand
+        // neither attribute applies to it. The parent's values must not stand
         // in for the ones this split would have written.
         assert!(
             !child.attributes().contains_key("split.total"),
@@ -816,7 +821,8 @@ mod tests {
         );
     }
 
-    /// The same, for the terminator: it goes through the same attribute path.
+    /// The terminator goes through the same attribute path, so the same has to
+    /// hold for it.
     #[test]
     fn a_terminator_replaces_the_parents_custom_fragment_attributes() {
         let parent = FlowFile::builder()
@@ -829,8 +835,8 @@ mod tests {
         assert!(!terminator.attributes().contains_key("split.parent"));
     }
 
-    /// Configuring custom keys must not stop the default ones being dropped:
-    /// a part carrying a parent's `fragment.count` is just as unmergeable.
+    /// Configuring custom keys must not stop the default ones being dropped.
+    /// A part carrying a parent's `fragment.count` is just as unmergeable.
     #[test]
     fn custom_keys_still_drop_the_default_fragment_attributes() {
         let parent = FlowFile::builder()
