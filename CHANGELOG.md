@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.4
+
+A performance pass over parsing and serializing, and the shorthands that were
+missing from the entry points.
 
 ### Added
 
