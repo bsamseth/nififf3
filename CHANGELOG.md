@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.5
+
+A documentation release. The API and its behavior are unchanged, so upgrading
+from 0.3.4 changes nothing about how your code runs.
+
+### Documentation
+
+- The doc comments, the code comments and this changelog are rewritten in the
+  same plain style as the README. Sentences carry one idea each, the em dashes
+  are gone, and each item's documentation opens with what the item does rather
+  than with a comparison to a sibling method. The detail is the same
+  throughout: every number, error type and trade-off that was written down
+  before is still written down.
+- `From<io::Error> for Error` and `From<Error> for io::Error` now document
+  themselves. One doc block used to cover both conversions while sitting on
+  one of them, so what you needed to know about turning an `Error` into an
+  `io::Error` was rendered under the impl that does the opposite. Each
+  conversion now carries its own description and its own example.
+
 ## 0.3.4
 
 This release makes parsing and serializing faster, and adds the shorthands that
