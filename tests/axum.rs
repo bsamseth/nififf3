@@ -115,7 +115,7 @@ async fn the_batch_extractor_reports_a_malformed_body_from_the_handler() {
 /// does, so an over-large body is a 413 there too. It is caught while reading,
 /// rather than after the whole batch is in memory.
 #[tokio::test]
-async fn the_batch_extractor_honours_the_default_body_limit() {
+async fn the_batch_extractor_honors_the_default_body_limit() {
     let app = app().layer(DefaultBodyLimit::max(64));
     let mut bytes = FlowFile::builder().content(vec![0u8; 100_000]).to_bytes();
     bytes.extend(FlowFile::builder().content(&b"x"[..]).to_bytes());
@@ -444,7 +444,7 @@ async fn extractor_applies_default_header_limits() {
 }
 
 #[tokio::test]
-async fn extractor_honours_the_default_body_limit() {
+async fn extractor_honors_the_default_body_limit() {
     // 64 bytes is past the header but well short of the content, so the limit
     // trips while the content streams; 8 trips while the header is still
     // being read. Both are the body being too large, not malformed.

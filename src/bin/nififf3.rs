@@ -17,20 +17,20 @@ struct Cli {
     limits: LimitArgs,
 }
 
-/// Caps on a flow file's attributes and declared content size. Unset means no
-/// cap, matching NiFi's own unpackager; set them when handling input you do not
-/// trust.
+/// Caps on a flow file's attributes and declared content size. Leaving one
+/// unset means no cap, matching NiFi's own unpackager. Set them when handling
+/// input you do not trust.
 ///
-/// Every subcommand honours them, including the two that never run a header
+/// Every subcommand honors them, including the two that never run a header
 /// parser: `from-json` checks each decoded flow file, and `create` checks the
 /// one it built.
 ///
-/// Where they are enforced differs, and it matters for `--max-content-len`.
-/// The binary paths and `create` refuse oversized content *before* buffering
-/// it. `from-json` cannot: serde has decoded the base64 into memory by the
-/// time there is a flow file to judge, so the limit rejects the input rather
-/// than preventing the allocation. Bound untrusted JSON at the transport if
-/// that distinction matters.
+/// Where they are enforced differs, and that matters for `--max-content-len`.
+/// The binary paths and `create` refuse oversized content before buffering it.
+/// `from-json` cannot. Serde has decoded the base64 into memory by the time
+/// there is a flow file to check, so the limit rejects the input rather than
+/// preventing the allocation. Bound untrusted JSON at the transport if that
+/// difference matters.
 #[derive(Args)]
 #[expect(
     clippy::struct_field_names,
@@ -99,7 +99,7 @@ enum Command {
         /// Input file; `-` or omitted reads from stdin.
         path: Option<PathBuf>,
     },
-    /// Create a flow file on stdout; the content is read from stdin.
+    /// Create a flow file on stdout. The content is read from stdin.
     Create {
         /// Attributes as key=value pairs.
         #[arg(value_name = "KEY=VALUE")]
@@ -129,8 +129,8 @@ fn run() -> Result<()> {
     }
 }
 
-/// Open the input for streaming; flow files are processed one at a time
-/// rather than reading the whole input up front.
+/// Open the input for streaming. Flow files are processed one at a time,
+/// rather than by reading the whole input up front.
 fn open_input(path: Option<&Path>) -> io::Result<Box<dyn BufRead>> {
     match path {
         Some(path) if path != Path::new("-") => Ok(Box::new(BufReader::new(File::open(path)?))),
@@ -219,8 +219,8 @@ fn create(attribute_args: &[String], limits: Limits) -> Result<()> {
 /// Read to the end of `reader`, refusing to buffer more than `max` bytes.
 ///
 /// `--max-content-len` is a guard, so it has to stop the read rather than
-/// judge it afterwards: buffering an unbounded stdin and *then* rejecting it
-/// is the thing the flag exists to prevent.
+/// judge it afterwards. Buffering an unbounded stdin and rejecting it after
+/// the fact is the thing the flag exists to prevent.
 fn read_within(mut reader: impl Read, max: Option<u64>) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let Some(limit) = max else {

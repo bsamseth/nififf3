@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn terminate_honours_custom_attribute_keys() {
+    fn terminate_honors_custom_attribute_keys() {
         let mut parts = parent().fragments().count_attribute("split.total");
         let _ = parts.next_part();
         let terminator = parts.terminate();
