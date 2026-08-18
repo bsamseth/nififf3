@@ -577,6 +577,59 @@ enum Source {
 /// one of them is bounded by memory. See [`new`](Self::new) for the shape of a
 /// handler.
 ///
+/// # Reading the request while writing the response
+///
+/// A producer that reads the request body and writes parts from the same task
+/// can deadlock. What triggers it is the client, so the same handler can work
+/// for years and then stop when one arrives that behaves differently.
+///
+/// Some HTTP clients send the whole request body before they read any of the
+/// response. NiFi's does. Against one of those, this happens:
+///
+/// 1. The producer writes parts until
+///    [`buffer_size`](Self::buffer_size) and the socket buffers are full.
+/// 2. Blocked on that write, the producer stops reading the request body.
+/// 3. The client's socket fills, so the client blocks writing. It will not
+///    read the response until it has sent the whole request.
+/// 4. Nothing drains the response, so the producer never wakes.
+///
+/// Each side is waiting for the other. curl reads the response while it
+/// writes, so it never triggers this, and that makes the failure look like a
+/// problem with one particular client.
+///
+/// It takes a request large enough that the client cannot fit what is left of
+/// it into the socket buffers. Under that size the client finishes sending,
+/// starts reading, and the response drains. So this appears at some size and
+/// not below it. How many parts you write does not matter.
+///
+/// Knowing every part's size up front does not avoid it. A producer that
+/// streams parts starts writing sooner than one that buffers each part first,
+/// which brings it to step 1 earlier rather than later.
+///
+/// ## Keeping the request moving
+///
+/// The fix is to go on reading the request whatever the response is doing.
+/// Drain the body into storage of your own, and let the producer read that
+/// instead of the socket. Spooling to a temporary file keeps memory bounded
+/// however large the request is:
+///
+/// ```ignore
+/// let builder = parent.derive_keep_uuid();
+/// let spooled = builder.tempfile_async(parent.into_content()).await?;
+/// // Build the response from `spooled`, which no longer touches the socket.
+/// ```
+///
+/// That drains the request before the first part is written. To start writing
+/// straight away, run the drain as its own task and have the producer follow
+/// the file behind it. Both are in `tests/response_deadlock.rs`, which
+/// measures the difference: the first part is ready after 1 ms when the two
+/// run concurrently, against 2382 ms when the request is drained first.
+///
+/// Raising [`buffer_size`](Self::buffer_size) past the size of the whole
+/// response also works, because the producer then never blocks on a write.
+/// It costs memory in proportion to the response, and it fails again as soon
+/// as a response outgrows the buffer.
+///
 /// # Status codes
 ///
 /// Returning a `FlowFilesResponse` commits you to a 2xx status, because the
