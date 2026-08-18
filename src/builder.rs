@@ -372,7 +372,10 @@ mod tests {
             .content(&b"a\nb"[..]);
 
         let mut parts = parent.fragments().with_count(2);
-        let part = parts.next_part().attribute("filename", "record-0").content(&b"a"[..]);
+        let part = parts
+            .next_part()
+            .attribute("filename", "record-0")
+            .content(&b"a"[..]);
 
         let merged = part.derive().defragment().content(&b"a\nb"[..]);
         let attributes = merged.attributes();
@@ -418,8 +421,16 @@ mod tests {
         assert_eq!(part.attribute("split.parent"), Some("records.csv"));
 
         let merged = part.derive().defragment_with(&keys).content(&b"a\nb"[..]);
-        assert_eq!(merged.attribute("filename"), Some("records.csv"), "restored");
-        assert_eq!(merged.attribute("source"), Some("upload"), "still inherited");
+        assert_eq!(
+            merged.attribute("filename"),
+            Some("records.csv"),
+            "restored"
+        );
+        assert_eq!(
+            merged.attribute("source"),
+            Some("upload"),
+            "still inherited"
+        );
         for key in ["split.id", "split.n", "split.total", "split.parent"] {
             assert_eq!(merged.attribute(key), None, "{key} should be gone");
         }

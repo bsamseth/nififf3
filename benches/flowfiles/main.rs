@@ -261,9 +261,7 @@ fn header(c: &mut Criterion) {
         let headers: Vec<_> = input
             .parsed
             .iter()
-            .map(|flow_file| {
-                FlowFile::from_parts(0, flow_file.attributes().clone(), Vec::new())
-            })
+            .map(|flow_file| FlowFile::from_parts(0, flow_file.attributes().clone(), Vec::new()))
             .collect();
         let total: usize = headers.iter().map(|h| h.to_bytes().len()).sum();
         group.throughput(bytes(total));

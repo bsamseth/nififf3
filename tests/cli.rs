@@ -186,11 +186,7 @@ fn limit_flags_reject_oversized_headers() {
         .stderr(predicates::str::contains("content size"));
 
     // Unset means no cap, as before.
-    nififf3()
-        .arg("attrs")
-        .write_stdin(many)
-        .assert()
-        .success();
+    nififf3().arg("attrs").write_stdin(many).assert().success();
 }
 
 /// The limit flags are global, so they have to mean the same thing on every

@@ -30,7 +30,8 @@ async fn read_declared<R: AsyncRead + Unpin>(
     let mut done = 0u64;
     while done < len {
         let step = (len - done).min(done.max(crate::sync::RESERVE_AHEAD));
-        let step = usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
+        let step =
+            usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
         buf.reserve_exact(step);
         let read = reader.take(step as u64).read_to_end(buf).await?;
         if read == 0 {
@@ -581,9 +582,7 @@ impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
 
         self.size = size;
         self.unread = size;
-        let Self {
-            reader, unread, ..
-        } = self;
+        let Self { reader, unread, .. } = self;
         Ok(Some(FlowFile::from_raw_parts(
             size,
             attributes,
@@ -1114,7 +1113,11 @@ mod tests {
         let bytes = sample().to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
 
-        let err = FlowFilesAsync::new(truncated).next().await.unwrap().unwrap_err();
+        let err = FlowFilesAsync::new(truncated)
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1178,7 +1181,10 @@ mod tests {
         .collect::<Vec<_>>()
         .await;
         assert_eq!(collected.len(), 1);
-        assert_eq!(collected[0].as_ref().unwrap().content().as_slice(), b"hello");
+        assert_eq!(
+            collected[0].as_ref().unwrap().content().as_slice(),
+            b"hello"
+        );
 
         assert_send(&FlowFilesAsync::new(std::io::Cursor::new(Vec::new())).into_stream());
     }

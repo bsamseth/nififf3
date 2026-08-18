@@ -80,7 +80,12 @@ async fn unpack(
                     let size = entry.header().entry_size()?;
                     let name = entry.path()?.display().to_string();
                     writer
-                        .write(parts.next_part().attribute("filename", name).reader(entry, size))
+                        .write(
+                            parts
+                                .next_part()
+                                .attribute("filename", name)
+                                .reader(entry, size),
+                        )
                         .await?;
                 }
                 Err(err) => {

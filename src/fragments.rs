@@ -3,9 +3,9 @@
 #[cfg(feature = "uuid")]
 use std::collections::HashMap;
 
+use crate::attr;
 #[cfg(feature = "uuid")]
 use crate::{FlowFile, FlowFileBuilder};
-use crate::attr;
 
 /// The attribute keys a fragment set is numbered with.
 ///
@@ -609,7 +609,9 @@ mod tests {
     fn a_terminated_bundle_declares_the_number_of_flow_files_it_contains() {
         let parent = parent();
         let mut parts = parent.fragments();
-        let mut bundle: Vec<_> = (0..4).map(|_| parts.next_part().content(Vec::new())).collect();
+        let mut bundle: Vec<_> = (0..4)
+            .map(|_| parts.next_part().content(Vec::new()))
+            .collect();
         bundle.push(parts.terminate());
 
         let declared: usize = bundle
@@ -784,9 +786,7 @@ mod tests {
 
         assert_eq!(child.attributes()["fragment.index"], "1");
         assert!(
-            !child
-                .attributes()
-                .contains_key("segment.original.filename"),
+            !child.attributes().contains_key("segment.original.filename"),
             "the grandparent's filename must not outlive the split it named"
         );
     }
@@ -804,7 +804,9 @@ mod tests {
             .attribute("split.parent", "grandparent.tar")
             .content(Vec::new());
 
-        let child = custom_keys(parent.fragments()).next_part().content(Vec::new());
+        let child = custom_keys(parent.fragments())
+            .next_part()
+            .content(Vec::new());
 
         assert_ne!(child.attributes()["split.id"], "old");
         assert_eq!(child.attributes()["split.n"], "1");
@@ -846,7 +848,9 @@ mod tests {
             .attribute("segment.original.filename", "grandparent.tar")
             .content(Vec::new());
 
-        let child = custom_keys(parent.fragments()).next_part().content(Vec::new());
+        let child = custom_keys(parent.fragments())
+            .next_part()
+            .content(Vec::new());
 
         for key in [
             "fragment.identifier",
@@ -854,7 +858,10 @@ mod tests {
             "fragment.count",
             "segment.original.filename",
         ] {
-            assert!(!child.attributes().contains_key(key), "{key} should be gone");
+            assert!(
+                !child.attributes().contains_key(key),
+                "{key} should be gone"
+            );
         }
     }
 
@@ -880,9 +887,7 @@ mod tests {
 
         assert_eq!(child.attributes()["split.parent"], "a.tar");
         assert!(
-            !child
-                .attributes()
-                .contains_key("segment.original.filename"),
+            !child.attributes().contains_key("segment.original.filename"),
             "one original filename per part, under the requested key"
         );
     }

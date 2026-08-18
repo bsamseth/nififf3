@@ -161,7 +161,9 @@ fn what_is_serialized_parses_back_identically() {
 fn the_field_length_boundary_round_trips() {
     for len in [0, 1, 0xFFFE, 0xFFFF, 0x1_0000, 0x1_0001] {
         let value = "v".repeat(len);
-        let flow_file = FlowFile::builder().attribute("k", &value).content(Vec::new());
+        let flow_file = FlowFile::builder()
+            .attribute("k", &value)
+            .content(Vec::new());
         let parsed = FlowFile::from_bytes(&flow_file.to_bytes()).unwrap();
         assert_eq!(parsed, flow_file, "value of {len} bytes");
     }

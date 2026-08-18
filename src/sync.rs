@@ -107,7 +107,8 @@ pub(crate) fn read_declared(
         // Never more than what is left, and never more than has already been
         // delivered, so bytes back the reservation rather than a claim.
         let step = (len - done).min(done.max(RESERVE_AHEAD));
-        let step = usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
+        let step =
+            usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
         // Reserved exactly rather than amortized. The sizes here already
         // double, so leaving the growth to the allocator would overshoot the
         // final one.
@@ -832,22 +833,19 @@ impl<R: Read> FlowFilesReader<R> {
             }
         }
 
-        let (attributes, size) =
-            match parse_header(&mut self.reader, Some(first[0]), self.limits) {
-                Ok(header) => header,
-                Err(err) => {
-                    self.done = true;
-                    return Err(err);
-                }
-            };
+        let (attributes, size) = match parse_header(&mut self.reader, Some(first[0]), self.limits) {
+            Ok(header) => header,
+            Err(err) => {
+                self.done = true;
+                return Err(err);
+            }
+        };
 
         self.size = size;
         self.unread = size;
         // Disjoint borrows of two fields, which is what lets the content carry
         // both the stream and the counter that tracks it.
-        let Self {
-            reader, unread, ..
-        } = self;
+        let Self { reader, unread, .. } = self;
         Ok(Some(FlowFile::from_raw_parts(
             size,
             attributes,
@@ -1328,7 +1326,10 @@ mod tests {
             ),
             "the skip must notice the content ran out"
         );
-        assert!(flow_files.next().unwrap().is_none(), "fused after the error");
+        assert!(
+            flow_files.next().unwrap().is_none(),
+            "fused after the error"
+        );
     }
 
     /// The eager reader has to agree with the two buffer-based entry points
@@ -1386,7 +1387,10 @@ mod tests {
     #[test]
     fn empty_finishes_a_build_with_no_content() {
         let done = FlowFile::builder().attribute("k", "v").empty();
-        assert_eq!(done, FlowFile::builder().attribute("k", "v").content(Vec::new()));
+        assert_eq!(
+            done,
+            FlowFile::builder().attribute("k", "v").content(Vec::new())
+        );
         assert_eq!(done.size(), 0);
     }
 
@@ -1548,7 +1552,12 @@ mod tests {
         let stream = writer.into_inner();
         assert_eq!(
             stream.len(),
-            FlowFile::builder().attribute("n", "1").content(Vec::new()).to_bytes().len() + 3
+            FlowFile::builder()
+                .attribute("n", "1")
+                .content(Vec::new())
+                .to_bytes()
+                .len()
+                + 3
         );
     }
 

@@ -73,7 +73,11 @@ async fn body_text(response: axum::response::Response) -> String {
 #[tokio::test]
 async fn the_batch_extractor_reads_every_flow_file_in_the_body() {
     let response = app()
-        .oneshot(Request::post("/batch").body(Body::from(batch_bytes())).unwrap())
+        .oneshot(
+            Request::post("/batch")
+                .body(Body::from(batch_bytes()))
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -157,7 +161,11 @@ async fn the_strict_batch_extractor_checks_the_content_type() {
 #[tokio::test]
 async fn the_single_extractor_rejects_a_batch_as_trailing_data() {
     let response = app()
-        .oneshot(Request::post("/echo").body(Body::from(batch_bytes())).unwrap())
+        .oneshot(
+            Request::post("/echo")
+                .body(Body::from(batch_bytes()))
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -244,7 +252,10 @@ async fn a_response_whose_content_reader_runs_long_is_cut_to_the_declared_size()
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.len(), declared);
-    assert_eq!(FlowFile::from_bytes(&body).unwrap().content().as_slice(), b"way");
+    assert_eq!(
+        FlowFile::from_bytes(&body).unwrap().content().as_slice(),
+        b"way"
+    );
 }
 
 #[tokio::test]
