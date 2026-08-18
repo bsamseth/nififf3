@@ -47,15 +47,15 @@
 use async_compression::tokio::bufread::GzipEncoder;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::routing::post;
 use axum::{Router, response::IntoResponse};
 use nififf3::{
     Error, FlowFile, FlowFileBody, FlowFilesAsync, FlowFilesReaderAsync, FlowFilesResponse,
     StrictFlowFileRequest, attr,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 /// The largest request the service will accept.
@@ -219,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = listener.local_addr()?;
     let (stop, shutdown) = oneshot::channel();
     let server = tokio::spawn(serve(listener, shutdown));
+    let client = reqwest::Client::new();
     println!("serving on http://{addr}");
 
     // Compressible, so the gzip round trip has something to show.
@@ -234,8 +235,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("in: one flow file, {} bytes of content", content.len());
 
     // --- one in, many out --------------------------------------------------
-    let (status, bundle) = send(addr, "/split", incoming.clone()).await?;
-    assert_eq!(status, 200, "split");
+    let (status, bundle) = send(&client, addr, "/split", incoming.clone()).await?;
+    assert_eq!(status, StatusCode::OK, "split");
 
     let mut flow_files = FlowFilesAsync::new(bundle.as_slice());
     let (mut chunks, mut chunk_bytes, mut declared) = (0, 0u64, None);
@@ -255,8 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(declared, Some(chunks + 1), "the chunks plus the terminator");
 
     // --- one in, one out, length decided by the transform ------------------
-    let (status, body) = send(addr, "/transform", incoming).await?;
-    assert_eq!(status, 200, "transform");
+    let (status, body) = send(&client, addr, "/transform", incoming).await?;
+    assert_eq!(status, StatusCode::OK, "transform");
     let compressed = FlowFile::from_bytes(&body)?;
     println!(
         "POST /transform -> {} bytes gzipped, mime.type={}",
@@ -268,8 +269,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- many in, one out --------------------------------------------------
     // The bundle `/split` produced goes straight back in.
-    let (status, body) = send(addr, "/merge", bundle).await?;
-    assert_eq!(status, 200, "merge");
+    let (status, body) = send(&client, addr, "/merge", bundle).await?;
+    assert_eq!(status, StatusCode::OK, "merge");
     let rejoined = FlowFile::from_bytes(&body)?;
     println!(
         "POST /merge -> {} bytes, filename={}",
@@ -283,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- the failures that still get a status code -------------------------
-    let (status, _) = send(addr, "/split", b"not a flow file".to_vec()).await?;
+    let (status, _) = send(&client, addr, "/split", b"not a flow file".to_vec()).await?;
     println!("POST /split (bad body) -> {status}");
     assert_eq!(
         status, 400,
@@ -291,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let nameless = FlowFile::builder().content(&b"anonymous"[..]).to_bytes();
-    let (status, message) = send(addr, "/split", nameless).await?;
+    let (status, message) = send(&client, addr, "/split", nameless).await?;
     println!(
         "POST /split (no filename) -> {status} {}",
         String::from_utf8_lossy(&message)
@@ -307,73 +308,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // --------------------------------------------------------------------------
-// Harness below. This is a stand-in for a client, not part of the template.
+// Harness below. A stand-in for a client, not part of the template.
 // --------------------------------------------------------------------------
 
-/// Send one flow file request and return the status and the decoded body.
+/// Send one flow file and return the status and the whole response body.
 ///
-/// Named `send` so that it does not collide with `axum::routing::post`.
-///
-/// It drains the response while the request is still going out. A client that
-/// does not is what `spool_async` protects the handlers against.
+/// A real client would stream the response rather than collect it. This one
+/// collects because it has to assert on all of it.
 async fn send(
+    client: &reqwest::Client,
     addr: std::net::SocketAddr,
-    uri: &str,
+    path: &str,
     body: Vec<u8>,
-) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(addr).await?;
-    let (mut rx, mut tx) = tokio::io::split(stream);
-    let reading = tokio::spawn(async move {
-        let mut raw = Vec::new();
-        rx.read_to_end(&mut raw).await.map(|_| raw)
-    });
-
-    let head = format!(
-        "POST {uri} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\n\
-         Connection: close\r\nContent-Length: {}\r\n\r\n",
-        nififf3::MEDIA_TYPE,
-        body.len()
-    );
-    tx.write_all(head.as_bytes()).await?;
-    tx.write_all(&body).await?;
-    tx.flush().await?;
-    let raw = reading.await??;
-
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("no header terminator in the response")?;
-    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .ok_or("no status code")?
-        .parse()?;
-    let body = &raw[split + 4..];
-    // A streamed response is chunked; one with a known length is not.
-    Ok((
-        status,
-        if head.contains("transfer-encoding: chunked") {
-            dechunk(body)?
-        } else {
-            body.to_vec()
-        },
-    ))
-}
-
-/// Undo `Transfer-Encoding: chunked`.
-fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut out = Vec::new();
-    loop {
-        let eol = body
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or("truncated chunk header")?;
-        let size = usize::from_str_radix(std::str::from_utf8(&body[..eol])?.trim(), 16)?;
-        if size == 0 {
-            return Ok(out);
-        }
-        out.extend_from_slice(&body[eol + 2..eol + 2 + size]);
-        body = &body[eol + 2 + size + 2..];
-    }
+) -> Result<(StatusCode, Vec<u8>), Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{addr}{path}"))
+        .header(header::CONTENT_TYPE, nififf3::MEDIA_TYPE)
+        .body(body)
+        .send()
+        .await?;
+    let status = response.status();
+    Ok((status, response.bytes().await?.to_vec()))
 }

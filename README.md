@@ -587,7 +587,9 @@ it.
 use axum::{Router, routing::post};
 use nififf3::{FlowFile, FlowFileRequest};
 
-async fn echo(flow_file: FlowFileRequest) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
+async fn echo(
+    FlowFileRequest(flow_file): FlowFileRequest,
+) -> Result<impl axum::response::IntoResponse, nififf3::Error> {
     // The content streams from the request body; buffer it here for brevity.
     let flow_file = flow_file.into_memory_async().await?;
     Ok(FlowFile::builder()
@@ -609,9 +611,11 @@ number of parts nor the size of any one part has to fit in memory:
 ```rust,ignore
 use nififf3::{Error, FlowFilesResponse, StrictFlowFileRequest};
 
-async fn split(req: StrictFlowFileRequest) -> Result<FlowFilesResponse, Error> {
+async fn split(
+    StrictFlowFileRequest(parent): StrictFlowFileRequest,
+) -> Result<FlowFilesResponse, Error> {
     // Validate here, while a real status code is still available.
-    let parent = req.into_inner().into_memory_async().await?;
+    let parent = parent.into_memory_async().await?;
     let mut parts = parent.fragments();
 
     Ok(FlowFilesResponse::new(move |mut writer| async move {
@@ -643,7 +647,8 @@ size of the request decides whether you see it. `FlowFile::spool_async` is the
 fix: it copies the body to a temporary file in the background, so the request
 keeps draining and you read that instead of the socket. The copy starts at
 once, so the first part still goes out immediately. `FlowFilesResponse`
-describes the failure in full, and `tests/response_deadlock.rs` reproduces it.
+describes the failure in full, `tests/response_deadlock.rs` reproduces it, and
+`examples/axum_service_large_files.rs` is a service written to avoid it.
 
 Returning the response commits you to a 2xx status, so validate before you
 return it. Report a problem with an individual part as a part of its own: a flow
@@ -729,7 +734,10 @@ default.
 - `stream`: `FlowFilesAsync::into_stream`, for composing with `StreamExt`.
   Implies `tokio`.
 - `axum`: request extractor and response types. Implies `stream`.
-- `tempfile`: spool content of unknown length to a temporary file.
+- `tempfile`: spool content of unknown length to a temporary file, through the
+  builder's `tempfile` and `spooled`. With `tokio` it also gives
+  `FlowFile::spool_async`, which copies a flow file's content to one in the
+  background.
 - `serde`: `Serialize` and `Deserialize` for in-memory flow files, with the
   content base64 encoded. This is the JSON shape the CLI uses. Reader-backed
   flow files serialize through `StreamingFlowFile`, which pushes the content
