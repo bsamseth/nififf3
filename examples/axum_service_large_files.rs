@@ -211,6 +211,10 @@ async fn serve(listener: TcpListener, shutdown: oneshot::Receiver<()>) -> std::i
         .await
 }
 
+// --------------------------------------------------------------------------
+// Harness below, not part of the template.
+// --------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A real server on a real socket, so the example exercises the wiring
@@ -306,10 +310,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server.await??;
     Ok(())
 }
-
-// --------------------------------------------------------------------------
-// Harness below. A stand-in for a client, not part of the template.
-// --------------------------------------------------------------------------
 
 /// Send one flow file and return the status and the whole response body.
 ///
