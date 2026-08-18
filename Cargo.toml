@@ -107,6 +107,12 @@ required-features = ["tokio", "uuid"]
 name = "axum_service"
 required-features = ["axum", "uuid"]
 
+# Also needs `tempfile`: it spools the request, and the gzip handler spools
+# its output to learn the length.
+[[example]]
+name = "axum_service_large_files"
+required-features = ["axum", "uuid", "tempfile"]
+
 [[bench]]
 name = "flowfiles"
 harness = false

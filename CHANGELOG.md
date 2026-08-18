@@ -18,6 +18,14 @@
 
 ### Documentation
 
+- A new example, `axum_service_large_files`. It is written to be copied when
+  starting a service whose inputs and outputs are too large to buffer, and it
+  covers all three shapes: split, transform and merge. The three differ only
+  in where each part's size comes from, because the header has to carry that
+  size before any content can be written. It runs against a real socket, and
+  it shows the wiring such a service needs, including the body limit,
+  spooling the request, and validating while a status code is still
+  available.
 - `FlowFilesResponse` describes that deadlock: what triggers it, why the size
   of the request decides whether you see it, why knowing every part's size up
   front makes it worse rather than better, and what to do about it.

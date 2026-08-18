@@ -706,10 +706,15 @@ the table calls for it:
 | `split` / `split_async` | none / `tokio` | one in, many out |
 | `merge` / `merge_async` | none / `tokio` | many in, one out |
 | `axum_service` | `axum` | one in, one or many out, over HTTP |
+| `axum_service_large_files` | `axum`, `tempfile` | the same three, written so nothing is held in memory |
 
 Read `split` and `merge` together. `merge` reassembles what `split` produced,
 using the fragment attributes the way NiFi's `MergeContent` does in `defragment`
 mode.
+
+`axum_service_large_files` is the one to read for content too large to buffer.
+It shows where each part's size comes from in the three cases, since the header
+has to carry that size before any content can be written.
 
 ## Feature flags
 
