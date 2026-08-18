@@ -622,7 +622,8 @@ enum Source {
 /// disk. The copy also starts at once and runs whether you read or not, so
 /// the first part still goes out immediately. `tests/response_deadlock.rs`
 /// measures that: the first part is ready after 1 ms, against 2439 ms for a
-/// handler that waits for the whole request before it starts.
+/// handler that waits for the whole request before it starts. That file also
+/// asserts the deadlock itself, so it fails if this ever stops happening.
 ///
 /// Raising [`buffer_size`](Self::buffer_size) past the size of the whole
 /// response also works, because the producer then never blocks on a write.

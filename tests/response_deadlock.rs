@@ -398,6 +398,13 @@ async fn run(
 async fn payload() -> Vec<u8> {
     // A large entry first, then more archive behind it, so the producer is
     // still writing part one while the client still has bytes to send.
+    //
+    // The total has to exceed what the kernel will hold for a connection
+    // nobody is reading, or the client sends everything, starts reading, and
+    // no deadlock forms. 48 MiB against a `tcp_rmem` ceiling of a few MiB
+    // leaves room to spare. A machine tuned for far larger socket buffers
+    // would need more here, and would show up as the deadlock tests failing
+    // because the exchange completed.
     let tar = tar_of(&[
         ("big.bin", noise(24 << 20, 1)),
         ("tail.bin", noise(24 << 20, 2)),
@@ -409,14 +416,20 @@ async fn payload() -> Vec<u8> {
         .to_bytes()
 }
 
-/// Demonstrates the bug, so it fails on purpose. Run it with
-/// `cargo test --all-features --test stall_repro -- --ignored --nocapture`.
-#[ignore = "reproduces the stall: fails by design"]
+/// The deadlock itself, asserted rather than skipped.
+///
+/// The client receives nothing at all, because it will not read until it has
+/// sent the whole request and it never gets to send the whole request. If this
+/// ever completes, the deadlock is gone and the documentation on
+/// `FlowFilesResponse` needs revisiting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nifi_shape_default_buffer() {
+async fn nifi_shape_default_buffer_deadlocks() {
     let out = run(None, false, Handler::GzipBuffered, payload().await).await;
     println!("NiFi shape, 64 KiB buffer  -> {out:?}");
-    assert!(out.completed(), "STALLED");
+    assert!(
+        matches!(out, Outcome::Stalled { received: 0, .. }),
+        "expected the documented deadlock, got {out:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -440,13 +453,19 @@ async fn nifi_shape_drain_request_first() {
     assert!(out.completed(), "STALLED");
 }
 
-/// The user's real shape: sizes known up front, nothing buffered.
-#[ignore = "reproduces the stall: fails by design"]
+/// Knowing every part's size up front does not help, and makes it worse.
+///
+/// A streaming producer starts writing sooner than one that buffers each part
+/// first, so it blocks sooner: this deadlocks after about a third of the bytes
+/// the buffered handler manages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nifi_shape_streaming_known_size() {
+async fn nifi_shape_streaming_known_size_deadlocks() {
     let out = run(None, false, Handler::StreamKnownSize, payload().await).await;
     println!("NiFi shape, streaming known size -> {out:?}");
-    assert!(out.completed(), "STALLED");
+    assert!(
+        matches!(out, Outcome::Stalled { received: 0, .. }),
+        "expected the documented deadlock, got {out:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
