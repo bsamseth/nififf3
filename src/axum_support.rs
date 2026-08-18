@@ -609,21 +609,20 @@ enum Source {
 /// ## Keeping the request moving
 ///
 /// The fix is to go on reading the request whatever the response is doing.
-/// Drain the body into storage of your own, and let the producer read that
-/// instead of the socket. Spooling to a temporary file keeps memory bounded
-/// however large the request is:
+/// [`FlowFile::spool_async`] does exactly that. It copies the body to a
+/// temporary file in the background, and hands back a flow file you read in
+/// place of the socket:
 ///
 /// ```ignore
-/// let builder = parent.derive_keep_uuid();
-/// let spooled = builder.tempfile_async(parent.into_content()).await?;
-/// // Build the response from `spooled`, which no longer touches the socket.
+/// let parent = parent.spool_async()?;
+/// // Build the response from `parent`, which no longer touches the socket.
 /// ```
 ///
-/// That drains the request before the first part is written. To start writing
-/// straight away, run the drain as its own task and have the producer follow
-/// the file behind it. Both are in `tests/response_deadlock.rs`, which
-/// measures the difference: the first part is ready after 1 ms when the two
-/// run concurrently, against 2382 ms when the request is drained first.
+/// Memory stays bounded however large the request is, because the bytes go to
+/// disk. The copy also starts at once and runs whether you read or not, so
+/// the first part still goes out immediately. `tests/response_deadlock.rs`
+/// measures that: the first part is ready after 1 ms, against 2439 ms for a
+/// handler that waits for the whole request before it starts.
 ///
 /// Raising [`buffer_size`](Self::buffer_size) past the size of the whole
 /// response also works, because the producer then never blocks on a write.

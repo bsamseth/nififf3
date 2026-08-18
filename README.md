@@ -639,9 +639,11 @@ If your producer reads the request body as it writes, keep the reading going
 whatever the writing is doing. Some HTTP clients, NiFi's among them, send the
 whole request before they read any of the response. Against one of those, a
 producer that stops reading because a write is blocked will deadlock, and the
-size of the request decides whether you see it. Spool the body to a temporary
-file and let the producer read that. `FlowFilesResponse` describes the failure
-and both fixes, and `tests/response_deadlock.rs` reproduces it.
+size of the request decides whether you see it. `FlowFile::spool_async` is the
+fix: it copies the body to a temporary file in the background, so the request
+keeps draining and you read that instead of the socket. The copy starts at
+once, so the first part still goes out immediately. `FlowFilesResponse`
+describes the failure in full, and `tests/response_deadlock.rs` reproduces it.
 
 Returning the response commits you to a 2xx status, so validate before you
 return it. Report a problem with an individual part as a part of its own: a flow

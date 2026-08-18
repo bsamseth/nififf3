@@ -24,6 +24,8 @@ mod async_io;
 mod axum_support;
 #[cfg(feature = "serde")]
 mod serde_support;
+#[cfg(all(feature = "tokio", feature = "tempfile"))]
+mod spool;
 
 pub use builder::FlowFileBuilder;
 pub use error::Error;
@@ -53,6 +55,9 @@ pub use axum_support::{
     FlowFilesResponse, ResponseSink, StrictFlowFileRequest, StrictFlowFilesRequest,
     StrictRejection,
 };
+
+#[cfg(all(feature = "tokio", feature = "tempfile"))]
+pub use spool::SpooledContent;
 
 #[cfg(feature = "serde")]
 pub use serde_support::StreamingFlowFile;

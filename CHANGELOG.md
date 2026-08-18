@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `FlowFile::spool_async` and the `SpooledContent` it produces: copy a flow
+  file's content to a temporary file in the background, and read it back from
+  there. It returns as soon as the copy has started, so reading can begin
+  immediately, and memory stays bounded however large the content is.
+
+  Use it when the content arrives over a connection you also answer on. A
+  producer that reads a request body and writes a response from the same task
+  deadlocks against a client that sends its whole request before reading any
+  of the response, and NiFi's client is one of those. Spooling keeps the
+  request draining however long the response is blocked. It needs the `tokio`
+  and `tempfile` features.
+
+### Documentation
+
+- `FlowFilesResponse` describes that deadlock: what triggers it, why the size
+  of the request decides whether you see it, why knowing every part's size up
+  front makes it worse rather than better, and what to do about it.
+  `tests/response_deadlock.rs` reproduces it over a real socket.
+
 ## 0.3.5
 
 A documentation release. The API and its behavior are unchanged, so upgrading

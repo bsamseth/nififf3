@@ -21,7 +21,6 @@ use axum::routing::post;
 use nififf3::{Error, FlowFile, FlowFilesResponse, StrictFlowFileRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder, EntryType, Header};
 
@@ -99,7 +98,10 @@ async fn unpack_gzip(
             let mut enc = GzipEncoder::new(Vec::new());
             tokio::io::copy(&mut entry, &mut enc).await?;
             enc.shutdown().await?;
-            eprintln!("    [server] {name}: gzipped to {} B, writing", enc.get_ref().len());
+            eprintln!(
+                "    [server] {name}: gzipped to {} B, writing",
+                enc.get_ref().len()
+            );
             writer
                 .write_bytes(
                     &parts
@@ -150,106 +152,15 @@ async fn unpack_gzip_drained(
     }))
 }
 
-/// Drain `src` into a temporary file as fast as it arrives, and hand back a
-/// reader that follows that file.
-///
-/// Two independent tasks. The drain never waits on the response, so the
-/// client is always free to keep sending. The follower feeds the producer,
-/// which may block on response backpressure without affecting the drain. The
-/// producer can therefore start emitting parts immediately: nothing here waits
-/// for the request to finish.
-fn spool_concurrently(
-    mut src: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-) -> std::io::Result<impl tokio::io::AsyncRead + Unpin + Send + 'static> {
-    let path = std::env::temp_dir().join(format!(
-        "nififf3-spool-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let wfile = std::fs::File::create(&path)?;
-    let rfile = std::fs::File::open(&path)?;
-    // Unlinked immediately: both handles stay valid, and nothing is left behind.
-    let _ = std::fs::remove_file(&path);
-    let mut wfile = tokio::fs::File::from_std(wfile);
-    let mut rfile = tokio::fs::File::from_std(rfile);
-
-    // (bytes written so far, request finished)
-    let (tx, mut rx) = watch::channel((0u64, false));
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut total = 0u64;
-        loop {
-            match src.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if wfile.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                    // `tokio::fs::File` buffers internally, so `write_all`
-                    // returning does not mean the bytes are in the file yet.
-                    // The watermark must not be published before they are, or
-                    // the follower reads short and takes it for EOF.
-                    if wfile.flush().await.is_err() {
-                        break;
-                    }
-                    total += n as u64;
-                    tx.send_replace((total, false));
-                }
-            }
-        }
-        let _ = wfile.flush().await;
-        tx.send_replace((total, true));
-    });
-
-    let (mut sink, source) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        let mut pos = 0u64;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let (written, done) = *rx.borrow_and_update();
-            if pos < written {
-                let want = ((written - pos) as usize).min(buf.len());
-                match rfile.read(&mut buf[..want]).await {
-                    Err(_) => break,
-                    // Below the watermark there should always be bytes. If not,
-                    // wait for the next update rather than calling it EOF.
-                    Ok(0) => {
-                        if rx.changed().await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(n) => {
-                        pos += n as u64;
-                        if sink.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            if done {
-                break;
-            }
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.shutdown().await;
-    });
-
-    Ok(source)
-}
-
-/// The streaming shape, fed by [`spool_concurrently`]. Responds immediately
-/// and cannot deadlock.
+/// The streaming shape, fed by [`FlowFile::spool_async`]. Responds
+/// immediately and cannot deadlock.
 #[allow(clippy::unused_async, reason = "axum handlers must be async")]
 async fn unpack_stream_spooled_concurrent(
     StrictFlowFileRequest(parent): StrictFlowFileRequest,
 ) -> Result<FlowFilesResponse, Error> {
+    let parent = parent.spool_async()?;
     let mut parts = parent.fragments();
-    let source = spool_concurrently(parent.into_content())?;
-    let mut archive = Archive::new(BufReader::new(source));
+    let mut archive = Archive::new(BufReader::new(parent.into_content()));
     let t0 = std::time::Instant::now();
 
     Ok(FlowFilesResponse::new(move |mut writer| async move {
@@ -267,7 +178,12 @@ async fn unpack_stream_spooled_concurrent(
             let size = entry.header().entry_size()?;
             let name = entry.path()?.display().to_string();
             writer
-                .write(parts.next_part().attribute("filename", name).reader(entry, size))
+                .write(
+                    parts
+                        .next_part()
+                        .attribute("filename", name)
+                        .reader(entry, size),
+                )
                 .await?;
         }
         writer.write_bytes(&parts.terminate()).await?;
@@ -293,7 +209,12 @@ async fn unpack_stream(
             let size = entry.header().entry_size()?;
             let name = entry.path()?.display().to_string();
             writer
-                .write(parts.next_part().attribute("filename", name).reader(entry, size))
+                .write(
+                    parts
+                        .next_part()
+                        .attribute("filename", name)
+                        .reader(entry, size),
+                )
                 .await?;
         }
         writer.write_bytes(&parts.terminate()).await?;
@@ -330,7 +251,12 @@ async fn unpack_stream_spooled(
             let size = entry.header().entry_size()?;
             let name = entry.path()?.display().to_string();
             writer
-                .write(parts.next_part().attribute("filename", name).reader(entry, size))
+                .write(
+                    parts
+                        .next_part()
+                        .attribute("filename", name)
+                        .reader(entry, size),
+                )
                 .await?;
         }
         writer.write_bytes(&parts.terminate()).await?;
@@ -357,9 +283,7 @@ async fn run(
                     Handler::GzipDrainMemory => unpack_gzip_drained(req).await,
                     Handler::StreamKnownSize => unpack_stream(req).await,
                     Handler::StreamSpooled => unpack_stream_spooled(req).await,
-                    Handler::StreamSpooledConcurrent => {
-                        unpack_stream_spooled_concurrent(req).await
-                    }
+                    Handler::StreamSpooledConcurrent => unpack_stream_spooled_concurrent(req).await,
                 };
                 match (made, buffer_size) {
                     (Ok(r), Some(n)) => Ok(r.buffer_size(n)),
@@ -534,7 +458,13 @@ async fn nifi_shape_streaming_spooled_to_disk() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nifi_shape_streaming_spooled_concurrently() {
-    let out = run(None, false, Handler::StreamSpooledConcurrent, payload().await).await;
+    let out = run(
+        None,
+        false,
+        Handler::StreamSpooledConcurrent,
+        payload().await,
+    )
+    .await;
     println!("NiFi shape, concurrent spool     -> {out:?}");
     assert!(out.completed(), "STALLED");
 }
