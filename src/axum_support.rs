@@ -808,11 +808,29 @@ impl IntoResponse for FlowFilesResponse {
             )
                 .into_response(),
             Source::Producer(producer) => {
+                // Only one direction of this duplex is used. The producer
+                // writes to `sink`, and the body reads from `body`. That
+                // makes `tokio::io::simplex` look like the better fit, but it
+                // cannot replace this.
+                //
+                // What ends the body is `DuplexStream`'s `Drop`, which calls
+                // `close_write`. The producer future completes, the writer it
+                // owns is dropped, and the reader sees EOF. `SimplexStream`
+                // has no `Drop`, and neither do the halves `split` returns.
+                // A reader over one would wait for an `is_closed` that
+                // nothing ever sets. No producer calls `shutdown`, so nothing
+                // else would close it either.
+                //
+                // The unused half costs little. Both halves start at
+                // `BytesMut::new()`, and `buffer_size` only caps how far one
+                // may grow. So the unused half holds an empty buffer for the
+                // life of the response, rather than `buffer_size` bytes.
                 let (sink, body) = tokio::io::duplex(buffer_size);
                 let writer = FlowFilesWriterAsync::new(ResponseSink { inner: sink });
                 streamed(body, tokio::spawn(producer(writer)))
             }
             Source::Blocking(producer) => {
+                // A duplex for the same reason as above.
                 let (sink, body) = tokio::io::duplex(buffer_size);
                 let sink = SyncIoBridge::new_with_handle(sink, tokio::runtime::Handle::current());
                 let handle = tokio::task::spawn_blocking(move || {
