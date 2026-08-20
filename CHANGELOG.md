@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.6
+
+One addition, for a service that reads a request and writes its response over
+the same connection. `FlowFile::spool_async` keeps the reading and the writing
+apart, so a client that will not read until it has finished sending can no
+longer deadlock the handler.
 
 ### Added
 
@@ -30,6 +35,11 @@
   of the request decides whether you see it, why knowing every part's size up
   front makes it worse rather than better, and what to do about it.
   `tests/response_deadlock.rs` reproduces it over a real socket.
+- Two of the README's examples no longer compiled. Both used the request
+  extractors the way they worked before 0.3.0, when they were type aliases
+  rather than newtypes, and both now destructure in the handler signature as
+  the text around them already said to. They are `rust,ignore` blocks, so the
+  doctest run never saw them.
 
 ## 0.3.5
 
