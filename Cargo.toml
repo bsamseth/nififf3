@@ -1,6 +1,6 @@
 [package]
 name = "nififf3"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 # Let-chains, which this crate uses throughout its parsing code, are stable
 # from 1.88 in edition 2024. Verified: 1.88 builds all features against the

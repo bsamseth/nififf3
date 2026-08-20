@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.7
+
+This release adds tracing. Under a `tracing` feature, on by default, the crate
+emits spans and events for the work it does, carrying enough context to follow
+one flow file through an interleaved log. The rest is smaller: a few more ways
+to read attributes, and a README rewritten to a quarter of its length.
 
 ### Added
 
