@@ -61,15 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen = 0;
     while let Some(part) = flow_files.next().await {
         let part = part?;
-        let index = &part.attributes()["fragment.index"];
-        match part.attributes().get("fragment.count") {
+        let index = &part["fragment.index"];
+        match part.parse_attribute::<usize>("fragment.count")? {
             Some(count) => {
-                declared = Some(count.parse::<usize>()?);
+                declared = Some(count);
                 println!("     [{index}] terminator, count={count}");
             }
             None => println!(
                 "     [{index}] {} = {:?}",
-                part.attributes()["filename"],
+                part["filename"],
                 String::from_utf8_lossy(part.content()),
             ),
         }

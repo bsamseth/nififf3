@@ -247,8 +247,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(part) = flow_files.next().await {
         let part = part?;
         // The terminator is the one carrying the count, and it has no content.
-        if let Some(count) = part.attributes().get("fragment.count") {
-            declared = Some(count.parse::<usize>()?);
+        if let Some(count) = part.parse_attribute::<usize>("fragment.count")? {
+            declared = Some(count);
         } else {
             chunks += 1;
             chunk_bytes += part.size();

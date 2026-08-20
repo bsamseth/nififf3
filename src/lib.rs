@@ -176,6 +176,38 @@ impl<R> FlowFile<R> {
         self.attributes.get(key).map(String::as_str)
     }
 
+    /// Read an attribute and parse it into `T`.
+    ///
+    /// NiFi writes every attribute as a string, including the ones that count
+    /// things, so a caller that wants a number has to parse one. This does
+    /// that without losing the difference between the two ways it can fail to
+    /// produce a value. `Ok(None)` means the attribute is not set. `Err` means
+    /// it is set to something that is not a `T`.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, attr};
+    ///
+    /// let flow_file = FlowFile::builder()
+    ///     .attribute(attr::FRAGMENT_INDEX, "2")
+    ///     .attribute(attr::FRAGMENT_COUNT, "not a number")
+    ///     .content(Vec::new());
+    ///
+    /// assert_eq!(flow_file.parse_attribute::<u64>(attr::FRAGMENT_INDEX)?, Some(2));
+    /// assert_eq!(flow_file.parse_attribute::<u64>("absent")?, None);
+    /// assert!(flow_file.parse_attribute::<u64>(attr::FRAGMENT_COUNT).is_err());
+    /// # Ok::<(), std::num::ParseIntError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Whatever `T::from_str` returns for the attribute's value.
+    pub fn parse_attribute<T: std::str::FromStr>(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<T>, T::Err> {
+        self.attribute(key).map(str::parse).transpose()
+    }
+
     /// The attributes of the flow file.
     ///
     /// For a single value, use [`attribute`](Self::attribute). It returns
@@ -663,6 +695,31 @@ impl FlowFile<Vec<u8>> {
         })
     }
 
+    /// The content as a string slice, if it is valid UTF-8.
+    ///
+    /// Flow files often carry text, and this saves going through
+    /// [`std::str::from_utf8`] by hand. For content that may not be valid
+    /// UTF-8 and does not need to be, [`String::from_utf8_lossy`] over
+    /// [`content`](FlowFile::content) replaces what it cannot decode.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// let flow_file = FlowFile::builder().content(&b"hello"[..]);
+    /// assert_eq!(flow_file.content_str()?, "hello");
+    ///
+    /// let binary = FlowFile::builder().content(vec![0xFF, 0xFE]);
+    /// assert!(binary.content_str().is_err());
+    /// # Ok::<(), std::str::Utf8Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`std::str::Utf8Error`] if the content is not valid UTF-8.
+    pub fn content_str(&self) -> std::result::Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.content)
+    }
+
     /// Wrap the content in a [`std::io::Cursor`], which implements both
     /// `std::io::Read` and (with the `tokio` feature) `tokio::io::AsyncRead`.
     ///
@@ -881,6 +938,52 @@ mod tests {
     fn indexing_a_missing_attribute_panics() {
         let flow_file = FlowFile::builder().content(Vec::new());
         let _ = &flow_file[attr::FILENAME];
+    }
+
+    /// The three outcomes have to stay distinguishable: a value, no attribute
+    /// at all, and an attribute that is not a `T`. Collapsing the last two is
+    /// how a bad count silently becomes a zero.
+    #[test]
+    fn parse_attribute_separates_missing_from_unparseable() {
+        let flow_file = FlowFile::builder()
+            .attribute(attr::FRAGMENT_INDEX, "2")
+            .attribute(attr::FRAGMENT_COUNT, "three")
+            .content(Vec::new());
+
+        assert_eq!(
+            flow_file.parse_attribute::<u64>(attr::FRAGMENT_INDEX),
+            Ok(Some(2))
+        );
+        assert_eq!(flow_file.parse_attribute::<u64>("absent"), Ok(None));
+        assert!(
+            flow_file
+                .parse_attribute::<u64>(attr::FRAGMENT_COUNT)
+                .is_err()
+        );
+
+        // Any `FromStr` works, not only numbers.
+        assert_eq!(
+            flow_file.parse_attribute::<String>(attr::FRAGMENT_COUNT),
+            Ok(Some("three".to_string()))
+        );
+    }
+
+    #[test]
+    fn content_str_decodes_utf8_and_reports_what_does_not() {
+        let text = FlowFile::builder().content("hei på deg".as_bytes());
+        assert_eq!(text.content_str(), Ok("hei på deg"));
+
+        let empty = FlowFile::builder().empty();
+        assert_eq!(empty.content_str(), Ok(""));
+
+        let binary = FlowFile::builder().content(vec![0xFF, 0xFE, 0x00]);
+        assert!(binary.content_str().is_err());
+        // The lossy route stays available for content that is not text. Each
+        // byte it cannot decode becomes one replacement character, which is
+        // three bytes, so count characters rather than bytes.
+        let lossy = String::from_utf8_lossy(binary.content());
+        assert_eq!(lossy.chars().count(), 3);
+        assert_eq!(lossy.matches('\u{FFFD}').count(), 2);
     }
 
     #[test]

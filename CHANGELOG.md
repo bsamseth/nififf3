@@ -9,6 +9,12 @@
   not set, as indexing a `HashMap` does, and `attribute` returns an `Option`
   for when it may be missing. Indexing only reads, again as with a `HashMap`:
   set an attribute through the builder or through `attributes_mut`.
+- `FlowFile::parse_attribute`, which reads an attribute and parses it into any
+  `FromStr` type. NiFi writes every attribute as a string, including the ones
+  that count things. This keeps the two ways that can fail apart: `Ok(None)`
+  means the attribute is not set, and `Err` means it is set to something that
+  is not a `T`.
+- `FlowFile::content_str`, the content as a `&str` when it is valid UTF-8.
 - Thirty more constants in the `attr` module. They cover the rest of NiFi's
   `CoreAttributes`, the file metadata that `GetFile`, `ListFile` and
   `UnpackContent` write, the sizes and counts from `SplitText`, the

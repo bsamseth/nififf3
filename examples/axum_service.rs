@@ -109,18 +109,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let part = part?;
         // The last flow file is the terminator: no content, and the count for
         // the whole bundle including itself.
-        match part.attributes().get("fragment.count") {
+        match part.parse_attribute::<usize>("fragment.count")? {
             Some(total) => {
-                declared = Some(total.parse::<usize>()?);
-                println!(
-                    "  [{}] terminator, count={total}",
-                    part.attributes()["fragment.index"]
-                );
+                declared = Some(total);
+                println!("  [{}] terminator, count={total}", part["fragment.index"]);
             }
             None => println!(
                 "  [{}] {} = {:?}",
-                part.attributes()["fragment.index"],
-                part.attributes()["filename"],
+                part["fragment.index"],
+                part["filename"],
                 String::from_utf8_lossy(part.content()),
             ),
         }

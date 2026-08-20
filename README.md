@@ -35,20 +35,18 @@ indexing a `HashMap` does. Use `attribute` when it may be missing, since that
 returns an `Option`:
 
 ```rust
-use nififf3::{FlowFile, attr};
+use nififf3::FlowFile;
 
 let flow_file = FlowFile::builder()
-    .attribute(attr::FILENAME, "greeting.txt")
+    .attribute("filename", "greeting.txt")
     .content(&b"hi"[..]);
 
-assert_eq!(flow_file[attr::FILENAME], "greeting.txt");
+assert_eq!(flow_file["filename"], "greeting.txt");
 assert_eq!(flow_file.attribute("nothing"), None);
 ```
 
 Indexing only reads. Set an attribute through the builder, or through
-`attributes_mut` on a flow file you already hold. The `attr` module names the
-attributes NiFi gives a meaning to, so that a key is a constant rather than a
-string you retype.
+`attributes_mut` on a flow file you already hold.
 
 `FlowFile::parse` is lazy. It reads only the header from a reader, and hands
 back the content as a second reader limited to the declared size. You can
