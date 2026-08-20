@@ -152,7 +152,9 @@ The sync parsing and serialization API is always available. Only `uuid` is on
 by default.
 
 - `uuid`: `derive` and `fragments`, which mint identifiers. On by default.
-  Without it, a parse-and-serialize build depends only on `thiserror`.
+- `tracing`: events and spans from inside the crate. On by default. With
+  `default-features = false` a parse-and-serialize build depends only on
+  `thiserror`.
 - `tokio`: async parsing and serialization over `AsyncRead` and `AsyncWrite`.
 - `stream`: `FlowFilesAsync::into_stream`. Implies `tokio`.
 - `axum`: request extractors and response types. Implies `stream`.
@@ -160,6 +162,26 @@ by default.
   `tempfile` and `spooled`, and through `FlowFile::spool_async`.
 - `serde`: `Serialize` and `Deserialize` with the content base64 encoded.
 - `cli`: the `nififf3` binary. Implies `serde`.
+
+## Tracing
+
+Under the `tracing` feature, which is on by default, the crate emits spans and
+events for the work it does. Nothing is emitted unless your program installs a
+subscriber, and with the feature off the calls are compiled out.
+
+Spans carry the same three fields wherever they are known, so an interleaved
+log can be followed back to one flow file: `uuid`, `filename` when the flow
+file has one, and `size`. Set `RUST_LOG` to choose how much you want.
+
+- `warn` and `error` report what your own `Result`s cannot: a write that
+  poisoned a writer, a background spool that failed, a response body that
+  broke after the status line went out, a request rejected before your handler
+  ran.
+- `info` is one line per extracted request, for a service that wants a record
+  of what it was asked to do.
+- `debug` is one line per flow file parsed or written.
+- `trace` follows the content itself, including buffering, discarding, and
+  skipping past what a reader left behind.
 
 ## Wire format
 

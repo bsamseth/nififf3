@@ -5,7 +5,9 @@
 //! buffers make the deadlock reachable with modest payloads, and they also
 //! make the transfer slow, so a wall-clock timeout cannot tell "stuck" from
 //! "slow".
-#![cfg(all(feature = "axum", feature = "uuid"))]
+// `tempfile` too: the fixes it compares use `spool_async` and
+// `tempfile_async`, both of which need it.
+#![cfg(all(feature = "axum", feature = "uuid", feature = "tempfile"))]
 // A reproduction harness, not library code: the outcome fields exist to be
 // printed through `Debug`, and the byte generator truncates on purpose.
 #![allow(dead_code, clippy::cast_possible_truncation)]

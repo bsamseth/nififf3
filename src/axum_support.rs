@@ -194,10 +194,37 @@ fn limited_body(req: Request) -> FlowFileBody {
 impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
     type Rejection = Error;
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "info",
+            name = "flow_file_request",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        FlowFile::parse_async_with_limits(limited_body(req), Limits::untrusted())
-            .await
-            .map(Self)
+        let parsed =
+            FlowFile::parse_async_with_limits(limited_body(req), Limits::untrusted()).await;
+        match parsed {
+            Ok(flow_file) => {
+                flow_file.record_identity();
+                #[cfg(feature = "tracing")]
+                tracing::info!("extracted flow file from request");
+                Ok(Self(flow_file))
+            }
+            Err(err) => {
+                // This becomes a status code, so the handler never runs and
+                // never sees why.
+                #[cfg(feature = "tracing")]
+                tracing::warn!(error = %err, "rejecting request");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -500,6 +527,12 @@ impl Stream for ExactLength {
                     // the header is served from an in-memory cursor and always
                     // drains, but nothing here depends on that being true.
                     let delivered = this.declared.saturating_sub(this.remaining);
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        declared = this.declared,
+                        delivered,
+                        "content ended early, failing the response body"
+                    );
                     Some(Err(crate::error::truncated(this.declared, delivered)))
                 })
             }
@@ -930,15 +963,29 @@ impl Stream for ProducerStream {
             Some(Ok(chunk)) => Poll::Ready(Some(Ok(chunk))),
             Some(Err(err)) => {
                 this.producer = None;
+                #[cfg(feature = "tracing")]
+                tracing::warn!(error = %err, "response body failed mid-stream");
                 Poll::Ready(Some(Err(err.into())))
             }
             None => {
                 let outcome = ready!(Pin::new(producer).poll(cx));
                 this.producer = None;
                 Poll::Ready(match outcome {
-                    Ok(Ok(())) => None,
-                    Ok(Err(err)) => Some(Err(err)),
-                    Err(join) => Some(Err(join.into())),
+                    Ok(Ok(())) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("producer finished, response body complete");
+                        None
+                    }
+                    Ok(Err(err)) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(error = %err, "producer failed, truncating the body");
+                        Some(Err(err))
+                    }
+                    Err(join) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(error = %join, "producer panicked or was aborted");
+                        Some(Err(join.into()))
+                    }
                 })
             }
         }

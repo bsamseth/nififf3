@@ -220,13 +220,29 @@ impl<R: Read> FlowFile<io::Take<R>> {
     ///
     /// As [`parse`](Self::parse), plus [`Error::TooManyAttributes`] or
     /// [`Error::AttributeTooLong`] when the header exceeds `limits`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "parse",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn parse_with_limits(mut reader: R, limits: Limits) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None, limits)?;
-        Ok(FlowFile::from_raw_parts(
-            size,
-            attributes,
-            reader.take(size),
-        ))
+        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            attributes = flow_file.attributes.len(),
+            "parsed header, content left as a reader"
+        );
+        Ok(flow_file)
     }
 }
 
@@ -320,6 +336,19 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     ///
     /// As [`parse_next`](Self::parse_next), plus [`Error::TooManyAttributes`]
     /// or [`Error::AttributeTooLong`] when a header exceeds `limits`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "parse_next",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn parse_next_with_limits(reader: &'r mut R, limits: Limits) -> Result<Option<Self>> {
         let mut first = [0u8; 1];
         loop {
@@ -327,18 +356,25 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
                 // A one-byte buffer, so this is the end of the stream. A
                 // reader returning `Ok(0)` with room to fill is buggy, and
                 // retrying one would spin rather than recover.
-                Ok(0) => return Ok(None),
+                Ok(0) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!("stream ended on a flow file boundary");
+                    return Ok(None);
+                }
                 Ok(_) => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {} // retry
                 Err(e) => return Err(e.into()),
             }
         }
         let (attributes, size) = parse_header(reader, Some(first[0]), limits)?;
-        Ok(Some(FlowFile::from_raw_parts(
-            size,
-            attributes,
-            reader.take(size),
-        )))
+        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            attributes = flow_file.attributes.len(),
+            "parsed header, content left as a reader"
+        );
+        Ok(Some(flow_file))
     }
 }
 
@@ -378,12 +414,35 @@ impl<R: Read> FlowFile<R> {
     /// the wire format cannot express. As [`FlowFile::to_bytes`].
     ///
     /// [`size`]: FlowFile::size
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "write_to",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub fn write_to<W: Write>(mut self, writer: &mut W) -> io::Result<u64> {
         writer.write_all(&self.header_bytes())?;
         let copied = io::copy(&mut (&mut self.content).take(self.size), writer)?;
         if copied != self.size {
+            // The header is already out, so the stream now holds a flow file
+            // that promises more than it carries. The caller sees the error,
+            // but whatever is reading the far end will not.
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                copied,
+                "content ended early, leaving a truncated flow file in the stream"
+            );
             return Err(crate::error::truncated(self.size, copied));
         }
+        #[cfg(feature = "tracing")]
+        tracing::debug!(copied, "wrote flow file");
         Ok(copied)
     }
 
@@ -419,11 +478,26 @@ impl<R: Read> FlowFile<R> {
     /// [`Error::SizeMismatch`], as [`into_memory`](Self::into_memory).
     ///
     /// [`size`]: FlowFile::size
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "skip_content",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub fn skip_content(mut self) -> io::Result<u64> {
         let skipped = io::copy(&mut (&mut self.content).take(self.size), &mut io::sink())?;
         if skipped != self.size {
             return Err(crate::error::truncated(self.size, skipped));
         }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(skipped, "discarded content");
         Ok(skipped)
     }
 
@@ -444,12 +518,27 @@ impl<R: Read> FlowFile<R> {
     /// [`Error::SizeMismatch`].
     ///
     /// [`size`]: FlowFile::size
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "into_memory",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub fn into_memory(mut self) -> io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = read_declared(&mut self.content, self.size, &mut content)?;
         if read != self.size {
             return Err(crate::error::truncated(self.size, read));
         }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(read, "read content into memory");
         Ok(FlowFile::from_raw_parts(
             self.size,
             self.attributes,
@@ -558,6 +647,19 @@ impl FlowFile<Vec<u8>> {
     /// As [`to_bytes`](FlowFile::to_bytes) panics: for an attribute the wire
     /// format cannot express, or a declared size that disagrees with the
     /// content.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "write_bytes_to",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub fn write_bytes_to<W: Write>(&self, writer: &mut W) -> io::Result<u64> {
         assert_eq!(
             self.size,
@@ -566,6 +668,8 @@ impl FlowFile<Vec<u8>> {
         );
         writer.write_all(&self.header_bytes())?;
         writer.write_all(&self.content)?;
+        #[cfg(feature = "tracing")]
+        tracing::debug!(written = self.size, "wrote flow file");
         Ok(self.size)
     }
 }
@@ -861,6 +965,13 @@ impl<R: Read> FlowFilesReader<R> {
         if self.unread == 0 {
             return Ok(());
         }
+        // Skipping is this type's whole job, and it happens without the caller
+        // asking, so say when it does.
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            unread = self.unread,
+            "skipping the rest of the previous flow file's content"
+        );
         let skipped = io::copy(&mut (&mut self.reader).take(self.unread), &mut io::sink())?;
         let unread = std::mem::replace(&mut self.unread, 0);
         if skipped != unread {
@@ -986,6 +1097,16 @@ impl<W: Write> FlowFilesWriter<W> {
 
     fn poison_on_err<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
         if result.is_err() {
+            // Every later write is refused from here on, and the stream is
+            // left part-way through a flow file.
+            #[cfg(feature = "tracing")]
+            if let Err(err) = &result {
+                tracing::warn!(
+                    error = %err,
+                    written = self.count,
+                    "write failed, poisoning the writer"
+                );
+            }
             self.poisoned = true;
         }
         result

@@ -158,6 +158,27 @@ impl<R> FlowFile<R> {
         self.size
     }
 
+    /// Record the fields that identify this flow file on the current span.
+    ///
+    /// Parsing only learns them once the header is in, so an entry point
+    /// declares the fields empty and fills them here. It is a no-op without
+    /// the `tracing` feature, so call sites need no `cfg` of their own.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn record_identity(&self) {
+        let span = tracing::Span::current();
+        span.record("uuid", self.attribute(attr::UUID));
+        span.record("filename", self.attribute(attr::FILENAME));
+        span.record("size", self.size);
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    #[inline]
+    #[expect(
+        clippy::unused_self,
+        reason = "the tracing build uses self; this one exists so call sites need no cfg"
+    )]
+    pub(crate) fn record_identity(&self) {}
+
     /// The value of one attribute, if it is set.
     ///
     /// The [`attr`] module names the ones NiFi gives a meaning to.
@@ -550,6 +571,19 @@ impl FlowFile<Vec<u8>> {
     /// As [`from_bytes`](Self::from_bytes), plus [`Error::TooManyAttributes`],
     /// [`Error::AttributeTooLong`] or [`Error::ContentTooLarge`] when the
     /// header exceeds `limits`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "from_bytes",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn from_bytes_with_limits(bytes: &[u8], limits: Limits) -> Result<Self> {
         let mut reader = bytes;
         let (attributes, size) = sync::parse_header(&mut reader, None, limits)?;
@@ -563,7 +597,11 @@ impl FlowFile<Vec<u8>> {
         if actual > size {
             return Err(Error::TrailingData(actual - size));
         }
-        Ok(Self::from_raw_parts(size, attributes, reader.to_vec()))
+        let flow_file = Self::from_raw_parts(size, attributes, reader.to_vec());
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(attributes = flow_file.attributes.len(), "parsed flow file");
+        Ok(flow_file)
     }
 
     /// Parse a flow file from a `Vec` holding exactly one, reusing its
@@ -600,6 +638,19 @@ impl FlowFile<Vec<u8>> {
     /// # Errors
     ///
     /// As [`from_bytes_with_limits`](Self::from_bytes_with_limits).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "from_vec",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     pub fn from_vec_with_limits(mut bytes: Vec<u8>, limits: Limits) -> Result<Self> {
         let (attributes, size, header_len) = {
             let mut reader = bytes.as_slice();
@@ -619,7 +670,11 @@ impl FlowFile<Vec<u8>> {
         // Shifts the content down over the header rather than allocating a
         // second buffer for it.
         bytes.drain(..header_len);
-        Ok(Self::from_raw_parts(size, attributes, bytes))
+        let flow_file = Self::from_raw_parts(size, attributes, bytes);
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(attributes = flow_file.attributes.len(), "parsed flow file");
+        Ok(flow_file)
     }
 
     /// Serialize the flow file to the binary V3 format.

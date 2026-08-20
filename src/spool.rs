@@ -109,6 +109,19 @@ where
     /// # Panics
     ///
     /// If called outside a tokio runtime, since it spawns the copy.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "spool_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub fn spool_async(self) -> io::Result<FlowFile<SpooledContent>> {
         let file = tempfile::NamedTempFile::new()?;
         // Two independent handles. `try_clone` would share one file offset
@@ -123,7 +136,13 @@ where
         let (progress, mut watch_progress) = watch::channel((0u64, false));
 
         let copy_failure = Arc::clone(&failure);
+        // The copy outlives this call, so it needs the span carried into it.
+        // Without that its events would have no flow file attached to them.
+        #[cfg(feature = "tracing")]
+        let span = tracing::Span::current();
         let copy = tokio::spawn(async move {
+            #[cfg(feature = "tracing")]
+            let _guard = span.enter();
             // `file` lives until the copy ends, so the path outlives both
             // handles being opened.
             let _file = file;
@@ -134,11 +153,18 @@ where
                     Ok(0) => break,
                     Ok(read) => read,
                     Err(err) => {
+                        // Nothing is watching this task. The error waits in
+                        // the slot until a read reaches the point where the
+                        // copy stopped, and no read may ever get there.
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(error = %err, written, "spool source failed");
                         *copy_failure.lock().expect("spool lock") = Some(err);
                         break;
                     }
                 };
                 if let Err(err) = sink.write_all(&buf[..read]).await {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(error = %err, written, "spool file write failed");
                     *copy_failure.lock().expect("spool lock") = Some(err);
                     break;
                 }
@@ -147,12 +173,16 @@ where
                 // they are would have the reader see a short read and take it
                 // for the end.
                 if let Err(err) = sink.flush().await {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(error = %err, written, "spool file flush failed");
                     *copy_failure.lock().expect("spool lock") = Some(err);
                     break;
                 }
                 written += read as u64;
                 progress.send_replace((written, false));
             }
+            #[cfg(feature = "tracing")]
+            tracing::debug!(spooled = written, "finished copying the content to disk");
             progress.send_replace((written, true));
         });
 

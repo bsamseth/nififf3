@@ -174,13 +174,29 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// # Errors
     ///
     /// As [`FlowFile::parse_with_limits`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "parse_async",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     pub async fn parse_async_with_limits(mut reader: R, limits: Limits) -> Result<Self> {
         let (attributes, size) = parse_header(&mut reader, None, limits).await?;
-        Ok(FlowFile::from_raw_parts(
-            size,
-            attributes,
-            reader.take(size),
-        ))
+        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            attributes = flow_file.attributes.len(),
+            "parsed header, content left as a reader"
+        );
+        Ok(flow_file)
     }
 }
 
@@ -231,6 +247,19 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// # Errors
     ///
     /// As [`FlowFile::parse_next_with_limits`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "parse_next_async",
+            skip_all,
+            fields(
+                uuid = tracing::field::Empty,
+                filename = tracing::field::Empty,
+                size = tracing::field::Empty,
+            )
+        )
+    )]
     pub async fn parse_next_async_with_limits(
         reader: &'r mut R,
         limits: Limits,
@@ -241,18 +270,25 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
                 // A one-byte buffer, so this is the end of the stream: a
                 // reader returning `Ok(0)` with room to fill is buggy, and
                 // retrying one would spin rather than recover.
-                Ok(0) => return Ok(None),
+                Ok(0) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!("stream ended on a flow file boundary");
+                    return Ok(None);
+                }
                 Ok(_) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} // retry
                 Err(e) => return Err(e.into()),
             }
         }
         let (attributes, size) = parse_header(reader, Some(first[0]), limits).await?;
-        Ok(Some(FlowFile::from_raw_parts(
-            size,
-            attributes,
-            reader.take(size),
-        )))
+        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            attributes = flow_file.attributes.len(),
+            "parsed header, content left as a reader"
+        );
+        Ok(Some(flow_file))
     }
 }
 
@@ -598,6 +634,11 @@ impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
         if self.unread == 0 {
             return Ok(());
         }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            unread = self.unread,
+            "skipping the rest of the previous flow file's content"
+        );
         let skipped = tokio::io::copy(
             &mut (&mut self.reader).take(self.unread),
             &mut tokio::io::sink(),
@@ -714,6 +755,19 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// As [`FlowFile::to_bytes`]: an attribute the wire format cannot express,
     /// or a declared size disagreeing with the content.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "write_bytes",
+            skip_all,
+            fields(
+                uuid = flow_file.attribute(crate::attr::UUID),
+                filename = flow_file.attribute(crate::attr::FILENAME),
+                size = flow_file.size,
+            )
+        )
+    )]
     pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> std::io::Result<u64> {
         self.guard()?;
         // As the sync twin: header then content, rather than one buffer built
@@ -730,6 +784,8 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
         .await;
         self.poison_on_err(result)?;
         self.count += 1;
+        #[cfg(feature = "tracing")]
+        tracing::debug!(written = flow_file.size, "wrote flow file");
         Ok(flow_file.size)
     }
 
@@ -742,6 +798,14 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
 
     fn poison_on_err<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
         if result.is_err() {
+            #[cfg(feature = "tracing")]
+            if let Err(err) = &result {
+                tracing::warn!(
+                    error = %err,
+                    written = self.count,
+                    "write failed, poisoning the writer"
+                );
+            }
             self.poisoned = true;
         }
         result
@@ -853,6 +917,19 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     ///
     /// As [`FlowFile::write_to`]: an attribute longer than `u32::MAX` bytes
     /// cannot be expressed in the wire format.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "write_to_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub async fn write_to_async<W: AsyncWrite + Unpin>(
         mut self,
         writer: &mut W,
@@ -860,8 +937,15 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
         writer.write_all(&self.header_bytes()).await?;
         let copied = tokio::io::copy(&mut (&mut self.content).take(self.size), writer).await?;
         if copied != self.size {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                copied,
+                "content ended early, leaving a truncated flow file in the stream"
+            );
             return Err(crate::error::truncated(self.size, copied));
         }
+        #[cfg(feature = "tracing")]
+        tracing::debug!(copied, "wrote flow file");
         Ok(copied)
     }
 
@@ -871,6 +955,19 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`FlowFile::skip_content`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "skip_content_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub async fn skip_content_async(mut self) -> std::io::Result<u64> {
         let skipped = tokio::io::copy(
             &mut (&mut self.content).take(self.size),
@@ -880,6 +977,8 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
         if skipped != self.size {
             return Err(crate::error::truncated(self.size, skipped));
         }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(skipped, "discarded content");
         Ok(skipped)
     }
 
@@ -889,12 +988,27 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`FlowFile::into_memory`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "into_memory_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
     pub async fn into_memory_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
         let mut content = Vec::new();
         let read = read_declared(&mut self.content, self.size, &mut content).await?;
         if read != self.size {
             return Err(crate::error::truncated(self.size, read));
         }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(read, "read content into memory");
         Ok(FlowFile::from_raw_parts(
             self.size,
             self.attributes,

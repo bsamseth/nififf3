@@ -23,6 +23,20 @@
   exhaustive, and a processor can write whatever it likes, so a missing
   constant is a gap here rather than a name you cannot use.
 
+### Added
+
+- A `tracing` feature, on by default, that emits spans and events from inside
+  the crate. Nothing is emitted unless your program installs a subscriber, and
+  with the feature off every call is compiled out.
+
+  Spans carry `uuid`, `filename` and `size` wherever those are known, so an
+  interleaved log can be followed back to one flow file. `warn` and `error`
+  report what a `Result` cannot: a poisoned writer, a background spool that
+  failed, a response body that broke after the status line went out, a request
+  rejected before the handler ran. `info` is one line per extracted request,
+  `debug` one per flow file parsed or written, and `trace` follows the content
+  itself.
+
 ### Changed
 
 - `Limits::recommended` is now `Limits::untrusted`. The old name claimed an

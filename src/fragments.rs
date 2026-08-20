@@ -387,9 +387,24 @@ impl Fragments {
     /// past it describes a set that cannot be reassembled. Panicking here is
     /// louder than shipping a bundle that times out to `failure` in
     /// production.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "next_part",
+            skip_all,
+            fields(fragment_id = %self.identifier)
+        )
+    )]
     #[must_use]
     pub fn next_part(&mut self) -> FlowFileBuilder {
         self.index += 1;
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            index = self.index,
+            count = self.count,
+            "starting a fragment"
+        );
         assert!(
             self.count.is_none_or(|count| self.index <= count),
             "fragment {} of a set declared to hold {:?}",
@@ -461,9 +476,26 @@ impl Fragments {
     ///
     /// If a count was already declared and the terminator would not be the
     /// flow file that completes it.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "terminate",
+            skip_all,
+            fields(fragment_id = %self.identifier)
+        )
+    )]
     #[must_use]
     pub fn terminate(self) -> FlowFile<Vec<u8>> {
         let index = self.index + 1;
+        // The count is what lets a merge complete downstream, so it is worth
+        // seeing what was declared.
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            parts = self.index,
+            count = index,
+            "closing the fragment set with a terminator"
+        );
         assert!(
             self.count.is_none_or(|count| count == index),
             "a set declared to hold {:?} cannot be terminated as flow file {index}; \
