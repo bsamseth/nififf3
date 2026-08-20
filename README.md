@@ -62,13 +62,14 @@ assert_eq!(flow_file.content_str()?, "Hello, NiFi!");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Indexing panics when an attribute is not set, as indexing a `HashMap` does.
-`attribute` returns an `Option` for when it may be missing, and
-`parse_attribute` reads one and parses it into a number.
+Indexing with `[]` panics when an attribute is not set, as indexing a
+`HashMap` does. `attribute` returns an `Option` for when it may be missing,
+and `parse_attribute` reads and parses in one combined function.
 
 A header from outside your own system can declare millions of attributes. Pass
-`Limits` to any `*_with_limits` entry point to bound it. `Limits` documents
-what the recommended caps permit, and what the parser will not do whatever you
+`Limits` to any `*_with_limits` entry point to bound it. `Limits::untrusted`
+is a starting point sized for input you did not produce, and `Limits`
+documents what those caps permit and what the parser will not do whatever you
 set.
 
 ## Creating

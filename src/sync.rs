@@ -1358,7 +1358,7 @@ mod tests {
         assert!(matches!(
             FlowFile::from_reader_with_limits(
                 bytes.as_slice(),
-                Limits::recommended().with_max_content_len(4)
+                Limits::untrusted().with_max_content_len(4)
             ),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
@@ -1498,7 +1498,7 @@ mod tests {
     #[test]
     fn limits_reject_an_oversized_declared_content_size() {
         let bytes = sample_flow_file().to_bytes();
-        let limits = Limits::recommended().with_max_content_len(4);
+        let limits = Limits::untrusted().with_max_content_len(4);
 
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
@@ -1511,7 +1511,7 @@ mod tests {
             FlowFile::parse_with_limits(header_only, limits),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::recommended()).is_ok());
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::untrusted()).is_ok());
     }
 
     /// A reader that yields `available` bytes and then ends, so a flow file
@@ -1652,14 +1652,14 @@ mod tests {
         let bytes = sample_flow_file().to_bytes();
 
         assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, Limits::recommended().with_max_attributes(1)),
+            FlowFile::from_bytes_with_limits(&bytes, Limits::untrusted().with_max_attributes(1)),
             Err(Error::TooManyAttributes { count: 2, limit: 1 })
         ));
         assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, Limits::recommended().with_max_content_len(4)),
+            FlowFile::from_bytes_with_limits(&bytes, Limits::untrusted().with_max_content_len(4)),
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
-        assert!(FlowFile::from_bytes_with_limits(&bytes, Limits::recommended()).is_ok());
+        assert!(FlowFile::from_bytes_with_limits(&bytes, Limits::untrusted()).is_ok());
     }
 
     #[test]
@@ -1705,7 +1705,7 @@ mod tests {
             .content(Vec::new());
         let bytes = flow_file.to_bytes();
 
-        let limits = Limits::recommended().with_max_attributes(5);
+        let limits = Limits::untrusted().with_max_attributes(5);
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::TooManyAttributes {
@@ -1713,7 +1713,7 @@ mod tests {
                 limit: 5
             })
         ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::recommended()).is_ok());
+        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::untrusted()).is_ok());
     }
 
     /// The aggregate the per-attribute limits cannot express: each attribute
@@ -1816,7 +1816,7 @@ mod tests {
             .content(Vec::new())
             .to_bytes();
 
-        let limits = Limits::recommended().with_max_attribute_len(8);
+        let limits = Limits::untrusted().with_max_attribute_len(8);
         assert!(matches!(
             FlowFile::parse_with_limits(bytes.as_slice(), limits),
             Err(Error::AttributeTooLong { limit: 8, .. })

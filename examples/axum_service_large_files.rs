@@ -35,7 +35,7 @@
 //! client actually sends, which is the only bound that means anything on a
 //! public endpoint. Disabling it lets any client hold as much of your disk as
 //! it likes. The header is bounded separately: both extractors apply
-//! `Limits::recommended`, so a crafted header is rejected before its
+//! `Limits::untrusted`, so a crafted header is rejected before its
 //! attributes are read.
 //!
 //! Validation happens before a `FlowFilesResponse` is returned, because

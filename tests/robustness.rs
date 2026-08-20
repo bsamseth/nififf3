@@ -104,7 +104,7 @@ fn arbitrary_input_is_rejected_rather_than_fatal() {
             }
         };
 
-        for limits in [Limits::UNLIMITED, Limits::recommended()] {
+        for limits in [Limits::UNLIMITED, Limits::untrusted()] {
             // Whatever these return, returning at all is the assertion.
             let _ = FlowFile::from_bytes_with_limits(&bytes, limits);
             let _ = FlowFile::from_vec_with_limits(bytes.clone(), limits);

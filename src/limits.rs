@@ -11,18 +11,18 @@ use crate::{Error, Result};
 /// functions apply [`Limits::UNLIMITED`] and trust their input, as
 /// [`FlowFile::parse`](crate::FlowFile::parse) and the calls beside it do. The
 /// `*_with_limits` variants take explicit limits, and the axum extractors
-/// apply [`recommended`](Self::recommended).
+/// apply [`untrusted`](Self::untrusted).
 ///
 /// Build a set of limits by chaining the `with_max_*` methods onto a starting
 /// point. Use [`UNLIMITED`](Self::UNLIMITED) to build up from nothing, and
-/// [`recommended`](Self::recommended) to adjust down from sensible caps. Each
+/// [`untrusted`](Self::untrusted) to adjust its caps. Each
 /// method takes `None` as well as a value, so you can clear a limit as well as
 /// set one:
 ///
 /// ```
 /// use nififf3::Limits;
 ///
-/// let limits = Limits::recommended()
+/// let limits = Limits::untrusted()
 ///     .with_max_attributes(64)
 ///     .with_max_content_len(None); // explicitly unbounded
 ///
@@ -34,10 +34,11 @@ use crate::{Error, Result};
 ///
 /// [`max_attributes`](Self::max_attributes) and
 /// [`max_attribute_len`](Self::max_attribute_len) are per-attribute, and the
-/// second one applies to keys and values separately. On their own, the
-/// recommended values would permit 4096 × 2 × 1 MiB, which is around 8 GiB of
-/// header. [`max_total_attribute_len`](Self::max_total_attribute_len) is what
-/// bounds that, at 2 MiB by default. The other two are still useful, because
+/// second one applies to keys and values separately. On their own, the values
+/// [`untrusted`](Self::untrusted) sets would permit 4096 × 2 × 1 MiB, or
+/// around 8 GiB of header.
+/// [`max_total_attribute_len`](Self::max_total_attribute_len) is what bounds
+/// that, at 2 MiB by default. The other two are still useful, because
 /// they fail earlier and say something more specific about what was wrong.
 ///
 /// None of this bounds the content, because the content is streamed. Over HTTP,
@@ -79,7 +80,7 @@ use crate::{Error, Result};
 ///     .content(&b"hi"[..])
 ///     .to_bytes();
 ///
-/// let limits = Limits::recommended().with_max_attribute_len(10);
+/// let limits = Limits::untrusted().with_max_attribute_len(10);
 /// let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
 /// assert!(matches!(err, Error::AttributeTooLong { .. }));
 /// ```
@@ -100,7 +101,7 @@ impl Limits {
     ///
     /// This is the neutral starting point. Chain `with_max_*` onto it to build
     /// a set of limits up from nothing.
-    /// [`recommended`](Self::recommended) already has caps in place, so
+    /// [`untrusted`](Self::untrusted) already has caps in place, so
     /// chaining onto that one adjusts them instead.
     pub const UNLIMITED: Self = Self {
         max_attributes: None,
@@ -109,22 +110,43 @@ impl Limits {
         max_content_len: None,
     };
 
-    /// Sensible caps for untrusted input: at most 4096 attributes, each key
+    /// Caps for input you did not produce: at most 4096 attributes, each key
     /// and value at most 1 MiB, 2 MiB of attribute bytes in total, and no cap
     /// on the declared content size.
+    ///
+    /// These numbers are a starting point, not advice. They are sized to stop
+    /// a crafted header from costing much, on the assumption that ordinary
+    /// input stays well under them. A pipeline whose flow files carry many
+    /// attributes, or large ones, will hit them on legitimate input and should
+    /// raise them. For input you control, [`UNLIMITED`](Self::UNLIMITED) is
+    /// what NiFi itself applies.
+    ///
+    /// The numbers are not part of the API. Any of them may change in a point
+    /// release, in either direction, and one that is unset today may gain a
+    /// cap. If your pipeline depends on a particular limit, set that limit
+    /// yourself with the `with_max_*` methods rather than inheriting it from
+    /// here.
     ///
     /// This is also [`Default::default`]. The plain parsers do not apply it:
     /// [`FlowFile::parse`](crate::FlowFile::parse) and the calls beside it use
     /// [`UNLIMITED`](Self::UNLIMITED), matching NiFi. "Default" here means the
-    /// defaults worth starting from, and not the crate's default behavior.
+    /// value to start from, and not the crate's default behavior.
     #[must_use]
-    pub const fn recommended() -> Self {
+    pub const fn untrusted() -> Self {
         Self {
             max_attributes: Some(4096),
             max_attribute_len: Some(1 << 20),
             max_total_attribute_len: Some(2 << 20),
             max_content_len: None,
         }
+    }
+
+    /// Renamed to [`untrusted`](Self::untrusted), which says what these caps
+    /// are for without calling them advice.
+    #[must_use]
+    #[deprecated(since = "0.3.7", note = "renamed to `Limits::untrusted`")]
+    pub const fn recommended() -> Self {
+        Self::untrusted()
     }
 
     /// Set or clear the maximum number of attributes.
@@ -191,7 +213,7 @@ impl Limits {
     /// use nififf3::{Error, FlowFile, Limits};
     ///
     /// let bytes = FlowFile::builder().content(&b"hello"[..]).to_bytes();
-    /// let limits = Limits::recommended().with_max_content_len(4);
+    /// let limits = Limits::untrusted().with_max_content_len(4);
     ///
     /// let err = FlowFile::parse_with_limits(bytes.as_slice(), limits).unwrap_err();
     /// assert!(matches!(err, Error::ContentTooLarge { size: 5, limit: 4 }));
@@ -295,7 +317,7 @@ impl Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self::recommended()
+        Self::untrusted()
     }
 }
 
@@ -305,7 +327,7 @@ mod tests {
 
     #[test]
     fn limits_can_be_set_and_cleared() {
-        let limits = Limits::recommended()
+        let limits = Limits::untrusted()
             .with_max_attributes(64)
             .with_max_content_len(1024)
             .with_max_attribute_len(None);
@@ -325,9 +347,17 @@ mod tests {
         assert_eq!(limits.max_content_len(), None);
     }
 
+    /// The old name has to keep working, since deprecating it rather than
+    /// removing it is the whole point.
     #[test]
-    fn default_is_recommended() {
-        assert_eq!(Limits::default(), Limits::recommended());
+    #[allow(deprecated, reason = "checking the deprecated name still resolves")]
+    fn the_renamed_constructor_still_answers_under_its_old_name() {
+        assert_eq!(Limits::recommended(), Limits::untrusted());
+    }
+
+    #[test]
+    fn default_is_the_untrusted_preset() {
+        assert_eq!(Limits::default(), Limits::untrusted());
     }
 
     /// `check` and the parsers have to agree, or `--max-*` would mean one
@@ -346,7 +376,7 @@ mod tests {
             Limits::UNLIMITED.with_max_attribute_len(10),
             Limits::UNLIMITED.with_max_total_attribute_len(256),
             Limits::UNLIMITED.with_max_content_len(2),
-            Limits::recommended(),
+            Limits::untrusted(),
         ] {
             let parsed = FlowFile::from_bytes_with_limits(&bytes, limits);
             let checked = limits.check(flow_file.attributes(), flow_file.size());

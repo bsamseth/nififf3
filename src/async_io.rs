@@ -1053,7 +1053,7 @@ mod tests {
         assert!(matches!(
             FlowFile::from_reader_async_with_limits(
                 bytes.as_slice(),
-                Limits::recommended().with_max_content_len(4)
+                Limits::untrusted().with_max_content_len(4)
             )
             .await,
             Err(Error::ContentTooLarge { size: 5, limit: 4 })
@@ -1067,7 +1067,7 @@ mod tests {
             .content(Vec::new())
             .to_bytes();
 
-        let limits = Limits::recommended().with_max_attribute_len(8);
+        let limits = Limits::untrusted().with_max_attribute_len(8);
         assert!(matches!(
             FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
             Err(Error::AttributeTooLong { limit: 8, .. })
@@ -1100,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn async_limits_reject_an_oversized_declared_content_size() {
         let bytes = sample().to_bytes();
-        let limits = Limits::recommended().with_max_content_len(4);
+        let limits = Limits::untrusted().with_max_content_len(4);
 
         assert!(matches!(
             FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,

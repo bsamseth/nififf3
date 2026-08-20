@@ -23,6 +23,21 @@
   exhaustive, and a processor can write whatever it likes, so a missing
   constant is a gap here rather than a name you cannot use.
 
+### Changed
+
+- `Limits::recommended` is now `Limits::untrusted`. The old name claimed an
+  authority the numbers do not have. They are caps sized to stop a crafted
+  header from costing much, on the assumption that ordinary input stays well
+  under them, and nothing about them suits every use: a pipeline whose flow
+  files carry many attributes, or large ones, will hit them on legitimate
+  input. The new name says what they are for and leaves the judgement to you.
+  The old name still works and is deprecated, so nothing breaks. The values
+  are unchanged, and so is `Default`, which still gives them.
+- The values `Limits::untrusted` sets are documented as not being part of the
+  API. Any of them may change in a point release, in either direction, and one
+  that is unset today may gain a cap. Set a limit yourself with the
+  `with_max_*` methods if you depend on it being a particular number.
+
 ### Documentation
 
 - The README is rewritten and about a quarter of its former length. It now

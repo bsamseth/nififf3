@@ -29,7 +29,7 @@ use crate::{
 /// incrementally.
 ///
 /// Request bodies are untrusted, so the header is parsed with
-/// [`Limits::recommended`]. To use different limits, extract the raw
+/// [`Limits::untrusted`]. To use different limits, extract the raw
 /// [`axum::body::Body`] and call
 /// [`FlowFile::parse_async_with_limits`] on a reader over it.
 ///
@@ -118,7 +118,7 @@ impl FlowFileBody {
     /// async fn handler(request: Request) -> Result<usize, nififf3::Error> {
     ///     // `with_limited_body` is what applies `DefaultBodyLimit`.
     ///     let body = FlowFileBody::from_body(request.with_limited_body().into_body());
-    ///     let mut flow_files = FlowFilesAsync::with_limits(body, Limits::recommended());
+    ///     let mut flow_files = FlowFilesAsync::with_limits(body, Limits::untrusted());
     ///
     ///     let mut count = 0;
     ///     while let Some(flow_file) = flow_files.next().await {
@@ -195,7 +195,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
     type Rejection = Error;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        FlowFile::parse_async_with_limits(limited_body(req), Limits::recommended())
+        FlowFile::parse_async_with_limits(limited_body(req), Limits::untrusted())
             .await
             .map(Self)
     }
@@ -328,7 +328,7 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
 /// the contents instead, build a [`FlowFileBody`] and drive
 /// [`FlowFile::parse_next_async`] over it yourself.
 ///
-/// Headers are parsed with [`Limits::recommended`], as for the single-flow-file
+/// Headers are parsed with [`Limits::untrusted`], as for the single-flow-file
 /// extractors. Parse errors surface from [`next`](FlowFilesAsync::next) rather
 /// than from extraction, since nothing is read until then: the extractor itself
 /// only fails if the request cannot be taken apart at all.
@@ -370,7 +370,7 @@ impl<S: Send + Sync> FromRequest<S> for FlowFilesRequest {
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(Self(FlowFilesAsync::with_limits(
             limited_body(req),
-            Limits::recommended(),
+            Limits::untrusted(),
         )))
     }
 }
