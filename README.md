@@ -32,21 +32,23 @@ assert_eq!(flow_file.content().as_slice(), b"Hello, NiFi!");
 
 Indexing a flow file reads an attribute, and panics if it is not set, the way
 indexing a `HashMap` does. Use `attribute` when it may be missing, since that
-returns an `Option`. Assigning to an index sets the attribute, adding it if it
-was not there:
+returns an `Option`:
 
 ```rust
 use nififf3::{FlowFile, attr};
 
-let mut flow_file = FlowFile::builder().content(&b"hi"[..]);
-flow_file[attr::FILENAME] = "greeting.txt".to_string();
+let flow_file = FlowFile::builder()
+    .attribute(attr::FILENAME, "greeting.txt")
+    .content(&b"hi"[..]);
 
 assert_eq!(flow_file[attr::FILENAME], "greeting.txt");
 assert_eq!(flow_file.attribute("nothing"), None);
 ```
 
-The `attr` module names the attributes NiFi gives a meaning to, so that a key
-is a constant rather than a string you retype.
+Indexing only reads. Set an attribute through the builder, or through
+`attributes_mut` on a flow file you already hold. The `attr` module names the
+attributes NiFi gives a meaning to, so that a key is a constant rather than a
+string you retype.
 
 `FlowFile::parse` is lazy. It reads only the header from a reader, and hands
 back the content as a second reader limited to the declared size. You can

@@ -8,7 +8,7 @@
 #![cfg_attr(docsrs, doc(auto_cfg))]
 
 use std::collections::HashMap;
-use std::ops::{Index, IndexMut};
+use std::ops::Index;
 
 pub mod attr;
 
@@ -688,6 +688,12 @@ impl FlowFile<Vec<u8>> {
 /// [`attribute`](FlowFile::attribute) returns `None` instead, which is what to
 /// reach for when the attribute may be missing.
 ///
+/// Only reading works this way. There is no `IndexMut`, so
+/// `flow_file[key] = value` does not compile, which is also true of a
+/// [`HashMap`]. Set an attribute through the builder, or through
+/// [`attributes_mut`](FlowFile::attributes_mut) on a flow file you already
+/// hold.
+///
 /// ```
 /// use nififf3::{FlowFile, attr};
 ///
@@ -710,34 +716,6 @@ where
 
     fn index(&self, key: &Q) -> &String {
         &self.attributes[key]
-    }
-}
-
-/// Assign to an attribute, adding it if it was not set.
-///
-/// ```
-/// use nififf3::{FlowFile, attr};
-///
-/// let mut flow_file = FlowFile::builder().content(&b"hello"[..]);
-///
-/// flow_file[attr::FILENAME] = "greeting.txt".to_string();
-/// flow_file["seen"] = "true".to_string();
-///
-/// assert_eq!(flow_file[attr::FILENAME], "greeting.txt");
-/// assert_eq!(flow_file["seen"], "true");
-/// ```
-///
-/// This is where the resemblance to [`HashMap`] stops. A `HashMap` has no
-/// `IndexMut` at all, so `map[key] = value` does not compile. Here it does,
-/// and the attribute is added if it was missing.
-///
-/// The cost of that is a mutable index adding the attribute whether or not you
-/// go on to assign to it. `&mut flow_file["absent"]` leaves an empty value
-/// behind. Reading through [`Index`] never adds anything, so only take a
-/// mutable index when you mean to write.
-impl<R> IndexMut<&str> for FlowFile<R> {
-    fn index_mut(&mut self, key: &str) -> &mut String {
-        self.attributes.entry(key.to_string()).or_default()
     }
 }
 
@@ -903,39 +881,6 @@ mod tests {
     fn indexing_a_missing_attribute_panics() {
         let flow_file = FlowFile::builder().content(Vec::new());
         let _ = &flow_file[attr::FILENAME];
-    }
-
-    /// Assignment adds the attribute when it was missing, which is the one
-    /// place this differs from `HashMap`. A `HashMap` has no `IndexMut`, so
-    /// the equivalent line does not compile.
-    #[test]
-    fn assigning_through_an_index_sets_the_attribute() {
-        let mut flow_file = FlowFile::builder()
-            .attribute(attr::FILENAME, "old.txt")
-            .content(&b"hello"[..]);
-
-        flow_file[attr::FILENAME] = "new.txt".to_string();
-        flow_file["added"] = "yes".to_string();
-
-        assert_eq!(flow_file[attr::FILENAME], "new.txt", "overwritten");
-        assert_eq!(flow_file["added"], "yes", "added");
-        assert_eq!(flow_file.attributes().len(), 2);
-        // Nothing else moved: the content and the size are untouched.
-        assert_eq!(flow_file.size(), 5);
-    }
-
-    /// The cost of assignment working: a mutable index adds the attribute even
-    /// when nothing is assigned. Checked so that the documented surprise stays
-    /// true.
-    #[test]
-    fn a_mutable_index_adds_a_missing_attribute() {
-        let mut flow_file = FlowFile::builder().content(Vec::new());
-
-        flow_file["grown"].push_str("in place");
-        assert_eq!(flow_file["grown"], "in place");
-
-        let _ = &mut flow_file["absent"];
-        assert_eq!(flow_file.attribute("absent"), Some(""), "left empty");
     }
 
     #[test]

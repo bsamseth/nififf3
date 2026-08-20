@@ -4,12 +4,11 @@
 
 ### Added
 
-- `FlowFile` implements `Index` and `IndexMut` over attribute names, so
-  `flow_file["filename"]` reads an attribute and
-  `flow_file["filename"] = value` sets one. Reading panics when the attribute
-  is not set, as indexing a `HashMap` does. Assigning adds it, which a
-  `HashMap` cannot do at all, since it has no `IndexMut`. The cost is that a
-  mutable index adds the attribute whether or not you assign to it.
+- `FlowFile` implements `Index` over attribute names, so
+  `flow_file["filename"]` reads an attribute. It panics when the attribute is
+  not set, as indexing a `HashMap` does, and `attribute` returns an `Option`
+  for when it may be missing. Indexing only reads, again as with a `HashMap`:
+  set an attribute through the builder or through `attributes_mut`.
 - Thirty more constants in the `attr` module. They cover the rest of NiFi's
   `CoreAttributes`, the file metadata that `GetFile`, `ListFile` and
   `UnpackContent` write, the sizes and counts from `SplitText`, the
