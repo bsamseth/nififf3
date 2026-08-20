@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `FlowFile` implements `Index` and `IndexMut` over attribute names, so
+  `flow_file["filename"]` reads an attribute and
+  `flow_file["filename"] = value` sets one. Reading panics when the attribute
+  is not set, as indexing a `HashMap` does. Assigning adds it, which a
+  `HashMap` cannot do at all, since it has no `IndexMut`. The cost is that a
+  mutable index adds the attribute whether or not you assign to it.
+- Thirty more constants in the `attr` module. They cover the rest of NiFi's
+  `CoreAttributes`, the file metadata that `GetFile`, `ListFile` and
+  `UnpackContent` write, the sizes and counts from `SplitText`, the
+  `merge.*` attributes from `MergeContent`, and the request and response
+  attributes from `HandleHttpRequest` and `InvokeHTTP`. The list is not
+  exhaustive, and a processor can write whatever it likes, so a missing
+  constant is a gap here rather than a name you cannot use.
+
 ## 0.3.6
 
 One addition, for a service that reads a request and writes its response over
