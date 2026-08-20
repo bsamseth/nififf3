@@ -23,6 +23,16 @@
   exhaustive, and a processor can write whatever it likes, so a missing
   constant is a gap here rather than a name you cannot use.
 
+### Documentation
+
+- The README is rewritten and about a quarter of its former length. It now
+  covers what a flow file is, how to parse one from each kind of source, how
+  to build one, and what the axum integration offers, and it opens with a
+  handler that answers NiFi over HTTP. Everything it used to explain in full
+  is documented on the item it belongs to, which is where you land from
+  docs.rs anyway. Every code block in it is now compiled as a doc test, where
+  six of them used to be skipped.
+
 ## 0.3.6
 
 One addition, for a service that reads a request and writes its response over
