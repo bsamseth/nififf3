@@ -171,7 +171,11 @@ subscriber, and with the feature off the calls are compiled out.
 
 Spans carry the same three fields wherever they are known, so an interleaved
 log can be followed back to one flow file: `uuid`, `filename` when the flow
-file has one, and `size`. Set `RUST_LOG` to choose how much you want.
+file has one, and `size`.
+
+How much of it you get is your subscriber's decision, not this crate's.
+`tracing-subscriber` with its `EnvFilter` is what reads `RUST_LOG`, so
+`RUST_LOG=nififf3=debug` needs that in your own dependencies.
 
 - `warn` and `error` report what your own `Result`s cannot: a write that
   poisoned a writer, a background spool that failed, a response body that

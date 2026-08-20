@@ -149,3 +149,54 @@ fn each_flow_file_in_a_stream_is_logged_once() {
     let parsed = logs.matches("parsed header").count();
     assert_eq!(parsed, 2, "one per flow file, got {parsed}: {logs}");
 }
+
+/// A wrong content type is answered with a 415 before the handler runs, so
+/// nothing in the handler can report it.
+#[cfg(all(feature = "axum", feature = "uuid"))]
+#[test]
+fn a_rejected_content_type_is_logged() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    let logs = {
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+        let app = Router::new().route(
+            "/in",
+            post(|_: nififf3::StrictFlowFileRequest| async { "unreachable" }),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/in")
+            .header("content-type", "text/plain")
+            .body(Body::from(sample()))
+            .unwrap();
+        let response = tracing::subscriber::with_default(subscriber, || {
+            futures_executor_block_on(app.oneshot(request))
+        });
+        assert_eq!(response.unwrap().status(), 415);
+        sink.text()
+    };
+
+    assert!(logs.contains("content type is not"), "{logs}");
+    assert!(logs.contains("text/plain"), "{logs}");
+}
+
+/// `with_default` sets the subscriber for this thread, so the whole exchange
+/// has to run inside it rather than on a runtime started outside.
+#[cfg(all(feature = "axum", feature = "uuid"))]
+fn futures_executor_block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}

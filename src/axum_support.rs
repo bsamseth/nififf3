@@ -299,6 +299,13 @@ fn require_media_type(req: &Request) -> Result<(), StrictRejection> {
     if media_type.is_some_and(|value| value.eq_ignore_ascii_case(MEDIA_TYPE)) {
         Ok(())
     } else {
+        // A 415 that the handler never runs to see, decided by a header the
+        // caller of this service chose.
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            content_type,
+            "rejecting request: content type is not {MEDIA_TYPE}"
+        );
         Err(StrictRejection::UnsupportedMediaType(
             content_type.map(abbreviated),
         ))
