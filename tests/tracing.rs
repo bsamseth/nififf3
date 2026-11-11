@@ -150,11 +150,12 @@ fn each_flow_file_in_a_stream_is_logged_once() {
     assert_eq!(parsed, 2, "one per flow file, got {parsed}: {logs}");
 }
 
-/// A wrong content type is answered with a 415 before the handler runs, so
-/// nothing in the handler can report it.
+/// A body that is not a flow file is answered with a 400 before the handler
+/// runs, so nothing in the handler can report it. The log names the content
+/// type, which is the first thing to check.
 #[cfg(all(feature = "axum", feature = "uuid"))]
 #[test]
-fn a_rejected_content_type_is_logged() {
+fn a_rejected_request_is_logged() {
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
@@ -171,29 +172,71 @@ fn a_rejected_content_type_is_logged() {
             .finish();
         let app = Router::new().route(
             "/in",
-            post(|_: nififf3::StrictFlowFileRequest| async { "unreachable" }),
+            post(|_: nififf3::FlowFile<nififf3::Spool>| async { "unreachable" }),
         );
         let request = Request::builder()
             .method("POST")
             .uri("/in")
             .header("content-type", "text/plain")
-            .body(Body::from(sample()))
+            .body(Body::from("plain text, not a flow file"))
             .unwrap();
-        let response = tracing::subscriber::with_default(subscriber, || {
-            futures_executor_block_on(app.oneshot(request))
-        });
-        assert_eq!(response.unwrap().status(), 415);
+        let response =
+            tracing::subscriber::with_default(subscriber, || block_on(app.oneshot(request)));
+        assert_eq!(response.unwrap().status(), 400);
         sink.text()
     };
 
-    assert!(logs.contains("content type is not"), "{logs}");
+    assert!(logs.contains("rejecting request"), "{logs}");
+    assert!(logs.contains("invalid magic header"), "{logs}");
     assert!(logs.contains("text/plain"), "{logs}");
+}
+
+/// The extractor says where each request's content went, which is the field
+/// to look at when disk fills up or memory does.
+#[cfg(all(feature = "axum", feature = "uuid"))]
+#[test]
+fn an_extracted_request_logs_its_identity_and_destination() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    let logs = {
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(Level::INFO)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+        let app = Router::new().route(
+            "/in",
+            post(|flow_file: nififf3::FlowFile<nififf3::Spool>| async move {
+                flow_file.size().to_string()
+            }),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/in")
+            .body(Body::from(sample()))
+            .unwrap();
+        let response =
+            tracing::subscriber::with_default(subscriber, || block_on(app.oneshot(request)));
+        assert_eq!(response.unwrap().status(), 200);
+        sink.text()
+    };
+
+    assert!(logs.contains("extracted flow file from request"), "{logs}");
+    assert!(logs.contains("uuid=\"0f4d-known\""), "{logs}");
+    assert!(logs.contains("filename=\"greeting.txt\""), "{logs}");
+    assert!(logs.contains("spool=\"memory\""), "{logs}");
 }
 
 /// `with_default` sets the subscriber for this thread, so the whole exchange
 /// has to run inside it rather than on a runtime started outside.
 #[cfg(all(feature = "axum", feature = "uuid"))]
-fn futures_executor_block_on<F: std::future::Future>(future: F) -> F::Output {
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

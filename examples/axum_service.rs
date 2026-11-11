@@ -2,9 +2,9 @@
 //!
 //! Two handlers on one `Router`:
 //!
-//! - `POST /transform` takes one flow file in and sends one out.
-//!   `StrictFlowFileRequest` parses the header and streams the body, and the
-//!   answer is a flow file, which is itself an `IntoResponse`.
+//! - `POST /transform` takes one flow file in and sends one out. The
+//!   extractor is `FlowFile<Spool>`, and the answer is a flow file, which is
+//!   itself an `IntoResponse`.
 //! - `POST /split` takes one flow file in and sends many out, through
 //!   `FlowFilesResponse`.
 //!
@@ -19,13 +19,11 @@ use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
 use axum::{Router, response::IntoResponse};
 use http_body_util::BodyExt;
-use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse, StrictFlowFileRequest};
+use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse, Spool};
 use tower::ServiceExt;
 
 /// One in, one out: the content is rewritten, the attributes carried over.
-async fn transform(
-    StrictFlowFileRequest(flow_file): StrictFlowFileRequest,
-) -> Result<impl IntoResponse, Error> {
+async fn transform(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
     let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file
         .derive()
@@ -40,9 +38,7 @@ async fn transform(
 /// `FlowFilesResponse` is returned. Past that point the status is already 200,
 /// so a problem with one record belongs in the body, as attributes on a flow
 /// file of its own.
-async fn split(
-    StrictFlowFileRequest(flow_file): StrictFlowFileRequest,
-) -> Result<FlowFilesResponse, Error> {
+async fn split(flow_file: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
     let parent = flow_file.into_memory_async().await?;
     let mut parts = parent.fragments();
 
@@ -88,8 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  {} bytes, filename={}, transformed={}",
         answer.size(),
-        answer.attributes()["filename"],
-        answer.attributes()["transformed"],
+        answer["filename"],
+        answer["transformed"],
     );
     assert_eq!(answer.content().as_slice(), b"ALPHA\nBETA\nGAMMA");
 
@@ -133,14 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("POST /split (bad body) -> {}", response.status());
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let no_content_type = Request::builder()
-        .method("POST")
-        .uri("/split")
-        .body(Body::empty())?;
-    let response = app.oneshot(no_content_type).await?;
-    println!("POST /split (no content type) -> {}", response.status());
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let message = response.into_body().collect().await?.to_bytes();
+    println!("  {}", String::from_utf8_lossy(&message));
     Ok(())
 }
 

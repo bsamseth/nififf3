@@ -1,239 +1,518 @@
-//! Copying a flow file's content to a temporary file in the background.
+//! Content held in memory or in a temporary file, whichever its size calls
+//! for.
 
-use std::io;
+use std::io::{self, Cursor, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter, ReadBuf,
+};
 
-use crate::FlowFile;
+use crate::{FlowFile, FlowFileBuilder};
 
-/// How much spooled content may sit between the temporary file and the reader.
-const PIPE_SIZE: usize = 64 * 1024;
+/// How much goes to or from the temporary file per operation. Every
+/// `tokio::fs` call is a hop to a blocking thread, so this amortizes them.
+const FILE_BUFFER: usize = 128 * 1024;
 
-/// Content held in a temporary file that a background task is still filling.
+/// Where spooled content goes, by size.
 ///
-/// [`FlowFile::spool_async`] produces one. Reading it yields the content in
-/// order, waiting when the reader catches up with the copy rather than
-/// reporting the end early.
+/// Content up to [`max_in_memory`](Self::max_in_memory) bytes is held in
+/// memory. Anything larger goes to an anonymous temporary file, created in
+/// [`directory`](Self::directory) or in the system's temporary directory.
 ///
-/// If the copy fails, the error surfaces from the read that reaches the point
-/// where it stopped. Dropping this stops the copy and releases the temporary
-/// file.
-#[derive(Debug)]
-pub struct SpooledContent {
-    inner: tokio::io::DuplexStream,
-    failure: Arc<Mutex<Option<io::Error>>>,
-    tasks: [JoinHandle<()>; 2],
+/// The defaults suit most services. To change them for the axum extractors,
+/// add the config to the router as an extension:
+///
+/// ```
+/// # #[cfg(feature = "axum")] {
+/// use axum::{Extension, Router};
+/// use nififf3::SpoolConfig;
+///
+/// let app: Router = Router::new()
+///     .layer(Extension(SpoolConfig::new().with_max_in_memory(64 << 20)));
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpoolConfig {
+    max_in_memory: usize,
+    directory: Option<PathBuf>,
 }
 
-impl AsyncRead for SpooledContent {
+impl SpoolConfig {
+    /// What [`max_in_memory`](Self::max_in_memory) is unless set: 4 MiB.
+    pub const DEFAULT_MAX_IN_MEMORY: usize = 4 << 20;
+
+    /// The default configuration. The same as [`Default::default`], but
+    /// `const`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            max_in_memory: Self::DEFAULT_MAX_IN_MEMORY,
+            directory: None,
+        }
+    }
+
+    /// Hold content up to `bytes` long in memory, and spool anything larger
+    /// to disk. Zero sends everything to disk.
+    #[must_use]
+    pub fn with_max_in_memory(mut self, bytes: usize) -> Self {
+        self.max_in_memory = bytes;
+        self
+    }
+
+    /// Create temporary files in `directory` rather than in the system's
+    /// temporary directory.
+    ///
+    /// Use it when the system directory is small or on the wrong disk. The
+    /// files are anonymous, meaning they are unlinked as soon as they are
+    /// created where the platform allows it, so nothing is left behind if the
+    /// process dies.
+    #[must_use]
+    pub fn with_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.directory = Some(directory.into());
+        self
+    }
+
+    /// The largest content held in memory.
+    #[must_use]
+    pub fn max_in_memory(&self) -> usize {
+        self.max_in_memory
+    }
+
+    /// Where temporary files go, or `None` for the system default.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+}
+
+impl Default for SpoolConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Content that has been read in full, held in memory or in a temporary file
+/// depending on its size. See [`SpoolConfig`].
+///
+/// The axum extractor for `FlowFile<Spool>` produces one for every request,
+/// and so do [`FlowFile::spool_async`] and [`FlowFileBuilder::spool_async`].
+/// Whatever produced it has already read the content to the end, so a
+/// `Spool` never waits on a network or on another task. Reading it yields the
+/// content from the current position, and it can be rewound and read again.
+///
+/// It is an
+/// [`AsyncRead`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html)
+/// and an
+/// [`AsyncSeek`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncSeek.html),
+/// so it feeds any async decoder, including ones that seek. For a synchronous
+/// decoder, wrap it in `tokio_util::io::SyncIoBridge` on a blocking thread.
+/// When the content is in memory, [`as_bytes`](Self::as_bytes) gives it
+/// without a read.
+///
+/// Dropping it releases the memory or the file.
+#[derive(Debug)]
+pub struct Spool {
+    inner: Inner,
+    len: u64,
+}
+
+#[derive(Debug)]
+enum Inner {
+    Memory(Cursor<Vec<u8>>),
+    File(BufReader<tokio::fs::File>),
+}
+
+impl Spool {
+    /// Spool content that is already in memory.
+    #[must_use]
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            inner: Inner::Memory(Cursor::new(bytes)),
+        }
+    }
+
+    /// Read `reader` to its end into a spool.
+    ///
+    /// The content goes to memory or to disk as `config` says. Use
+    /// [`from_reader_exact`](Self::from_reader_exact) when the length is known
+    /// in advance, which is the case for a flow file's content.
+    ///
+    /// ```
+    /// use nififf3::{Spool, SpoolConfig};
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let spool = Spool::from_reader(&b"hello"[..], &SpoolConfig::default()).await?;
+    /// assert_eq!(spool.len(), 5);
+    /// assert_eq!(spool.as_bytes(), Some(&b"hello"[..]));
+    /// # Ok::<(), std::io::Error>(())
+    /// # }).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Whatever the reader reports, or the temporary file cannot be created
+    /// or written.
+    pub async fn from_reader<R: AsyncRead + Unpin>(
+        mut reader: R,
+        config: &SpoolConfig,
+    ) -> io::Result<Self> {
+        spool(&mut reader, None, config)
+            .await
+            .map_err(|err| err.error)
+    }
+
+    /// Read exactly `size` bytes from `reader` into a spool.
+    ///
+    /// Knowing the size up front means content over the threshold goes
+    /// straight to disk, instead of into memory first.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_reader`](Self::from_reader), plus an
+    /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying
+    /// [`Error::SizeMismatch`](crate::Error::SizeMismatch) if the reader ends
+    /// before `size` bytes. Nothing checks for bytes beyond `size`; they are
+    /// left in the reader.
+    pub async fn from_reader_exact<R: AsyncRead + Unpin>(
+        mut reader: R,
+        size: u64,
+        config: &SpoolConfig,
+    ) -> io::Result<Self> {
+        spool(&mut reader, Some(size), config)
+            .await
+            .map_err(|err| err.error)
+    }
+
+    /// The length of the content in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the content is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether the content is held in memory rather than in a file.
+    #[must_use]
+    pub fn is_in_memory(&self) -> bool {
+        matches!(self.inner, Inner::Memory(_))
+    }
+
+    /// The whole content, if it is in memory. The read position does not
+    /// matter here.
+    #[must_use]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match &self.inner {
+            Inner::Memory(cursor) => Some(cursor.get_ref()),
+            Inner::File(_) => None,
+        }
+    }
+
+    /// The whole content as a `Vec`, reading the file if there is one. The
+    /// read position does not matter here.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read.
+    pub async fn into_bytes(mut self) -> io::Result<Vec<u8>> {
+        match self.inner {
+            Inner::Memory(cursor) => Ok(cursor.into_inner()),
+            Inner::File(ref mut file) => {
+                file.rewind().await?;
+                let mut bytes = Vec::new();
+                crate::async_io::read_declared(file, self.len, &mut bytes).await?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// Move the read position back to the start, to read the content again.
+    ///
+    /// # Errors
+    ///
+    /// If seeking the file fails.
+    pub async fn rewind(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            Inner::Memory(cursor) => {
+                cursor.set_position(0);
+                Ok(())
+            }
+            Inner::File(file) => file.rewind().await.map(|_| ()),
+        }
+    }
+}
+
+impl From<Vec<u8>> for Spool {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
+impl AsyncRead for Spool {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
-        if buf.filled().len() == before {
-            // The pipe ended. Either the copy finished, or it stopped on an
-            // error the reader has not been told about yet.
-            if let Some(err) = self.failure.lock().expect("spool lock").take() {
-                return Poll::Ready(Err(err));
+        match &mut self.get_mut().inner {
+            Inner::Memory(cursor) => Pin::new(cursor).poll_read(cx, buf),
+            Inner::File(file) => Pin::new(file).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncSeek for Spool {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        match &mut self.get_mut().inner {
+            Inner::Memory(cursor) => Pin::new(cursor).start_seek(position),
+            Inner::File(file) => Pin::new(file).start_seek(position),
+        }
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        match &mut self.get_mut().inner {
+            Inner::Memory(cursor) => Pin::new(cursor).poll_complete(cx),
+            Inner::File(file) => Pin::new(file).poll_complete(cx),
+        }
+    }
+}
+
+/// Which end of the copy failed. The axum extractor answers a failing client
+/// and a failing disk with different status codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Side {
+    /// The reader being spooled.
+    Source,
+    /// The temporary file.
+    Sink,
+}
+
+#[derive(Debug)]
+pub(crate) struct SpoolError {
+    /// Only the axum extractors act on the side; the public spooling calls
+    /// flatten the error.
+    #[cfg_attr(not(feature = "axum"), allow(dead_code))]
+    pub(crate) side: Side,
+    pub(crate) error: io::Error,
+}
+
+fn source(error: io::Error) -> SpoolError {
+    SpoolError {
+        side: Side::Source,
+        error,
+    }
+}
+
+fn sink(error: io::Error) -> SpoolError {
+    SpoolError {
+        side: Side::Sink,
+        error,
+    }
+}
+
+/// Read `reader` into a spool: exactly `expected` bytes when it is given,
+/// otherwise to the end.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        level = "debug",
+        name = "spool",
+        skip_all,
+        fields(expected, destination = tracing::field::Empty, bytes = tracing::field::Empty)
+    )
+)]
+pub(crate) async fn spool<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    expected: Option<u64>,
+    config: &SpoolConfig,
+) -> Result<Spool, SpoolError> {
+    let threshold = config.max_in_memory as u64;
+    let mut memory = Vec::new();
+    match expected {
+        // The size is known and small: exactly that much, into memory.
+        Some(size) if size <= threshold => {
+            let read = crate::async_io::read_declared(reader, size, &mut memory)
+                .await
+                .map_err(source)?;
+            if read != size {
+                return Err(source(crate::error::truncated(size, read)));
+            }
+            return Ok(finished(Spool::from_vec(memory)));
+        }
+        // The size is known and large: straight to disk.
+        Some(_) => {}
+        // The size is unknown: memory first, and disk if it runs past the
+        // threshold. One byte past is all it takes to know.
+        None => {
+            let probe = threshold.saturating_add(1);
+            reader
+                .take(probe)
+                .read_to_end(&mut memory)
+                .await
+                .map_err(source)?;
+            if memory.len() as u64 <= threshold {
+                return Ok(finished(Spool::from_vec(memory)));
             }
         }
-        Poll::Ready(Ok(()))
     }
-}
 
-impl Drop for SpooledContent {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+    let file = create_file(config.directory.clone()).await.map_err(sink)?;
+    let mut writer = BufWriter::with_capacity(FILE_BUFFER, file);
+    writer.write_all(&memory).await.map_err(sink)?;
+    let mut total = memory.len() as u64;
+    drop(memory);
+
+    let mut buf = vec![0u8; FILE_BUFFER];
+    loop {
+        let want = match expected {
+            Some(size) => {
+                usize::try_from(size - total).map_or(buf.len(), |left| left.min(buf.len()))
+            }
+            None => buf.len(),
+        };
+        if want == 0 {
+            break;
         }
+        let read = reader.read(&mut buf[..want]).await.map_err(source)?;
+        if read == 0 {
+            if let Some(size) = expected {
+                return Err(source(crate::error::truncated(size, total)));
+            }
+            break;
+        }
+        writer.write_all(&buf[..read]).await.map_err(sink)?;
+        total += read as u64;
     }
+    writer.flush().await.map_err(sink)?;
+    let mut file = writer.into_inner();
+    file.rewind().await.map_err(sink)?;
+    Ok(finished(Spool {
+        inner: Inner::File(BufReader::with_capacity(FILE_BUFFER, file)),
+        len: total,
+    }))
 }
 
-impl<R> FlowFile<R>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    /// Start copying the content to a temporary file in the background, and
-    /// return at once.
+/// Record where the content ended up, then hand it on.
+fn finished(spool: Spool) -> Spool {
+    #[cfg(feature = "tracing")]
+    {
+        let span = tracing::Span::current();
+        span.record(
+            "destination",
+            if spool.is_in_memory() {
+                "memory"
+            } else {
+                "disk"
+            },
+        );
+        span.record("bytes", spool.len);
+        tracing::debug!("spooled content");
+    }
+    spool
+}
+
+/// An anonymous temporary file, created off the async threads since creating
+/// one is a blocking call.
+async fn create_file(directory: Option<PathBuf>) -> io::Result<tokio::fs::File> {
+    let file = tokio::task::spawn_blocking(move || match directory {
+        Some(directory) => tempfile::tempfile_in(directory),
+        None => tempfile::tempfile(),
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+impl<R: AsyncRead + Unpin> FlowFile<R> {
+    /// Read the content to its end into a [`Spool`], with the default
+    /// [`SpoolConfig`].
     ///
-    /// The returned flow file keeps this one's attributes and declared
-    /// [`size`](FlowFile::size), and its content reads back the same bytes.
-    /// Reading it can begin immediately, and the copy runs whether you read or
-    /// not.
-    ///
-    /// Use this when the content arrives over a connection you also answer on.
-    /// A producer that reads a request body and writes a response from the
-    /// same task deadlocks against a client that sends its whole request
-    /// before reading any of the response, and NiFi's client is one of those.
-    /// Spooling separates the two: the copy keeps draining the request however
-    /// long the response is blocked.
-    /// [`FlowFilesResponse`](crate::FlowFilesResponse) describes the deadlock
-    /// in full.
-    ///
-    /// Memory stays bounded whatever the content's size, because the bytes go
-    /// to disk. At most 64 KiB of them sit between the file and your reader.
+    /// Use it to take a flow file off a stream, such as a request body, and
+    /// hold it in full without deciding between memory and disk yourself.
+    /// Exactly [`size`](FlowFile::size) bytes are read.
     ///
     /// ```
-    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// use nififf3::FlowFile;
     ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bytes = FlowFile::builder()
     ///     .attribute("filename", "big.tar")
     ///     .content(&b"contents"[..])
     ///     .to_bytes();
     ///
-    /// // `spool_async` outlives this call, so the source must be owned.
-    /// let parsed = FlowFile::parse_async(std::io::Cursor::new(bytes)).await?;
-    /// let spooled = parsed.spool_async()?;
-    ///
+    /// let spooled = FlowFile::parse_async(bytes.as_slice()).await?.spool_async().await?;
     /// assert_eq!(spooled.attribute("filename"), Some("big.tar"));
-    /// assert_eq!(spooled.size(), 8);
-    /// assert_eq!(spooled.into_memory_async().await?.content().as_slice(), b"contents");
+    /// assert_eq!(spooled.content().as_bytes(), Some(&b"contents"[..]));
     /// # Ok::<(), nififf3::Error>(())
     /// # }).unwrap();
     /// ```
     ///
     /// # Errors
     ///
-    /// If the temporary file cannot be created or opened. A failure during the
-    /// copy itself is reported later, by the read that reaches it.
+    /// As [`Spool::from_reader_exact`].
+    pub async fn spool_async(self) -> io::Result<FlowFile<Spool>> {
+        self.spool_async_with(&SpoolConfig::new()).await
+    }
+
+    /// As [`spool_async`](Self::spool_async), with a [`SpoolConfig`] of your
+    /// own.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If called outside a tokio runtime, since it spawns the copy.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            level = "debug",
-            name = "spool_async",
-            skip_all,
-            fields(
-                uuid = self.attribute(crate::attr::UUID),
-                filename = self.attribute(crate::attr::FILENAME),
-                size = self.size,
-            )
-        )
-    )]
-    pub fn spool_async(self) -> io::Result<FlowFile<SpooledContent>> {
-        let file = tempfile::NamedTempFile::new()?;
-        // Two independent handles. `try_clone` would share one file offset
-        // between the copy and the reader, so each would move the other's
-        // position.
-        let mut sink = tokio::fs::File::from_std(file.reopen()?);
-        let mut source = tokio::fs::File::from_std(file.reopen()?);
+    /// As [`Spool::from_reader_exact`].
+    pub async fn spool_async_with(self, config: &SpoolConfig) -> io::Result<FlowFile<Spool>> {
+        let (size, attributes, content) = self.into_parts();
+        let spool = Spool::from_reader_exact(content, size, config).await?;
+        Ok(FlowFile::from_raw_parts(size, attributes, spool))
+    }
+}
 
-        let (size, attributes, mut content) = self.into_parts();
-        let failure = Arc::new(Mutex::new(None));
-        // How many bytes are in the file, and whether the copy is finished.
-        let (progress, mut watch_progress) = watch::channel((0u64, false));
+impl FlowFileBuilder {
+    /// Finish the build by reading an [`AsyncRead`] to its end into a
+    /// [`Spool`], with the default [`SpoolConfig`].
+    ///
+    /// Use it when the content size is not known up front and may be large:
+    /// the output of a compressor, for instance. The size is what was read.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let reader = &b"length unknown ahead of time"[..];
+    /// let flow_file = FlowFile::builder().spool_async(reader).await?;
+    /// assert_eq!(flow_file.size(), 28);
+    /// # Ok::<(), std::io::Error>(())
+    /// # }).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Spool::from_reader`].
+    pub async fn spool_async(self, content: impl AsyncRead + Unpin) -> io::Result<FlowFile<Spool>> {
+        self.spool_async_with(content, &SpoolConfig::new()).await
+    }
 
-        let copy_failure = Arc::clone(&failure);
-        // The copy outlives this call, so it needs the span carried into it.
-        // Without that its events would have no flow file attached to them.
-        #[cfg(feature = "tracing")]
-        let span = tracing::Span::current();
-        let copy = tokio::spawn(async move {
-            #[cfg(feature = "tracing")]
-            let _guard = span.enter();
-            // `file` lives until the copy ends, so the path outlives both
-            // handles being opened.
-            let _file = file;
-            let mut buf = vec![0u8; PIPE_SIZE];
-            let mut written = 0u64;
-            loop {
-                let read = match content.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(read) => read,
-                    Err(err) => {
-                        // Nothing is watching this task. The error waits in
-                        // the slot until a read reaches the point where the
-                        // copy stopped, and no read may ever get there.
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(error = %err, written, "spool source failed");
-                        *copy_failure.lock().expect("spool lock") = Some(err);
-                        break;
-                    }
-                };
-                if let Err(err) = sink.write_all(&buf[..read]).await {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(error = %err, written, "spool file write failed");
-                    *copy_failure.lock().expect("spool lock") = Some(err);
-                    break;
-                }
-                // `tokio::fs::File` buffers, so a returned `write_all` does not
-                // mean the bytes are in the file. Publishing the count before
-                // they are would have the reader see a short read and take it
-                // for the end.
-                if let Err(err) = sink.flush().await {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(error = %err, written, "spool file flush failed");
-                    *copy_failure.lock().expect("spool lock") = Some(err);
-                    break;
-                }
-                written += read as u64;
-                progress.send_replace((written, false));
-            }
-            #[cfg(feature = "tracing")]
-            tracing::debug!(spooled = written, "finished copying the content to disk");
-            progress.send_replace((written, true));
-        });
-
-        let (mut pipe, inner) = tokio::io::duplex(PIPE_SIZE);
-        let follow_failure = Arc::clone(&failure);
-        let follow = tokio::spawn(async move {
-            let mut position = 0u64;
-            let mut buf = vec![0u8; PIPE_SIZE];
-            loop {
-                let (written, done) = *watch_progress.borrow_and_update();
-                if position == written {
-                    if done {
-                        break;
-                    }
-                    if watch_progress.changed().await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                let want = usize::try_from(written - position)
-                    .unwrap_or(usize::MAX)
-                    .min(buf.len());
-                match source.read(&mut buf[..want]).await {
-                    // Below the count there are bytes to come, so wait for the
-                    // next update rather than treating this as the end.
-                    Ok(0) => {
-                        if watch_progress.changed().await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(read) => {
-                        position += read as u64;
-                        if pipe.write_all(&buf[..read]).await.is_err() {
-                            break; // the reader went away
-                        }
-                    }
-                    Err(err) => {
-                        *follow_failure.lock().expect("spool lock") = Some(err);
-                        break;
-                    }
-                }
-            }
-            let _ = pipe.shutdown().await;
-        });
-
-        let content = SpooledContent {
-            inner,
-            failure,
-            tasks: [copy, follow],
-        };
-        Ok(FlowFile::from_raw_parts(size, attributes, content))
+    /// As [`spool_async`](Self::spool_async), with a [`SpoolConfig`] of your
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Spool::from_reader`].
+    pub async fn spool_async_with(
+        self,
+        content: impl AsyncRead + Unpin,
+        config: &SpoolConfig,
+    ) -> io::Result<FlowFile<Spool>> {
+        let spool = Spool::from_reader(content, config).await?;
+        let size = spool.len();
+        Ok(self.reader(spool, size))
     }
 }
 
@@ -255,136 +534,156 @@ mod tests {
             .collect()
     }
 
-    /// The spooled content has to read back exactly what went in, including
-    /// content large enough to cross the pipe many times over.
-    #[tokio::test]
-    async fn spooling_preserves_the_flow_file() {
-        for len in [0usize, 1, PIPE_SIZE - 1, PIPE_SIZE, 5 * PIPE_SIZE + 7] {
-            let content = noise(len);
-            let bytes = FlowFile::builder()
-                .attribute("filename", "big.bin")
-                .content(content.clone())
-                .to_bytes();
+    fn small() -> SpoolConfig {
+        SpoolConfig::new().with_max_in_memory(1024)
+    }
 
-            let parsed = FlowFile::parse_async(std::io::Cursor::new(bytes))
+    /// The threshold decides where the content lives, whichever way the
+    /// length is learned, and the content reads back the same from both.
+    #[tokio::test]
+    async fn the_threshold_picks_memory_or_disk_and_both_read_back() {
+        for len in [0usize, 1, 1023, 1024, 1025, 5 * FILE_BUFFER + 7] {
+            let content = noise(len);
+            let in_memory = len <= 1024;
+
+            let exact = Spool::from_reader_exact(content.as_slice(), len as u64, &small())
                 .await
                 .unwrap();
-            let spooled = parsed.spool_async().unwrap();
-            assert_eq!(spooled.size(), len as u64, "{len}");
-            assert_eq!(spooled.attribute("filename"), Some("big.bin"));
+            assert_eq!(exact.is_in_memory(), in_memory, "exact, {len}");
+            assert_eq!(exact.len(), len as u64);
+            assert_eq!(exact.into_bytes().await.unwrap(), content, "exact, {len}");
 
-            let read = spooled.into_memory_async().await.unwrap();
-            assert_eq!(read.content(), &content, "{len}");
+            let to_end = Spool::from_reader(content.as_slice(), &small())
+                .await
+                .unwrap();
+            assert_eq!(to_end.is_in_memory(), in_memory, "to end, {len}");
+            assert_eq!(to_end.len(), len as u64);
+            let mut read = Vec::new();
+            let mut to_end = to_end;
+            to_end.read_to_end(&mut read).await.unwrap();
+            assert_eq!(read, content, "to end, {len}");
         }
     }
 
-    /// The copy runs whether or not anything is reading, which is the whole
-    /// point: a blocked reader must not stop the source being drained.
     #[tokio::test]
-    async fn the_copy_proceeds_while_nothing_reads() {
-        let content = noise(4 * PIPE_SIZE);
-        let bytes = FlowFile::builder().content(content.clone()).to_bytes();
-        let (header, body) = bytes.split_at(bytes.len() - content.len());
+    async fn a_spool_can_be_rewound_and_read_again() {
+        for len in [10usize, 3 * FILE_BUFFER] {
+            let content = noise(len);
+            let mut spool = Spool::from_reader(content.as_slice(), &small())
+                .await
+                .unwrap();
 
-        // A source that reports how much of it has been taken.
-        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Counting {
-            inner: std::io::Cursor::new([header, body].concat()),
-            taken: Arc::clone(&taken),
-        };
+            let mut first = Vec::new();
+            spool.read_to_end(&mut first).await.unwrap();
+            let mut nothing = Vec::new();
+            spool.read_to_end(&mut nothing).await.unwrap();
+            assert!(nothing.is_empty(), "exhausted until rewound");
 
-        let parsed = FlowFile::parse_async(counted).await.unwrap();
-        let spooled = parsed.spool_async().unwrap();
+            spool.rewind().await.unwrap();
+            let mut second = Vec::new();
+            spool.read_to_end(&mut second).await.unwrap();
+            assert_eq!(first, content);
+            assert_eq!(second, content);
 
-        // Nothing has read a byte of `spooled`, yet the source drains anyway.
-        for _ in 0..100 {
-            if taken.load(std::sync::atomic::Ordering::Relaxed) == bytes.len() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // And `AsyncSeek` works as the trait, not only through `rewind`.
+            spool.seek(SeekFrom::Start(len as u64 - 3)).await.unwrap();
+            let mut tail = Vec::new();
+            spool.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(tail, &content[len - 3..]);
         }
-        assert_eq!(
-            taken.load(std::sync::atomic::Ordering::Relaxed),
-            bytes.len(),
-            "the source should be drained without anyone reading the spool"
-        );
+    }
+
+    /// A source that ends before the declared size is an error, at both
+    /// sizes, and the error says which side failed.
+    #[tokio::test]
+    async fn an_exact_spool_reports_a_short_source() {
+        for (declared, available) in [(100u64, 60usize), (5000, 3000)] {
+            let content = noise(available);
+            let mut reader = content.as_slice();
+            let err = spool(&mut reader, Some(declared), &small())
+                .await
+                .unwrap_err();
+            assert_eq!(err.side, Side::Source, "{declared}");
+            assert_eq!(err.error.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(matches!(
+                crate::Error::from(err.error),
+                crate::Error::SizeMismatch { expected, actual }
+                    if expected == declared && actual == available as u64
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exact_spool_leaves_what_follows_in_the_reader() {
+        let mut reader: &[u8] = b"hello, world";
+        let spool = Spool::from_reader_exact(&mut reader, 5, &small())
+            .await
+            .unwrap();
+        assert_eq!(spool.as_bytes(), Some(&b"hello"[..]));
+        assert_eq!(reader, b", world");
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_is_told_apart_from_a_failing_source() {
+        let missing = std::env::temp_dir().join("nififf3-no-such-directory");
+        let config = SpoolConfig::new()
+            .with_max_in_memory(0)
+            .with_directory(missing);
+        let mut reader: &[u8] = b"anything";
+        let err = spool(&mut reader, None, &config).await.unwrap_err();
+        assert_eq!(err.side, Side::Sink);
+    }
+
+    #[tokio::test]
+    async fn the_configured_directory_is_used() {
+        let dir = std::env::temp_dir().join("nififf3-spool-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = SpoolConfig::new()
+            .with_max_in_memory(0)
+            .with_directory(&dir);
+        assert_eq!(config.directory(), Some(dir.as_path()));
+        assert_eq!(config.max_in_memory(), 0);
+
+        let spool = Spool::from_reader(&b"to disk"[..], &config).await.unwrap();
+        assert!(!spool.is_in_memory());
+        assert_eq!(spool.into_bytes().await.unwrap(), b"to disk");
+    }
+
+    #[tokio::test]
+    async fn spooling_a_flow_file_keeps_its_attributes_and_size() {
+        let content = noise(3000);
+        let bytes = FlowFile::builder()
+            .attribute("filename", "big.bin")
+            .content(content.clone())
+            .to_bytes();
+
+        let parsed = FlowFile::parse_async(bytes.as_slice()).await.unwrap();
+        let spooled = parsed.spool_async_with(&small()).await.unwrap();
+        assert_eq!(spooled.size(), 3000);
+        assert_eq!(spooled.attribute("filename"), Some("big.bin"));
+        assert!(!spooled.content().is_in_memory());
         assert_eq!(
             spooled.into_memory_async().await.unwrap().content(),
             &content
         );
     }
 
-    /// A source that fails part-way must report that failure, rather than
-    /// looking like content that simply ended.
     #[tokio::test]
-    async fn a_failing_source_surfaces_its_error() {
-        let bytes = FlowFile::builder().content(vec![7u8; 4096]).to_bytes();
-        let parsed = FlowFile::parse_async(Failing {
-            inner: std::io::Cursor::new(bytes),
-            fail_after: 200,
-            read: 0,
-        })
-        .await
-        .unwrap();
-
-        let err = parsed
-            .spool_async()
-            .unwrap()
-            .into_memory_async()
+    async fn the_builder_takes_its_size_from_what_was_read() {
+        let flow_file = FlowFile::builder()
+            .attribute("k", "v")
+            .spool_async(&b"spooled"[..])
             .await
-            .expect_err("the source failed, so the read must fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-    }
-
-    struct Counting {
-        inner: std::io::Cursor<Vec<u8>>,
-        taken: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl AsyncRead for Counting {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            let before = buf.filled().len();
-            let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-            let read = buf.filled().len() - before;
-            self.taken
-                .fetch_add(read, std::sync::atomic::Ordering::Relaxed);
-            result
-        }
-    }
-
-    struct Failing {
-        inner: std::io::Cursor<Vec<u8>>,
-        fail_after: usize,
-        read: usize,
-    }
-
-    impl AsyncRead for Failing {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            if this.read >= this.fail_after {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "source gone",
-                )));
-            }
-            // Small reads, so the failure lands part-way through the content
-            // rather than after all of it has already been handed over.
-            let want = buf.remaining().min(64);
-            let mut chunk = vec![0u8; want];
-            let mut into = ReadBuf::new(&mut chunk);
-            ready!(Pin::new(&mut this.inner).poll_read(cx, &mut into))?;
-            let filled = into.filled().len();
-            buf.put_slice(into.filled());
-            this.read += filled;
-            Poll::Ready(Ok(()))
-        }
+            .unwrap();
+        assert_eq!(flow_file.size(), 7);
+        let mut out = Vec::new();
+        flow_file.write_to_async(&mut out).await.unwrap();
+        assert_eq!(
+            out,
+            FlowFile::builder()
+                .attribute("k", "v")
+                .content(&b"spooled"[..])
+                .to_bytes()
+        );
     }
 }

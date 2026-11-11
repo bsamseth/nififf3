@@ -165,121 +165,6 @@ fn from_json_rejects_size_mismatch() {
 }
 
 #[test]
-fn limit_flags_reject_oversized_headers() {
-    let many = FlowFile::builder()
-        .attributes((0..50).map(|i| (format!("k{i}"), "v")))
-        .content(Vec::new())
-        .to_bytes();
-
-    nififf3()
-        .args(["attrs", "--max-attributes", "10"])
-        .write_stdin(many.clone())
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("attribute count"));
-
-    nififf3()
-        .args(["content", "--max-content-len", "2"])
-        .write_stdin(sample_bytes())
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("content size"));
-
-    // Unset means no cap, as before.
-    nififf3().arg("attrs").write_stdin(many).assert().success();
-}
-
-/// The limit flags are global, so they have to mean the same thing on every
-/// subcommand, including the two that never run a header parser.
-#[test]
-fn limit_flags_apply_to_the_json_path_too() {
-    let json = r#"{"attributes": {"k": "a value longer than the limit"}, "content": ""}"#;
-
-    nififf3()
-        .args(["from-json", "--max-attribute-len", "4"])
-        .write_stdin(json)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("attribute length"));
-
-    // And to the flow file `create` builds, content included.
-    nififf3()
-        .args(["create", "--max-content-len", "2", "k=v"])
-        .write_stdin("far too much content")
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("content size"));
-
-    // Unset still means no cap.
-    nififf3()
-        .arg("from-json")
-        .write_stdin(json)
-        .assert()
-        .success();
-}
-
-/// `--max-content-len` has to bound the read rather than judge it afterwards,
-/// because the point of the flag is to avoid buffering an unbounded stdin at
-/// all. A limit of 0 makes that observable. One byte of input is already over
-/// it, so nothing after the first byte can have been needed to decide.
-#[test]
-fn create_stops_reading_at_the_content_limit() {
-    nififf3()
-        .args(["create", "--max-content-len", "0", "k=v"])
-        .write_stdin(vec![b'x'; 1 << 20])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("content size"));
-
-    // And an input inside the limit still goes through untouched.
-    let stdout = nififf3()
-        .args(["create", "--max-content-len", "5", "k=v"])
-        .write_stdin("hello")
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert_eq!(
-        FlowFile::from_bytes(&stdout).unwrap().content().as_slice(),
-        b"hello"
-    );
-}
-
-/// Attribute limits are decided before stdin is touched at all.
-#[test]
-fn create_rejects_oversized_attributes_without_reading_content() {
-    nififf3()
-        .args(["create", "--max-attribute-len", "2", "key=value"])
-        .write_stdin("content")
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("attribute length"));
-}
-
-/// The aggregate cap catches what the per-attribute ones cannot.
-#[test]
-fn total_attribute_length_flag_is_enforced() {
-    let many = FlowFile::builder()
-        .attributes((0..10).map(|i| (format!("k{i}"), "v".repeat(100))))
-        .content(Vec::new())
-        .to_bytes();
-
-    nififf3()
-        .args(["attrs", "--max-total-attribute-len", "256"])
-        .write_stdin(many.clone())
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("attribute bytes total"));
-
-    nififf3()
-        .args(["attrs", "--max-attribute-len", "1024"])
-        .write_stdin(many)
-        .assert()
-        .success();
-}
-
-#[test]
 fn to_json_rejects_garbage() {
     nififf3()
         .arg("to-json")
@@ -287,4 +172,26 @@ fn to_json_rejects_garbage() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("invalid magic"));
+}
+
+#[test]
+fn attrs_detects_truncated_input() {
+    let bytes = sample_bytes();
+    nififf3()
+        .arg("attrs")
+        .write_stdin(bytes[..bytes.len() - 2].to_vec())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("size mismatch"));
+}
+
+#[test]
+fn to_json_names_where_a_truncated_header_ended() {
+    let bytes = sample_bytes();
+    nififf3()
+        .arg("to-json")
+        .write_stdin(bytes[..12].to_vec())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("header ended early"));
 }

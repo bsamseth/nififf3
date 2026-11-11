@@ -8,7 +8,7 @@
 //! generator rather than a fuzzing dependency. So a failure reproduces on the
 //! next run, instead of being a one-off nobody can chase.
 
-use nififf3::{FlowFile, FlowFiles, Limits};
+use nififf3::{FlowFile, FlowFiles};
 
 /// A small linear congruential generator. The randomness is poor, but the
 /// coverage is adequate and the sequence is the same every run.
@@ -63,7 +63,7 @@ fn plausible(rng: &mut Rng) -> Vec<u8> {
         .to_bytes()
 }
 
-/// The parser's contract for untrusted input is that it may reject anything,
+/// The parser's contract for corrupt input is that it may reject anything,
 /// but it may not panic, hang, or allocate beyond what the input provides.
 ///
 /// Pure noise mostly dies on the magic or on an absurd attribute count, which
@@ -104,16 +104,14 @@ fn arbitrary_input_is_rejected_rather_than_fatal() {
             }
         };
 
-        for limits in [Limits::UNLIMITED, Limits::untrusted()] {
-            // Whatever these return, returning at all is the assertion.
-            let _ = FlowFile::from_bytes_with_limits(&bytes, limits);
-            let _ = FlowFile::from_vec_with_limits(bytes.clone(), limits);
-            let _ = FlowFile::parse_with_limits(bytes.as_slice(), limits)
-                .and_then(|flow_file| flow_file.into_memory().map_err(Into::into));
-            // Also has to terminate: the iterator fuses after an error rather
-            // than trying to resynchronise on a stream it cannot trust.
-            let _ = FlowFiles::with_limits(bytes.as_slice(), limits).count();
-        }
+        // Whatever these return, returning at all is the assertion.
+        let _ = FlowFile::from_bytes(&bytes);
+        let _ = FlowFile::from_vec(bytes.clone());
+        let _ = FlowFile::parse(bytes.as_slice())
+            .and_then(|flow_file| flow_file.into_memory().map_err(Into::into));
+        // Also has to terminate: the iterator fuses after an error rather
+        // than trying to resynchronise on a stream it cannot trust.
+        let _ = FlowFiles::new(bytes.as_slice()).count();
     }
 }
 

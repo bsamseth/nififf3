@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
 use axum::{Router, response::IntoResponse};
 use http_body_util::BodyExt;
-use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse, StrictFlowFileRequest};
+use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse, Spool};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder, EntryType, Header};
@@ -57,8 +57,9 @@ fn archive_of(parent: FlowFile<impl AsyncRead + Unpin>) -> Archive<impl AsyncRea
 /// Unpack an archive into one flow file per entry, streaming each entry's
 /// content straight through.
 ///
-/// Everything that can fail the request as a whole is checked before the
-/// `FlowFilesResponse` is returned. Past that point the status is 200, and a
+/// The parent arrives fully spooled, so the archive is decoded from memory or
+/// from a temporary file, never from the socket. Everything that can fail the
+/// request as a whole is checked before the `FlowFilesResponse` is returned. Past that point the status is 200, and a
 /// *structural* problem with the archive is reported as an attribute on its
 /// own flow file.
 ///
@@ -66,9 +67,7 @@ fn archive_of(parent: FlowFile<impl AsyncRead + Unpin>) -> Archive<impl AsyncRea
 /// declared size before its bytes are read, so an entry whose content runs
 /// short can only abort the response. See [`unpack_lenient`] for the
 /// alternative.
-async fn unpack(
-    StrictFlowFileRequest(parent): StrictFlowFileRequest,
-) -> Result<FlowFilesResponse, Error> {
+async fn unpack(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = archive_of(parent);
 
@@ -119,9 +118,7 @@ async fn unpack(
 /// while nothing has been committed for it yet, so it can be reported as an
 /// error flow file instead of poisoning the response. The cost is holding one
 /// entry in memory at a time, which the streaming [`unpack`] does not pay.
-async fn unpack_lenient(
-    StrictFlowFileRequest(parent): StrictFlowFileRequest,
-) -> Result<FlowFilesResponse, Error> {
+async fn unpack_lenient(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = archive_of(parent);
 
@@ -348,8 +345,8 @@ async fn a_truncated_entry_is_reported_as_a_part_when_the_handler_buffers() {
 
     assert_eq!(broken.len(), 1, "the failure arrived as a flow file");
     assert_eq!(broken[0].attributes()["fragment.index"], "2");
-    assert!(broken[0].content().is_empty());
-    assert!(!broken[0].attributes()[ERROR_ATTRIBUTE].is_empty());
+    assert_eq!(broken[0].size(), 0);
+    assert_ne!(broken[0].attributes()[ERROR_ATTRIBUTE], "");
 }
 
 #[tokio::test]
@@ -375,18 +372,6 @@ async fn a_body_that_is_not_a_flow_file_is_rejected_before_any_unpacking() {
 }
 
 #[tokio::test]
-async fn a_missing_content_type_is_rejected_before_any_unpacking() {
-    let request = Request::builder()
-        .method("POST")
-        .uri("/unpack")
-        .body(Body::from(parent_flow_file(tar_gz(&[]).await)))
-        .unwrap();
-
-    let response = app().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-}
-
-#[tokio::test]
 async fn an_archive_with_no_entries_is_a_bundle_with_no_parts() {
     let response = app()
         .oneshot(request(parent_flow_file(tar_gz(&[]).await)))
@@ -396,7 +381,7 @@ async fn an_archive_with_no_entries_is_a_bundle_with_no_parts() {
     assert_eq!(response.status(), StatusCode::OK);
     // The terminator is still there, declaring a bundle of one: an empty
     // archive is a split that produced nothing, not a truncated response.
-    assert!(parts_of(response).await.is_empty());
+    assert_eq!(parts_of(response).await.len(), 0);
 }
 
 #[tokio::test]
@@ -519,4 +504,54 @@ async fn blocking_producers_stream_the_same_way() {
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[2].attributes()["n"], "2");
     assert_eq!(parts[2].content().as_slice(), b"xx");
+}
+
+/// A blocking producer that panics must not take the response down silently:
+/// the body ends in an error, and the bytes written before it still arrive.
+#[tokio::test]
+async fn a_panicking_blocking_producer_fails_the_body() {
+    let response = FlowFilesResponse::blocking(|mut writer| {
+        writer.write_bytes(&FlowFile::builder().content(&b"delivered"[..]))?;
+        panic!("the decoder hit a bug");
+    })
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.into_body().collect().await.is_err());
+}
+
+/// Dropping the response part-way, as a client that disconnects does, drops
+/// the producer with it. An async producer stops at its next `await`.
+#[tokio::test]
+async fn dropping_the_body_stops_the_producer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = Flag(Arc::clone(&dropped));
+    let response = FlowFilesResponse::new(move |mut writer| async move {
+        let _flag = flag;
+        loop {
+            writer
+                .write_bytes(&FlowFile::builder().content(vec![0u8; 1024]))
+                .await?;
+        }
+    })
+    .into_response();
+
+    let mut body = response.into_body();
+    let first = body.frame().await.expect("a first chunk").unwrap();
+    assert!(first.is_data());
+    drop(body);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the producer was dropped with the body"
+    );
 }

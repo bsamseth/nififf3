@@ -189,7 +189,8 @@ impl FlowFileBuilder {
     ///
     /// If you don't know the size, use [`buffered`](Self::buffered) to read the
     /// content into memory first. With the `tempfile` feature, `tempfile` and
-    /// `spooled` spool it to disk instead.
+    /// `spooled` spool it to disk instead, and with `tokio` as well,
+    /// `spool_async` picks between memory and disk by size.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -207,8 +208,9 @@ impl FlowFileBuilder {
     /// Finish the build by reading `content` to completion into memory.
     ///
     /// Use it when the content size is not known up front. The whole content is
-    /// held in memory. For large content prefer `tempfile`, or `spooled` to
-    /// stay in memory up to a bound. Both are behind the `tempfile` feature.
+    /// held in memory. For content that may be large prefer `tempfile`, or
+    /// `spooled` to stay in memory up to a bound. Both are behind the
+    /// `tempfile` feature.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -300,7 +302,8 @@ impl FlowFileBuilder {
 
     /// Finish the build by reading an [`AsyncRead`](tokio::io::AsyncRead) to
     /// completion into memory. This is the async version of
-    /// [`buffered`](Self::buffered).
+    /// [`buffered`](Self::buffered). With the `tempfile` feature,
+    /// `spool_async` does the same but moves to disk past a threshold.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -325,37 +328,6 @@ impl FlowFileBuilder {
         let mut buf = Vec::new();
         content.read_to_end(&mut buf).await?;
         Ok(self.content(buf))
-    }
-
-    /// Finish the build by spooling an [`AsyncRead`](tokio::io::AsyncRead) into
-    /// an anonymous temporary file. This is the async version of
-    /// [`tempfile`](Self::tempfile).
-    ///
-    /// ```
-    /// use nififf3::FlowFile;
-    ///
-    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// let reader = &b"spooled to disk"[..]; // any `impl AsyncRead + Unpin`
-    /// let flow_file = FlowFile::builder().tempfile_async(reader).await.unwrap();
-    /// assert_eq!(flow_file.size(), 15);
-    /// # });
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Any error from creating the temporary file, or from copying `content`
-    /// into it.
-    #[cfg(all(feature = "tokio", feature = "tempfile"))]
-    pub async fn tempfile_async(
-        self,
-        mut content: impl tokio::io::AsyncRead + Unpin,
-    ) -> std::io::Result<FlowFile<tokio::fs::File>> {
-        use tokio::io::AsyncSeekExt;
-
-        let mut file = tokio::fs::File::from_std(::tempfile::tempfile()?);
-        let size = tokio::io::copy(&mut content, &mut file).await?;
-        file.rewind().await?;
-        Ok(FlowFile::from_raw_parts(size, self.attributes, file))
     }
 }
 
@@ -526,22 +498,5 @@ mod tests {
             .unwrap();
         assert_eq!(flow_file.size(), 5);
         assert_eq!(flow_file.content().as_slice(), b"hello");
-    }
-
-    #[cfg(all(feature = "tokio", feature = "tempfile"))]
-    #[tokio::test]
-    async fn tempfile_async_spools_content_and_sets_size() {
-        let flow_file = FlowFile::builder()
-            .attribute("k", "v")
-            .tempfile_async(&b"hello"[..])
-            .await
-            .unwrap();
-        assert_eq!(flow_file.size(), 5);
-        let mut out = Vec::new();
-        flow_file.write_to_async(&mut out).await.unwrap();
-        let expected = FlowFile::builder()
-            .attribute("k", "v")
-            .content(&b"hello"[..]);
-        assert_eq!(out, expected.to_bytes());
     }
 }

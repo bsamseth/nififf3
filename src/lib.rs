@@ -13,10 +13,10 @@ use std::ops::Index;
 pub mod attr;
 
 mod builder;
+mod content;
 mod error;
 mod format;
 mod fragments;
-mod limits;
 mod sync;
 
 #[cfg(feature = "tokio")]
@@ -29,12 +29,12 @@ mod serde_support;
 mod spool;
 
 pub use builder::FlowFileBuilder;
+pub use content::Content;
 pub use error::Error;
 pub use fragments::FragmentKeys;
 
 #[cfg(feature = "uuid")]
 pub use fragments::Fragments;
-pub use limits::Limits;
 pub use sync::{FlowFiles, FlowFilesReader, FlowFilesWriter, StreamedContent};
 
 #[cfg(feature = "tokio")]
@@ -51,14 +51,10 @@ pub use async_io::{
 pub use futures_core::Stream;
 
 #[cfg(feature = "axum")]
-pub use axum_support::{
-    BlockingResponseSink, BoxError, FlowFileBody, FlowFileRequest, FlowFilesRequest,
-    FlowFilesResponse, ResponseSink, StrictFlowFileRequest, StrictFlowFilesRequest,
-    StrictRejection,
-};
+pub use axum_support::{BoxError, FlowFileBody, FlowFilesResponse, Rejection};
 
 #[cfg(all(feature = "tokio", feature = "tempfile"))]
-pub use spool::SpooledContent;
+pub use spool::{Spool, SpoolConfig};
 
 #[cfg(feature = "serde")]
 pub use serde_support::StreamingFlowFile;
@@ -98,8 +94,7 @@ pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 ///
 /// [`builder`](Self::builder) creates a flow file from scratch, `derive`
 /// creates one from another flow file's attributes, and `fragments` splits one
-/// into many. Every parsing entry point has a `*_with_limits` variant that
-/// takes [`Limits`], and those are what to use on untrusted input.
+/// into many.
 ///
 /// [`from_bytes`]: Self::from_bytes
 /// [`from_vec`]: Self::from_vec
@@ -144,6 +139,19 @@ impl<R> FlowFile<R> {
             attributes,
             content,
         }
+    }
+
+    /// A flow file just parsed off a stream, whose content is left as a
+    /// reader. Records the identity on the current span.
+    pub(crate) fn parsed(header: format::Header, content: R) -> Self {
+        let flow_file = Self::from_raw_parts(header.size, header.attributes, content);
+        flow_file.record_identity();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            attributes = flow_file.attributes.len(),
+            "parsed header, content left as a reader"
+        );
+        flow_file
     }
 
     /// The length of the content in bytes, as declared in the header.
@@ -531,8 +539,8 @@ impl FlowFile<Vec<u8>> {
     /// The declared content size is validated against the actual number of
     /// bytes present: too few bytes is a [`Error::SizeMismatch`], extra bytes
     /// after the content is a [`Error::TrailingData`]. To read several
-    /// concatenated flow files from one buffer, use [`FlowFile::parse_next`]
-    /// instead.
+    /// concatenated flow files from one buffer, use [`FlowFiles`] or
+    /// [`FlowFile::parse_next`] instead.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -549,28 +557,10 @@ impl FlowFile<Vec<u8>> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidMagic`] or [`Error::InvalidAttribute`] for a malformed
-    /// header, [`Error::Io`] for one that ends part-way through,
+    /// [`Error::InvalidMagic`], [`Error::InvalidAttribute`] or
+    /// [`Error::TruncatedHeader`] for a malformed header,
     /// [`Error::SizeMismatch`] if fewer content bytes are present than the
     /// header declares, and [`Error::TrailingData`] if more.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::from_bytes_with_limits(bytes, Limits::UNLIMITED)
-    }
-
-    /// Like [`from_bytes`](Self::from_bytes), but enforcing [`Limits`] on the
-    /// header. Use this for untrusted input.
-    ///
-    /// The buffer already bounds how much there is to read, so this matters
-    /// less here than it does for the streaming parsers. Even so, a 1 KiB
-    /// buffer can declare tens of thousands of attributes.
-    /// [`max_content_len`](Limits::max_content_len) also rejects an oversized
-    /// declared size without walking the header first.
-    ///
-    /// # Errors
-    ///
-    /// As [`from_bytes`](Self::from_bytes), plus [`Error::TooManyAttributes`],
-    /// [`Error::AttributeTooLong`] or [`Error::ContentTooLarge`] when the
-    /// header exceeds `limits`.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -584,20 +574,11 @@ impl FlowFile<Vec<u8>> {
             )
         )
     )]
-    pub fn from_bytes_with_limits(bytes: &[u8], limits: Limits) -> Result<Self> {
-        let mut reader = bytes;
-        let (attributes, size) = sync::parse_header(&mut reader, None, limits)?;
-        let actual = reader.len() as u64;
-        if actual < size {
-            return Err(Error::SizeMismatch {
-                expected: size,
-                actual,
-            });
-        }
-        if actual > size {
-            return Err(Error::TrailingData(actual - size));
-        }
-        let flow_file = Self::from_raw_parts(size, attributes, reader.to_vec());
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (header, header_len) = format::decode_header(bytes)?;
+        let content = &bytes[header_len..];
+        Self::check_exact(header.size, content.len() as u64)?;
+        let flow_file = Self::from_raw_parts(header.size, header.attributes, content.to_vec());
         flow_file.record_identity();
         #[cfg(feature = "tracing")]
         tracing::debug!(attributes = flow_file.attributes.len(), "parsed flow file");
@@ -608,10 +589,9 @@ impl FlowFile<Vec<u8>> {
     /// allocation for the content.
     ///
     /// The header is parsed and then removed from the front of `bytes`, so the
-    /// content stays in the allocation it arrived in. Use this when the bytes
-    /// are already owned, which is the common case for anything read into
-    /// memory. [`from_bytes`](Self::from_bytes) copies the content out of the
-    /// slice it is given instead.
+    /// content stays in the allocation it arrived in.
+    /// [`from_bytes`](Self::from_bytes) copies the content out of the slice it
+    /// is given instead.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -628,16 +608,6 @@ impl FlowFile<Vec<u8>> {
     /// # Errors
     ///
     /// As [`from_bytes`](Self::from_bytes).
-    pub fn from_vec(bytes: Vec<u8>) -> Result<Self> {
-        Self::from_vec_with_limits(bytes, Limits::UNLIMITED)
-    }
-
-    /// Like [`from_vec`](Self::from_vec), but enforcing [`Limits`] on the
-    /// header. Use this for untrusted input.
-    ///
-    /// # Errors
-    ///
-    /// As [`from_bytes_with_limits`](Self::from_bytes_with_limits).
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -651,30 +621,44 @@ impl FlowFile<Vec<u8>> {
             )
         )
     )]
-    pub fn from_vec_with_limits(mut bytes: Vec<u8>, limits: Limits) -> Result<Self> {
-        let (attributes, size, header_len) = {
-            let mut reader = bytes.as_slice();
-            let (attributes, size) = sync::parse_header(&mut reader, None, limits)?;
-            (attributes, size, bytes.len() - reader.len())
-        };
-        let actual = (bytes.len() - header_len) as u64;
-        if actual < size {
-            return Err(Error::SizeMismatch {
-                expected: size,
-                actual,
-            });
-        }
-        if actual > size {
-            return Err(Error::TrailingData(actual - size));
-        }
+    pub fn from_vec(mut bytes: Vec<u8>) -> Result<Self> {
+        let (header, header_len) = format::decode_header(&bytes)?;
+        Self::check_exact(header.size, (bytes.len() - header_len) as u64)?;
         // Shifts the content down over the header rather than allocating a
         // second buffer for it.
         bytes.drain(..header_len);
-        let flow_file = Self::from_raw_parts(size, attributes, bytes);
+        let flow_file = Self::from_raw_parts(header.size, header.attributes, bytes);
         flow_file.record_identity();
         #[cfg(feature = "tracing")]
         tracing::debug!(attributes = flow_file.attributes.len(), "parsed flow file");
         Ok(flow_file)
+    }
+
+    /// The check both buffer parsers share: the buffer holds exactly the
+    /// declared content, no less and no more.
+    fn check_exact(declared: u64, actual: u64) -> Result<()> {
+        if actual < declared {
+            return Err(Error::SizeMismatch {
+                expected: declared,
+                actual,
+            });
+        }
+        if actual > declared {
+            return Err(Error::TrailingData(actual - declared));
+        }
+        Ok(())
+    }
+
+    /// Panic if the declared size disagrees with the content, which only a
+    /// misuse of [`map_content`](Self::map_content) can arrange. The check
+    /// runs in every build, because the alternative is emitting a flow file
+    /// that only the reader at the far end finds to be corrupt.
+    pub(crate) fn assert_size_matches(&self) {
+        assert_eq!(
+            self.size,
+            self.content.len() as u64,
+            "declared size does not match the content; see FlowFile::with_size"
+        );
     }
 
     /// Serialize the flow file to the binary V3 format.
@@ -707,11 +691,7 @@ impl FlowFile<Vec<u8>> {
     /// flow file that only the reader at the far end finds to be corrupt.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        assert_eq!(
-            self.size,
-            self.content.len() as u64,
-            "declared size does not match the content; see FlowFile::with_size"
-        );
+        self.assert_size_matches();
         // One allocation for header and content together: the length is known
         // exactly before either is written, so nothing here grows.
         let mut buf = Vec::with_capacity(format::header_len(&self.attributes) + self.content.len());
@@ -939,10 +919,6 @@ mod tests {
                 expected: 5,
                 actual: 3
             })
-        ));
-        assert!(matches!(
-            FlowFile::from_vec_with_limits(bytes, Limits::UNLIMITED.with_max_content_len(4)),
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
         ));
     }
 

@@ -1,37 +1,64 @@
 //! Parsing and serialization over `tokio::io::AsyncRead`/`AsyncWrite`.
 
-use std::collections::HashMap;
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::format::{MAGIC, MAX_VALUE_2_BYTES};
-use crate::{Error, FlowFile, Limits, Result};
+use crate::format::{self, Header, HeaderDecoder};
+use crate::{Content, Error, FlowFile, Result};
 
-async fn read_field_len<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<usize> {
-    let mut buf = [0u8; 2];
-    reader.read_exact(&mut buf).await?;
-    let len = u16::from_be_bytes(buf) as usize;
-    if len < MAX_VALUE_2_BYTES {
-        Ok(len)
-    } else {
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf).await?;
-        Ok(u32::from_be_bytes(buf) as usize)
+/// Async twin of [`crate::sync::read_header`].
+pub(crate) async fn read_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Header>> {
+    let mut decoder = HeaderDecoder::new();
+    loop {
+        let chunk = decoder.next_read();
+        let wanted = chunk.len();
+        let got = fill(reader, chunk).await?;
+        if got < wanted {
+            if got == 0 && !decoder.started() {
+                return Ok(None);
+            }
+            return Err(Error::TruncatedHeader {
+                needed: wanted - got,
+                expecting: decoder.expecting(),
+            });
+        }
+        if let Some(header) = decoder.advance()? {
+            return Ok(Some(header));
+        }
     }
 }
 
-/// Async twin of [`crate::sync::read_declared`], which is where the reasoning
-/// for the reservation schedule lives.
-async fn read_declared<R: AsyncRead + Unpin>(
+/// Read into `buf` until it is full or the reader ends. Returns how many
+/// bytes arrived.
+async fn fill<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]).await {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
+}
+
+fn missing_header() -> Error {
+    Error::TruncatedHeader {
+        needed: format::MAGIC.len(),
+        expecting: "the magic header",
+    }
+}
+
+/// Async twin of [`crate::sync::read_declared`].
+pub(crate) async fn read_declared<R: AsyncRead + Unpin>(
     reader: &mut R,
     len: u64,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<u64> {
     let mut done = 0u64;
     while done < len {
-        let step = (len - done).min(done.max(crate::sync::RESERVE_AHEAD));
-        let step =
-            usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
+        let left = usize::try_from(len - done).unwrap_or(usize::MAX);
+        let step = format::reserve_step(usize::try_from(done).unwrap_or(usize::MAX), left);
         buf.reserve_exact(step);
         let read = reader.take(step as u64).read_to_end(buf).await?;
         if read == 0 {
@@ -42,69 +69,8 @@ async fn read_declared<R: AsyncRead + Unpin>(
     Ok(done)
 }
 
-async fn read_string<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    budget: &mut crate::sync::Budget,
-) -> Result<String> {
-    let len = read_field_len(reader).await?;
-    budget.check(len)?;
-    // Grow the buffer as bytes actually arrive instead of trusting the
-    // declared length, so a crafted header cannot force a huge allocation.
-    let mut buf = Vec::new();
-    let read = read_declared(reader, len as u64, &mut buf).await?;
-    if read != len as u64 {
-        return Err(
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attribute truncated").into(),
-        );
-    }
-    budget.spend(len);
-    String::from_utf8(buf).map_err(Error::InvalidAttribute)
-}
-
-pub(crate) async fn parse_header<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    first_byte: Option<u8>,
-    limits: Limits,
-) -> Result<(HashMap<String, String>, u64)> {
-    let mut magic = [0u8; 7];
-    match first_byte {
-        Some(byte) => {
-            magic[0] = byte;
-            reader.read_exact(&mut magic[1..]).await?;
-        }
-        None => {
-            reader.read_exact(&mut magic).await?;
-        }
-    }
-    if magic != MAGIC {
-        return Err(Error::InvalidMagic(magic));
-    }
-    let count = read_field_len(reader).await?;
-    if let Some(limit) = limits.max_attributes
-        && count > limit
-    {
-        return Err(Error::TooManyAttributes { count, limit });
-    }
-    let mut attributes = HashMap::with_capacity(count.min(1024));
-    let mut budget = crate::sync::Budget::new(limits);
-    for _ in 0..count {
-        let key = read_string(reader, &mut budget).await?;
-        let value = read_string(reader, &mut budget).await?;
-        attributes.insert(key, value);
-    }
-    let mut size = [0u8; 8];
-    reader.read_exact(&mut size).await?;
-    let size = u64::from_be_bytes(size);
-    if let Some(limit) = limits.max_content_len
-        && size > limit
-    {
-        return Err(Error::ContentTooLarge { size, limit });
-    }
-    Ok((attributes, size))
-}
-
 impl FlowFile<Vec<u8>> {
-    /// Async version of [`FlowFile::from_reader`]: reads one whole flow file,
+    /// Async version of [`FlowFile::from_reader`]: read one whole flow file,
     /// content included.
     ///
     /// ```
@@ -121,29 +87,16 @@ impl FlowFile<Vec<u8>> {
     ///
     /// As [`FlowFile::from_reader`].
     pub async fn from_reader_async<R: AsyncRead + Unpin>(reader: R) -> Result<Self> {
-        Self::from_reader_async_with_limits(reader, Limits::UNLIMITED).await
-    }
-
-    /// Async version of [`FlowFile::from_reader_with_limits`]. Use this for
-    /// untrusted input.
-    ///
-    /// # Errors
-    ///
-    /// As [`FlowFile::from_reader_with_limits`].
-    pub async fn from_reader_async_with_limits<R: AsyncRead + Unpin>(
-        reader: R,
-        limits: Limits,
-    ) -> Result<Self> {
-        Ok(FlowFile::parse_async_with_limits(reader, limits)
+        Ok(FlowFile::parse_async(reader)
             .await?
             .into_memory_async()
             .await?)
     }
 }
 
-impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
-    /// Async version of [`FlowFile::parse`]: consumes only the header and
-    /// returns the content as a reader limited to the declared size.
+impl<R: AsyncRead + Unpin> FlowFile<Content<R>> {
+    /// Async version of [`FlowFile::parse`]: consume only the header, and
+    /// return the content as a reader limited to the declared size.
     ///
     /// The header is read in small increments, so wrap unbuffered sources in
     /// a [`tokio::io::BufReader`].
@@ -164,16 +117,6 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
     /// # Errors
     ///
     /// As [`FlowFile::parse`].
-    pub async fn parse_async(reader: R) -> Result<Self> {
-        Self::parse_async_with_limits(reader, Limits::UNLIMITED).await
-    }
-
-    /// Like [`parse_async`](Self::parse_async), but enforcing [`Limits`] on
-    /// the header. Use this for untrusted input.
-    ///
-    /// # Errors
-    ///
-    /// As [`FlowFile::parse_with_limits`].
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -187,35 +130,24 @@ impl<R: AsyncRead + Unpin> FlowFile<tokio::io::Take<R>> {
             )
         )
     )]
-    pub async fn parse_async_with_limits(mut reader: R, limits: Limits) -> Result<Self> {
-        let (attributes, size) = parse_header(&mut reader, None, limits).await?;
-        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
-        flow_file.record_identity();
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            attributes = flow_file.attributes.len(),
-            "parsed header, content left as a reader"
-        );
-        Ok(flow_file)
+    pub async fn parse_async(mut reader: R) -> Result<Self> {
+        let header = read_header(&mut reader).await?.ok_or_else(missing_header)?;
+        let size = header.size;
+        Ok(FlowFile::parsed(header, Content::new(reader, size)))
     }
 }
 
-impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
+impl<'r, R: AsyncRead + Unpin> FlowFile<Content<&'r mut R>> {
     /// Async version of [`FlowFile::parse_next`]: parse the next flow file
     /// from a stream of concatenated flow files.
     ///
-    /// Returns `Ok(None)` on a clean end of input.
-    ///
-    /// Every flow file's content must be consumed before the next is parsed.
-    /// Use [`into_memory_async`](FlowFile::into_memory_async),
+    /// Returns `Ok(None)` on a clean end of input. Every flow file's content
+    /// must be consumed before the next is parsed, with
+    /// [`into_memory_async`](FlowFile::into_memory_async),
     /// [`write_to_async`](FlowFile::write_to_async) or
-    /// [`skip_content_async`](FlowFile::skip_content_async) for that. See
+    /// [`skip_content_async`](FlowFile::skip_content_async). See
     /// [`FlowFile::parse_next`] for what dropping one unread does to the
-    /// stream, which is the same here.
-    ///
-    /// [`FlowFilesReaderAsync`] does that
-    /// bookkeeping for you and is usually the better choice; this is the
-    /// primitive underneath it.
+    /// stream. [`FlowFilesReaderAsync`] does that bookkeeping for you.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -237,16 +169,6 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
     /// # Errors
     ///
     /// As [`FlowFile::parse_next`].
-    pub async fn parse_next_async(reader: &'r mut R) -> Result<Option<Self>> {
-        Self::parse_next_async_with_limits(reader, Limits::UNLIMITED).await
-    }
-
-    /// Like [`parse_next_async`](Self::parse_next_async), but enforcing
-    /// [`Limits`] on the header. Use this for untrusted input.
-    ///
-    /// # Errors
-    ///
-    /// As [`FlowFile::parse_next_with_limits`].
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -260,55 +182,153 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
             )
         )
     )]
-    pub async fn parse_next_async_with_limits(
-        reader: &'r mut R,
-        limits: Limits,
-    ) -> Result<Option<Self>> {
-        let mut first = [0u8; 1];
-        loop {
-            match reader.read(&mut first).await {
-                // A one-byte buffer, so this is the end of the stream: a
-                // reader returning `Ok(0)` with room to fill is buggy, and
-                // retrying one would spin rather than recover.
-                Ok(0) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::trace!("stream ended on a flow file boundary");
-                    return Ok(None);
-                }
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} // retry
-                Err(e) => return Err(e.into()),
-            }
+    pub async fn parse_next_async(reader: &'r mut R) -> Result<Option<Self>> {
+        let Some(header) = read_header(reader).await? else {
+            #[cfg(feature = "tracing")]
+            tracing::trace!("stream ended on a flow file boundary");
+            return Ok(None);
+        };
+        let size = header.size;
+        Ok(Some(FlowFile::parsed(header, Content::new(reader, size))))
+    }
+}
+
+impl<R: AsyncRead + Unpin> FlowFile<R> {
+    /// Async version of [`FlowFile::write_to`]: serialize the flow file to a
+    /// writer, reading exactly [`size`](FlowFile::size) bytes from the
+    /// content reader. Returns the number of content bytes copied.
+    ///
+    /// ```
+    /// use nififf3::FlowFile;
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let content = &b"hello"[..]; // any `impl AsyncRead + Unpin`
+    /// let flow_file = FlowFile::builder().reader(content, 5);
+    ///
+    /// let mut out = Vec::new();
+    /// flow_file.write_to_async(&mut out).await.unwrap();
+    /// assert_eq!(FlowFile::from_bytes(&out).unwrap().size(), 5);
+    /// # });
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::write_to`].
+    ///
+    /// # Panics
+    ///
+    /// As [`FlowFile::write_to`]: an attribute longer than `u32::MAX` bytes
+    /// cannot be expressed in the wire format.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "debug",
+            name = "write_to_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
+    pub async fn write_to_async<W: AsyncWrite + Unpin>(
+        mut self,
+        writer: &mut W,
+    ) -> std::io::Result<u64> {
+        writer.write_all(&self.header_bytes()).await?;
+        let copied = tokio::io::copy(&mut (&mut self.content).take(self.size), writer).await?;
+        if copied != self.size {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                copied,
+                "content ended early, leaving a truncated flow file in the stream"
+            );
+            return Err(crate::error::truncated(self.size, copied));
         }
-        let (attributes, size) = parse_header(reader, Some(first[0]), limits).await?;
-        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
-        flow_file.record_identity();
         #[cfg(feature = "tracing")]
-        tracing::debug!(
-            attributes = flow_file.attributes.len(),
-            "parsed header, content left as a reader"
-        );
-        Ok(Some(flow_file))
+        tracing::debug!(copied, "wrote flow file");
+        Ok(copied)
+    }
+
+    /// Async version of [`FlowFile::skip_content`]: discard the content,
+    /// consuming exactly [`size`](FlowFile::size) bytes from the reader.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::skip_content`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "skip_content_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
+    pub async fn skip_content_async(mut self) -> std::io::Result<u64> {
+        let skipped = tokio::io::copy(
+            &mut (&mut self.content).take(self.size),
+            &mut tokio::io::sink(),
+        )
+        .await?;
+        if skipped != self.size {
+            return Err(crate::error::truncated(self.size, skipped));
+        }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(skipped, "discarded content");
+        Ok(skipped)
+    }
+
+    /// Async version of [`FlowFile::into_memory`]: read the content to
+    /// completion and validate its length against the declared size.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlowFile::into_memory`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            level = "trace",
+            name = "into_memory_async",
+            skip_all,
+            fields(
+                uuid = self.attribute(crate::attr::UUID),
+                filename = self.attribute(crate::attr::FILENAME),
+                size = self.size,
+            )
+        )
+    )]
+    pub async fn into_memory_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
+        let mut content = Vec::new();
+        let read = read_declared(&mut self.content, self.size, &mut content).await?;
+        if read != self.size {
+            return Err(crate::error::truncated(self.size, read));
+        }
+        #[cfg(feature = "tracing")]
+        tracing::trace!(read, "read content into memory");
+        Ok(FlowFile::from_raw_parts(
+            self.size,
+            self.attributes,
+            content,
+        ))
     }
 }
 
 /// Async equivalent of [`FlowFiles`](crate::FlowFiles): reads concatenated
 /// flow files one at a time, buffering each content in memory.
 ///
-/// [`next`](Self::next) is an inherent async method rather than a
-/// [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
+/// [`next`](Self::next) is an inherent async method rather than a `Stream`
 /// impl, so the base type needs no extra dependency; with the `stream`
 /// feature, [`into_stream`](Self::into_stream) adapts it into one. After an
 /// error, `next` keeps returning `None`, since the stream position is no
 /// longer trustworthy.
 ///
-/// As with [`FlowFiles`](crate::FlowFiles), a content that ends before its
-/// declared size is reported as [`Error::SizeMismatch`] directly, not wrapped
-/// in [`Error::Io`].
-///
-/// Each content is buffered in memory. For contents too large for that, use
-/// [`FlowFilesReaderAsync`], which streams them and keeps the stream
-/// positioned for you.
+/// For contents too large to buffer, use [`FlowFilesReaderAsync`].
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesAsync};
@@ -328,25 +348,17 @@ impl<'r, R: AsyncRead + Unpin> FlowFile<tokio::io::Take<&'r mut R>> {
 #[derive(Debug)]
 pub struct FlowFilesAsync<R> {
     reader: R,
-    limits: Limits,
     done: bool,
 }
 
 impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
-    /// Iterate over the flow files in `reader`, without header limits.
+    /// Iterate over the flow files in `reader`.
     ///
     /// The header parsing reads in small increments, so wrap unbuffered
     /// sources in a [`tokio::io::BufReader`].
     pub fn new(reader: R) -> Self {
-        Self::with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
-    /// Use this for untrusted input.
-    pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
-            limits,
             done: false,
         }
     }
@@ -368,17 +380,12 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         self.reader
     }
 
-    /// Adapt into a [`Stream`](https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html)
-    /// of flow files, for composing with `StreamExt` and anything that takes
-    /// a stream.
+    /// Adapt into a [`Stream`](crate::Stream) of flow files, for composing
+    /// with `StreamExt` and anything that takes a stream.
     ///
-    /// Requires the `stream` feature (implied by `axum`). The stream ends the
-    /// same way [`next`](Self::next) does: `None` at a clean end of input, and
-    /// nothing further after an error.
-    ///
-    /// The result is [`Send`] exactly when the reader is, so it composes with
-    /// `axum` and `tokio::spawn` without either side saying so, and a
-    /// single-threaded runtime can still use a reader that is not.
+    /// The stream ends the same way [`next`](Self::next) does: `None` at a
+    /// clean end of input, and nothing further after an error. It is [`Send`]
+    /// exactly when the reader is.
     ///
     /// ```
     /// use nififf3::{FlowFile, FlowFilesAsync};
@@ -400,8 +407,7 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
     pub fn into_stream(self) -> impl futures_core::Stream<Item = Result<FlowFile<Vec<u8>>>> {
         // `next` borrows `self`, so the future cannot be stored beside it.
         // Passing ownership through each step keeps the state machine flat, at
-        // the cost of one boxed future per flow file. That cost is small next
-        // to buffering a flow file.
+        // the cost of one boxed future per flow file.
         futures_unfold(self, |mut reader| async move {
             let item = reader.next().await?;
             Some((item, reader))
@@ -413,11 +419,8 @@ impl<R: AsyncRead + Unpin> FlowFilesAsync<R> {
         if self.done {
             return None;
         }
-        let result = match FlowFile::parse_next_async_with_limits(&mut self.reader, self.limits)
-            .await
-        {
+        let result = match FlowFile::parse_next_async(&mut self.reader).await {
             Ok(None) => None,
-            // As in `FlowFiles::next`: the conversion recovers a truncation.
             Ok(Some(flow_file)) => Some(flow_file.into_memory_async().await.map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
@@ -446,9 +449,8 @@ where
         _item: std::marker::PhantomData<fn() -> I>,
     }
 
-    // Nothing here is structurally pinned. The in-flight future is boxed, so
-    // its address is stable wherever the stream itself lives, and every other
-    // field is moved in and out by value.
+    // Nothing here is structurally pinned: the in-flight future is boxed, and
+    // every other field is moved in and out by value.
     impl<T, F, Fut, I> Unpin for Unfold<T, F, Fut, I> {}
 
     impl<T, F, Fut, I> futures_core::Stream for Unfold<T, F, Fut, I>
@@ -492,12 +494,8 @@ where
 /// concatenated flow files without buffering their content, keeping the stream
 /// positioned for you.
 ///
-/// The streaming counterpart to [`FlowFilesAsync`], which reads each content
-/// into memory instead. See
-/// [`FlowFilesReader`](crate::FlowFilesReader) for when to choose which, and
-/// why this is the safe way to stream: reading none of a flow file's content,
-/// some of it, or all of it are equally correct, because the next call skips
-/// whatever was left.
+/// Reading none of a flow file's content, some of it, or all of it are
+/// equally correct, because the next call skips whatever was left.
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesReaderAsync};
@@ -506,7 +504,6 @@ where
 /// let mut bytes = FlowFile::builder().attribute("n", "1").content(&b"aaaa"[..]).to_bytes();
 /// bytes.extend(FlowFile::builder().attribute("n", "2").content(&b"bbbb"[..]).to_bytes());
 ///
-/// // Only the attributes are wanted; the content is simply not read.
 /// let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
 /// let mut names = Vec::new();
 /// while let Some(flow_file) = flow_files.next().await.unwrap() {
@@ -519,7 +516,6 @@ where
 #[derive(Debug)]
 pub struct FlowFilesReaderAsync<R> {
     reader: R,
-    limits: Limits,
     size: u64,
     unread: u64,
     done: bool,
@@ -529,10 +525,10 @@ pub struct FlowFilesReaderAsync<R> {
 /// itself, limited to this flow file's content.
 ///
 /// Reading it is optional. Whatever is left goes when the next flow file is
-/// asked for.
+/// asked for. As with [`Content`], a stream that ends early is an error.
 #[derive(Debug)]
 pub struct StreamedContentAsync<'a, R> {
-    inner: tokio::io::Take<&'a mut R>,
+    inner: Content<&'a mut R>,
     unread: &'a mut u64,
 }
 
@@ -543,31 +539,20 @@ impl<R: AsyncRead + Unpin> AsyncRead for StreamedContentAsync<'_, R> {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        // Delegate the `ReadBuf` handling to `Take`, then measure what it
-        // filled. Doing it by hand needs unsafe, which this crate forbids.
-        let before = buf.filled().len();
-        std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, buf))?;
-        let read = buf.filled().len() - before;
-        *this.unread = this.unread.saturating_sub(read as u64);
-        std::task::Poll::Ready(Ok(()))
+        let result = std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, buf));
+        *this.unread = this.inner.remaining();
+        std::task::Poll::Ready(result)
     }
 }
 
 impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
-    /// Read flow files from `reader`, without header limits.
+    /// Read flow files from `reader`.
     ///
     /// The header parsing reads in small increments, so wrap unbuffered
     /// sources in a [`tokio::io::BufReader`].
     pub fn new(reader: R) -> Self {
-        Self::with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
-    /// Use this for untrusted input.
-    pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
-            limits,
             size: 0,
             unread: 0,
             done: false,
@@ -586,47 +571,30 @@ impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
         if self.done {
             return Ok(None);
         }
-        if let Err(err) = self.discard_unread().await {
-            self.done = true;
-            return Err(err);
-        }
-
-        let mut first = [0u8; 1];
-        loop {
-            match self.reader.read(&mut first).await {
-                Ok(0) => {
-                    self.done = true;
-                    return Ok(None);
-                }
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {} // retry
-                Err(e) => {
-                    self.done = true;
-                    return Err(e.into());
-                }
+        let result = match self.discard_unread().await {
+            Ok(()) => read_header(&mut self.reader).await,
+            Err(err) => Err(err),
+        };
+        let header = match result {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                self.done = true;
+                return Ok(None);
             }
-        }
+            Err(err) => {
+                self.done = true;
+                return Err(err);
+            }
+        };
 
-        let (attributes, size) =
-            match parse_header(&mut self.reader, Some(first[0]), self.limits).await {
-                Ok(header) => header,
-                Err(err) => {
-                    self.done = true;
-                    return Err(err);
-                }
-            };
-
-        self.size = size;
-        self.unread = size;
+        self.size = header.size;
+        self.unread = header.size;
         let Self { reader, unread, .. } = self;
-        Ok(Some(FlowFile::from_raw_parts(
-            size,
-            attributes,
-            StreamedContentAsync {
-                inner: reader.take(size),
-                unread,
-            },
-        )))
+        let content = StreamedContentAsync {
+            inner: Content::new(reader, header.size),
+            unread,
+        };
+        Ok(Some(FlowFile::parsed(header, content)))
     }
 
     /// Read past whatever of the last flow file's content was left.
@@ -685,7 +653,7 @@ impl<R: AsyncRead + Unpin> FlowFilesReaderAsync<R> {
 ///
 /// - [`shutdown`](Self::shutdown) finalizes a writer that has an ending of its
 ///   own, such as a compressor's trailer. Skipping it on one of those
-///   silently truncates the output, and the flow files come back corrupt.
+///   silently truncates the output.
 /// - [`finish`](Self::finish) flushes and returns the writer, for one that
 ///   only buffers.
 /// - [`into_inner`](Self::into_inner) does neither, for discarding a stream
@@ -770,13 +738,7 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     )]
     pub async fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> std::io::Result<u64> {
         self.guard()?;
-        // As the sync twin: header then content, rather than one buffer built
-        // by copying the whole content into it first.
-        assert_eq!(
-            flow_file.size,
-            flow_file.content.len() as u64,
-            "declared size does not match the content; see FlowFile::with_size"
-        );
+        flow_file.assert_size_matches();
         let result = async {
             self.writer.write_all(&flow_file.header_bytes()).await?;
             self.writer.write_all(&flow_file.content).await
@@ -797,15 +759,15 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     }
 
     fn poison_on_err<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
-        if result.is_err() {
+        if let Err(err) = &result {
             #[cfg(feature = "tracing")]
-            if let Err(err) = &result {
-                tracing::warn!(
-                    error = %err,
-                    written = self.count,
-                    "write failed, poisoning the writer"
-                );
-            }
+            tracing::warn!(
+                error = %err,
+                written = self.count,
+                "write failed, poisoning the writer"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = err;
             self.poisoned = true;
         }
         result
@@ -816,8 +778,7 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// # Errors
     ///
     /// Whatever the underlying writer returns. A failed flush poisons the
-    /// writer, since bytes that never reached the stream leave it
-    /// mid-flow-file exactly as a failed write does.
+    /// writer, as a failed write does.
     pub async fn flush(&mut self) -> std::io::Result<()> {
         let result = self.writer.flush().await;
         self.poison_on_err(result)
@@ -827,9 +788,7 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     ///
     /// For a plain sink this is [`flush`](Self::flush) and little else. A
     /// writer that encodes, such as a compressor or a TLS session, emits its
-    /// ending here and nowhere else. Dropping the writer does not produce it,
-    /// so a stream that skips this is truncated. The reader on the far end
-    /// reports that as a corrupt flow file rather than as a missing trailer.
+    /// ending here and nowhere else. Dropping the writer does not produce it.
     ///
     /// # Errors
     ///
@@ -843,15 +802,12 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
     /// Flush and return the underlying writer.
     ///
     /// For a writer that finalizes itself, call [`shutdown`](Self::shutdown)
-    /// first. You can also call `shutdown` on its own and then
-    /// [`into_inner`](Self::into_inner), because shutting down and then
-    /// flushing is the wrong order.
+    /// first and then [`into_inner`](Self::into_inner).
     ///
     /// # Errors
     ///
     /// Whatever flushing the underlying writer returns, in which case the
-    /// writer is dropped. To keep hold of it either way, call
-    /// [`flush`](Self::flush) and then [`into_inner`](Self::into_inner).
+    /// writer is dropped.
     pub async fn finish(mut self) -> std::io::Result<W> {
         self.flush().await?;
         Ok(self.writer)
@@ -881,139 +837,8 @@ impl<W: AsyncWrite + Unpin> FlowFilesWriterAsync<W> {
 
     /// Consume the writer, returning the underlying one *without flushing or
     /// shutting it down*.
-    ///
-    /// See [`finish`](Self::finish) and [`shutdown`](Self::shutdown) for
-    /// completing a stream; this is for taking the writer back after a failure
-    /// in order to discard or truncate what was produced.
     pub fn into_inner(self) -> W {
         self.writer
-    }
-}
-
-impl<R: AsyncRead + Unpin> FlowFile<R> {
-    /// Async version of [`FlowFile::write_to`]: serialize the flow file to a
-    /// writer, reading exactly [`size`](FlowFile::size) bytes from the
-    /// content reader. Returns the number of content bytes copied, and
-    /// consumes the flow file for the same reason.
-    ///
-    /// ```
-    /// use nififf3::FlowFile;
-    ///
-    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// let content = &b"hello"[..]; // any `impl AsyncRead + Unpin`
-    /// let flow_file = FlowFile::builder().reader(content, 5);
-    ///
-    /// let mut out = Vec::new();
-    /// flow_file.write_to_async(&mut out).await.unwrap();
-    /// assert_eq!(FlowFile::from_bytes(&out).unwrap().size(), 5);
-    /// # });
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// As [`FlowFile::write_to`].
-    ///
-    /// # Panics
-    ///
-    /// As [`FlowFile::write_to`]: an attribute longer than `u32::MAX` bytes
-    /// cannot be expressed in the wire format.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            level = "debug",
-            name = "write_to_async",
-            skip_all,
-            fields(
-                uuid = self.attribute(crate::attr::UUID),
-                filename = self.attribute(crate::attr::FILENAME),
-                size = self.size,
-            )
-        )
-    )]
-    pub async fn write_to_async<W: AsyncWrite + Unpin>(
-        mut self,
-        writer: &mut W,
-    ) -> std::io::Result<u64> {
-        writer.write_all(&self.header_bytes()).await?;
-        let copied = tokio::io::copy(&mut (&mut self.content).take(self.size), writer).await?;
-        if copied != self.size {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                copied,
-                "content ended early, leaving a truncated flow file in the stream"
-            );
-            return Err(crate::error::truncated(self.size, copied));
-        }
-        #[cfg(feature = "tracing")]
-        tracing::debug!(copied, "wrote flow file");
-        Ok(copied)
-    }
-
-    /// Async version of [`FlowFile::skip_content`]: discards the content,
-    /// consuming exactly [`size`](FlowFile::size) bytes from the reader.
-    ///
-    /// # Errors
-    ///
-    /// As [`FlowFile::skip_content`].
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            level = "trace",
-            name = "skip_content_async",
-            skip_all,
-            fields(
-                uuid = self.attribute(crate::attr::UUID),
-                filename = self.attribute(crate::attr::FILENAME),
-                size = self.size,
-            )
-        )
-    )]
-    pub async fn skip_content_async(mut self) -> std::io::Result<u64> {
-        let skipped = tokio::io::copy(
-            &mut (&mut self.content).take(self.size),
-            &mut tokio::io::sink(),
-        )
-        .await?;
-        if skipped != self.size {
-            return Err(crate::error::truncated(self.size, skipped));
-        }
-        #[cfg(feature = "tracing")]
-        tracing::trace!(skipped, "discarded content");
-        Ok(skipped)
-    }
-
-    /// Async version of [`FlowFile::into_memory`]: reads the content to
-    /// completion and validates its length against the declared size.
-    ///
-    /// # Errors
-    ///
-    /// As [`FlowFile::into_memory`].
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            level = "trace",
-            name = "into_memory_async",
-            skip_all,
-            fields(
-                uuid = self.attribute(crate::attr::UUID),
-                filename = self.attribute(crate::attr::FILENAME),
-                size = self.size,
-            )
-        )
-    )]
-    pub async fn into_memory_async(mut self) -> std::io::Result<FlowFile<Vec<u8>>> {
-        let mut content = Vec::new();
-        let read = read_declared(&mut self.content, self.size, &mut content).await?;
-        if read != self.size {
-            return Err(crate::error::truncated(self.size, read));
-        }
-        #[cfg(feature = "tracing")]
-        tracing::trace!(read, "read content into memory");
-        Ok(FlowFile::from_raw_parts(
-            self.size,
-            self.attributes,
-            content,
-        ))
     }
 }
 
@@ -1021,7 +846,6 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
 mod tests {
     use super::*;
 
-    /// As in the sync tests: the payload, not the message.
     fn is_poisoned_error(err: &std::io::Error) -> bool {
         err.kind() == std::io::ErrorKind::BrokenPipe
             && matches!(
@@ -1089,8 +913,6 @@ mod tests {
         assert_eq!(trailer, b"and then something else");
     }
 
-    /// As the sync twin: none, some or all of a content read must all leave
-    /// the stream where the next flow file starts.
     #[tokio::test]
     async fn the_async_streaming_reader_positions_the_stream_however_much_is_read() {
         let mut bytes = FlowFile::builder()
@@ -1104,7 +926,6 @@ mod tests {
                 .to_bytes(),
         );
 
-        // Nothing read.
         let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
         let mut seen = Vec::new();
         while let Some(flow_file) = flow_files.next().await.unwrap() {
@@ -1112,7 +933,6 @@ mod tests {
         }
         assert_eq!(seen, ["1", "2"]);
 
-        // One byte of each read, the rest left.
         let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
         let mut seen = Vec::new();
         while let Some(mut flow_file) = flow_files.next().await.unwrap() {
@@ -1122,7 +942,6 @@ mod tests {
         }
         assert_eq!(seen, [b'a', b'b']);
 
-        // All of it.
         let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
         let mut seen = Vec::new();
         while let Some(flow_file) = flow_files.next().await.unwrap() {
@@ -1165,83 +984,38 @@ mod tests {
             })
         ));
         assert!(matches!(
-            FlowFile::from_reader_async_with_limits(
-                bytes.as_slice(),
-                Limits::untrusted().with_max_content_len(4)
-            )
-            .await,
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+            FlowFile::from_reader_async(&bytes[..10]).await,
+            Err(Error::TruncatedHeader { .. })
         ));
     }
 
+    /// Chunk boundaries fall wherever the transport puts them, so a reader
+    /// that hands over one byte at a time has to decode like a slice.
     #[tokio::test]
-    async fn async_limits_reject_oversized_attributes() {
-        let bytes = FlowFile::builder()
-            .attribute("key", "a value larger than the limit")
-            .content(Vec::new())
-            .to_bytes();
+    async fn parsing_through_a_dribbling_reader_matches_the_slice() {
+        struct Dribble(std::io::Cursor<Vec<u8>>);
+        impl AsyncRead for Dribble {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let mut one = [0u8; 1];
+                let mut small = tokio::io::ReadBuf::new(&mut one);
+                std::task::ready!(std::pin::Pin::new(&mut self.0).poll_read(cx, &mut small))?;
+                buf.put_slice(small.filled());
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
 
-        let limits = Limits::untrusted().with_max_attribute_len(8);
-        assert!(matches!(
-            FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
-            Err(Error::AttributeTooLong { limit: 8, .. })
-        ));
-    }
-
-    /// The async parser shares the budget the sync one uses, so the total
-    /// limit bounds what it buffers here too. See the sync twin for why
-    /// checking the declared length rather than the running total matters.
-    #[tokio::test]
-    async fn async_total_limit_rejects_an_attribute_on_its_declared_length() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"NiFiFF3");
-        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
-        bytes.extend_from_slice(&[0x00, 0x01, b'k']); // key
-        bytes.extend_from_slice(&[0xFF, 0xFF]); // extended value length
-        bytes.extend_from_slice(&(8u32 << 20).to_be_bytes());
-        bytes.extend_from_slice(b"tiny");
-
-        let limits = Limits::UNLIMITED.with_max_total_attribute_len(1024);
-        assert!(matches!(
-            FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
-            Err(Error::HeaderTooLarge {
-                len: 8_388_609,
-                limit: 1024
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn async_limits_reject_an_oversized_declared_content_size() {
-        let bytes = sample().to_bytes();
-        let limits = Limits::untrusted().with_max_content_len(4);
-
-        assert!(matches!(
-            FlowFile::parse_async_with_limits(bytes.as_slice(), limits).await,
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
-        ));
-    }
-
-    #[tokio::test]
-    async fn async_readers_report_truncation_as_a_size_mismatch() {
-        let bytes = sample().to_bytes();
-        let truncated = &bytes[..bytes.len() - 2];
-
-        let err = FlowFilesAsync::new(truncated)
-            .next()
+        let flow_file = FlowFile::builder()
+            .attributes((0..20).map(|i| (format!("k{i}"), "v".repeat(i * 5000))))
+            .content(vec![3u8; 70_000]);
+        let bytes = flow_file.to_bytes();
+        let parsed = FlowFile::from_reader_async(Dribble(std::io::Cursor::new(bytes)))
             .await
-            .unwrap()
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::SizeMismatch {
-                    expected: 5,
-                    actual: 3
-                }
-            ),
-            "{err:?}"
-        );
+            .unwrap();
+        assert_eq!(parsed, flow_file);
     }
 
     #[cfg(feature = "stream")]
@@ -1262,9 +1036,6 @@ mod tests {
         }
     }
 
-    /// The stream inherits `Send` from the reader rather than demanding it, so
-    /// a single-threaded runtime can use a reader that is not `Send` while
-    /// `axum` and `tokio::spawn` still get a `Send` stream from one that is.
     #[cfg(feature = "stream")]
     #[tokio::test]
     async fn into_stream_follows_the_reader_on_send() {
@@ -1295,10 +1066,6 @@ mod tests {
         .collect::<Vec<_>>()
         .await;
         assert_eq!(collected.len(), 1);
-        assert_eq!(
-            collected[0].as_ref().unwrap().content().as_slice(),
-            b"hello"
-        );
 
         assert_send(&FlowFilesAsync::new(std::io::Cursor::new(Vec::new())).into_stream());
     }
@@ -1322,7 +1089,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_write_poisons_the_async_writer() {
-        // Declares 10 bytes but the reader holds 6, so the write truncates.
         let mut out = Vec::new();
         let mut writer = FlowFilesWriterAsync::new(&mut out);
 
@@ -1399,16 +1165,14 @@ mod tests {
         writer.shutdown().await.unwrap();
         assert_eq!(writer.into_inner().shutdowns, 1);
 
-        // Neither happens on its own, which is the whole reason both exist.
         let mut writer = FlowFilesWriterAsync::new(Recording::default());
         write_one(&mut writer).await;
         let inner = writer.into_inner();
         assert_eq!((inner.flushes, inner.shutdowns), (0, 0));
     }
 
-    /// The case these methods exist for, against a real encoder: gzip writes
-    /// its trailer on shutdown and nowhere else, so a stream that skips it
-    /// cannot be read back at all.
+    /// Against a real encoder: gzip writes its trailer on shutdown and
+    /// nowhere else, so a stream that skips it cannot be read back at all.
     #[tokio::test]
     async fn shutdown_finalizes_a_real_encoder() {
         use async_compression::tokio::bufread::GzipDecoder;

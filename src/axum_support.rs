@@ -1,8 +1,8 @@
 //! Axum integration: extract flow files from requests and turn flow files
-//! into responses, streaming the content in both directions.
+//! into responses.
 
 use std::future::Future;
-use std::io::{self, Write};
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
@@ -13,123 +13,66 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_core::Stream;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 
+use crate::spool::{self, Side};
 use crate::{
-    Error, FlowFile, FlowFilesAsync, FlowFilesWriter, FlowFilesWriterAsync, Limits, MEDIA_TYPE,
+    Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, MEDIA_TYPE, Spool, SpoolConfig,
 };
 
-/// A flow file extracted from an axum request.
-///
-/// The content is an [`AsyncRead`] streaming the request body, limited to the
-/// size declared in the flow file header. The extractor never buffers the
-/// content in memory, so you can process a flow file of any size
-/// incrementally.
-///
-/// Request bodies are untrusted, so the header is parsed with
-/// [`Limits::untrusted`]. To use different limits, extract the raw
-/// [`axum::body::Body`] and call
-/// [`FlowFile::parse_async_with_limits`] on a reader over it.
-///
-/// # Body size
-///
-/// The body is read through axum's
-/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit), as any other
-/// extractor's body is, so it is capped at 2 MiB unless the router says
-/// otherwise. That cap is on the bytes the client actually sends, and that is
-/// the bound worth trusting on a server. [`Limits`] governs the header alone,
-/// and the size in the header is only a claim.
-///
-/// Streaming a flow file larger than the limit therefore has to say so:
-///
-/// ```
-/// use axum::extract::DefaultBodyLimit;
-/// use axum::{Router, routing::post};
-/// # async fn handler(_: nififf3::FlowFileRequest) {}
-///
-/// let app: Router = Router::new()
-///     .route("/large", post(handler))
-///     .layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)); // or ::disable()
-/// ```
-///
-/// Destructure it in the handler signature, as with axum's own extractors:
-///
-/// ```no_run
-/// use nififf3::FlowFileRequest;
-///
-/// async fn handler(FlowFileRequest(flow_file): FlowFileRequest) -> Result<String, nififf3::Error> {
-///     let flow_file = flow_file.into_memory_async().await?;
-///     Ok(format!("got {} bytes", flow_file.size()))
-/// }
-/// ```
-///
-/// It also dereferences to the flow file, for reading attributes without
-/// taking it apart.
-#[derive(Debug)]
-pub struct FlowFileRequest(pub FlowFile<tokio::io::Take<FlowFileBody>>);
-
-impl std::ops::Deref for FlowFileRequest {
-    type Target = FlowFile<tokio::io::Take<FlowFileBody>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for FlowFileRequest {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+/// How large the chunks of a streamed response body are.
+const RESPONSE_CHUNK: usize = 64 * 1024;
 
 /// [`AsyncRead`] adapter over an axum request body.
 ///
-/// The extractors build one for you. Construct it yourself with
-/// [`from_body`](Self::from_body) or the equivalent `From` when you want to
-/// parse a body some other way, such as with different [`Limits`], or when a
-/// flow file is followed by something that is not one.
+/// The extractors read through one of these. Build one yourself to parse a
+/// body some other way, such as to stream a request's content instead of
+/// spooling it.
 ///
-/// Note that a [`Body`] taken straight off a request has not been through
-/// axum's [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit). The extractors
-/// apply it by calling
+/// # Streaming a request body is a deadlock waiting to happen
+///
+/// NiFi's HTTP client sends the whole request before it reads any of the
+/// response. A handler that streams its response while still reading the
+/// request off the socket stalls as soon as the response outgrows the socket
+/// buffers: the handler waits for the client to read, and the client waits
+/// for the handler to finish reading. The extractors avoid this by reading
+/// the whole request before the handler runs. A handler that reads this type
+/// directly has to keep that in mind, and `tests/nifi_client.rs` demonstrates
+/// the stall over a real socket.
+///
+/// A [`Body`] taken straight off a request has not been through axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit). The extractors apply
+/// it by calling
 /// [`RequestExt::with_limited_body`](axum::RequestExt::with_limited_body)
 /// first, and anything reading a body by hand should do the same.
+///
+/// ```no_run
+/// use axum::extract::Request;
+/// use axum::RequestExt as _;
+/// use nififf3::{FlowFile, FlowFileBody};
+///
+/// async fn handler(request: Request) -> Result<u64, nififf3::Error> {
+///     let body = FlowFileBody::new(request.with_limited_body().into_body());
+///     let flow_file = FlowFile::parse_async(body).await?;
+///     Ok(flow_file.size())
+/// }
+/// ```
 pub struct FlowFileBody {
     stream: BodyDataStream,
     chunk: Bytes,
     /// Whether `stream` has already reported the end of the body. Polling a
     /// [`Stream`] after it returns `None` is contractually undefined, and a
     /// reader is free to keep reading past an end it has already been told
-    /// about. A flow file declaring more content than the body carries makes
-    /// that an ordinary case rather than a pathological one.
+    /// about.
     ended: bool,
 }
 
 impl FlowFileBody {
     /// Read an axum request body as an [`AsyncRead`].
-    ///
-    /// ```no_run
-    /// use axum::extract::Request;
-    /// use axum::RequestExt as _;
-    /// use nififf3::{FlowFileBody, FlowFilesAsync, Limits};
-    ///
-    /// async fn handler(request: Request) -> Result<usize, nififf3::Error> {
-    ///     // `with_limited_body` is what applies `DefaultBodyLimit`.
-    ///     let body = FlowFileBody::from_body(request.with_limited_body().into_body());
-    ///     let mut flow_files = FlowFilesAsync::with_limits(body, Limits::untrusted());
-    ///
-    ///     let mut count = 0;
-    ///     while let Some(flow_file) = flow_files.next().await {
-    ///         flow_file?;
-    ///         count += 1;
-    ///     }
-    ///     Ok(count)
-    /// }
-    /// ```
     #[must_use]
-    pub fn from_body(body: Body) -> Self {
+    pub fn new(body: Body) -> Self {
         Self {
             stream: body.into_data_stream(),
             chunk: Bytes::new(),
@@ -140,7 +83,7 @@ impl FlowFileBody {
 
 impl From<Body> for FlowFileBody {
     fn from(body: Body) -> Self {
-        Self::from_body(body)
+        Self::new(body)
     }
 }
 
@@ -182,17 +125,202 @@ impl AsyncRead for FlowFileBody {
     }
 }
 
-/// The request body as an [`AsyncRead`], with axum's
-/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) applied.
+/// Why a request could not be extracted into a flow file or a [`Spool`].
 ///
-/// `with_limited_body` is what applies it; reading `req.into_body()` directly
-/// would silently opt out.
-fn limited_body(req: Request) -> FlowFileBody {
-    FlowFileBody::from_body(req.with_limited_body().into_body())
+/// Each variant answers with the status it deserves: what the client sent
+/// wrong is a `4xx`, and what the server could not do is a `500`. The body of
+/// the response is the message, so the client's log says what happened.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Rejection {
+    /// The body is not a flow file, or not exactly one. Answered with
+    /// `400 Bad Request`.
+    #[error("request body is not a FlowFile V3{}: {error}", described(.content_type.as_deref()))]
+    Parse {
+        /// What was wrong with it.
+        error: Error,
+        /// The request's `Content-Type`, which is the first thing to check
+        /// when a client sends raw content instead of a flow file.
+        content_type: Option<String>,
+    },
+
+    /// The body ran past axum's
+    /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit). Answered with
+    /// `413 Payload Too Large`.
+    ///
+    /// The limit is 2 MiB unless the router raises it, and a flow file is
+    /// often larger than that. See [`DefaultBodyLimit::max`][max].
+    ///
+    /// [max]: axum::extract::DefaultBodyLimit::max
+    #[error(
+        "request body exceeds axum's DefaultBodyLimit, which is 2 MiB unless \
+         the router raises it with DefaultBodyLimit::max"
+    )]
+    BodyTooLarge,
+
+    /// The body could not be read: the client went away, or the connection
+    /// failed. Answered with `400 Bad Request`, for what that is worth to a
+    /// client that is no longer there.
+    #[error("failed to read the request body: {0}")]
+    Body(#[source] io::Error),
+
+    /// The body could not be spooled to disk. Answered with
+    /// `500 Internal Server Error`, because the request was fine and the
+    /// server was not. See [`SpoolConfig::with_directory`].
+    #[error("failed to spool the request body to disk: {0}")]
+    Spool(#[source] io::Error),
 }
 
-impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
-    type Rejection = Error;
+/// The content type as a parenthetical, for the parse rejection message.
+fn described(content_type: Option<&str>) -> String {
+    match content_type {
+        Some(content_type) => format!(" (Content-Type: {content_type})"),
+        None => String::new(),
+    }
+}
+
+impl Rejection {
+    /// The status this rejection answers with.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Parse { .. } | Self::Body(_) => StatusCode::BAD_REQUEST,
+            Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Spool(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Say what happened, since the handler never runs to say it.
+    fn log(&self) {
+        #[cfg(feature = "tracing")]
+        match self {
+            Self::Spool(error) => {
+                tracing::error!(error = %error, "rejecting request: spooling failed");
+            }
+            other => tracing::warn!(error = %other, status = %other.status(), "rejecting request"),
+        }
+    }
+
+    /// Sort an error from reading or parsing the body into a rejection.
+    fn from_error(error: Error, content_type: Option<&str>) -> Self {
+        match error {
+            Error::Io(error) if error.get_ref().is_some_and(is_body_limit) => Self::BodyTooLarge,
+            Error::Io(error) => Self::Body(error),
+            error => Self::Parse {
+                error,
+                content_type: content_type.map(str::to_owned),
+            },
+        }
+    }
+
+    fn from_spool(error: spool::SpoolError, content_type: Option<&str>) -> Self {
+        match error.side {
+            // A short body is a parse failure, and `Error::from` recovers it
+            // as a `SizeMismatch`. Anything else from the source is the body.
+            Side::Source => Self::from_error(Error::from(error.error), content_type),
+            Side::Sink => Self::Spool(error.error),
+        }
+    }
+}
+
+impl IntoResponse for Rejection {
+    fn into_response(self) -> Response {
+        (self.status(), self.to_string()).into_response()
+    }
+}
+
+/// Whether `err`, or anything in its source chain, is axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) being hit.
+///
+/// The limit is enforced by the body, several layers below the reader this
+/// crate parses from, so it arrives as an opaque [`io::Error`] like any other
+/// transport failure. Only the chain distinguishes it. This is a guess about
+/// how axum nests its errors, checked against axum 0.8 and http-body-util 0.1.
+/// If either re-wraps `LengthLimitError` the check stops matching, and an
+/// over-large body becomes a 400 rather than a 413. The test that notices is
+/// `the_extractor_honors_the_default_body_limit` in `tests/axum.rs`.
+fn is_body_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let err: &(dyn std::error::Error + 'static) = err;
+    std::iter::successors(Some(err), |err| err.source())
+        .any(<dyn std::error::Error + 'static>::is::<http_body_util::LengthLimitError>)
+}
+
+/// The [`SpoolConfig`] the router installed, or the default.
+fn spool_config(req: &Request) -> SpoolConfig {
+    req.extensions()
+        .get::<SpoolConfig>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn content_type(req: &Request) -> Option<String> {
+    req.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The request body as an [`AsyncRead`], with axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) applied.
+fn limited_body(req: Request) -> FlowFileBody {
+    FlowFileBody::new(req.with_limited_body().into_body())
+}
+
+/// Read whatever is left of `body`, returning how much there was.
+async fn drain(body: &mut FlowFileBody) -> io::Result<u64> {
+    tokio::io::copy(body, &mut tokio::io::sink()).await
+}
+
+/// Extract exactly one flow file from a request, with its content read in
+/// full before the handler runs.
+///
+/// This is the extractor to use for a service that answers NiFi. The header
+/// is parsed and the content is spooled, to memory or to disk by size as the
+/// [`SpoolConfig`] in the router's extensions says, or the default one if
+/// there is none. A body that is not a flow file, or that holds more than
+/// one, is rejected with a status before the handler runs. See [`Rejection`].
+///
+/// ```no_run
+/// use axum::response::IntoResponse;
+/// use nififf3::{Error, FlowFile, Spool};
+///
+/// async fn shout(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
+///     let flow_file = flow_file.into_memory_async().await?;
+///     Ok(flow_file
+///         .derive()
+///         .content(flow_file.content().to_ascii_uppercase())
+///         .into_reader())
+/// }
+/// ```
+///
+/// # Why the whole request is read first
+///
+/// NiFi's HTTP client sends the whole request before it reads any of the
+/// response. A handler that answered while the request was still arriving
+/// would stall against that client as soon as the response outgrew the socket
+/// buffers, with each side waiting for the other. Reading the request in full
+/// first makes that impossible, and against NiFi it costs nothing, since NiFi
+/// would not have read the response any sooner. [`Spool`] is the result: a
+/// plain value, with no task or socket behind it.
+///
+/// # Body size
+///
+/// The body is read through axum's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit), as any extractor's
+/// body is, so it is capped at 2 MiB unless the router says otherwise. A flow
+/// file is often larger than that:
+///
+/// ```
+/// use axum::extract::DefaultBodyLimit;
+/// use axum::{Router, routing::post};
+/// # async fn handler(_: nififf3::FlowFile<nififf3::Spool>) {}
+///
+/// let app: Router = Router::new()
+///     .route("/large", post(handler))
+///     .layer(DefaultBodyLimit::max(8 << 30)); // or ::disable()
+/// ```
+impl<S: Send + Sync> FromRequest<S> for FlowFile<Spool> {
+    type Rejection = Rejection;
 
     #[cfg_attr(
         feature = "tracing",
@@ -208,236 +336,117 @@ impl<S: Send + Sync> FromRequest<S> for FlowFileRequest {
         )
     )]
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let parsed =
-            FlowFile::parse_async_with_limits(limited_body(req), Limits::untrusted()).await;
-        match parsed {
+        let config = spool_config(&req);
+        let content_type = content_type(&req);
+        let mut body = limited_body(req);
+        let result = extract_one(&mut body, &config, content_type.as_deref()).await;
+        match &result {
             Ok(flow_file) => {
-                flow_file.record_identity();
                 #[cfg(feature = "tracing")]
-                tracing::info!("extracted flow file from request");
-                Ok(Self(flow_file))
+                tracing::info!(
+                    spool = if flow_file.content().is_in_memory() {
+                        "memory"
+                    } else {
+                        "disk"
+                    },
+                    "extracted flow file from request"
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = flow_file;
             }
-            Err(err) => {
-                // This becomes a status code, so the handler never runs and
-                // never sees why.
-                #[cfg(feature = "tracing")]
-                tracing::warn!(error = %err, "rejecting request");
-                Err(err)
-            }
+            Err(rejection) => rejection.log(),
         }
+        result
     }
 }
 
-/// Like [`FlowFileRequest`], but additionally requires the request to carry
-/// `Content-Type: application/flowfile-v3`.
-///
-/// A missing or different content type is rejected with
-/// `415 Unsupported Media Type` before the body is parsed. Media type
-/// parameters (e.g. a `charset`) are ignored in the comparison.
-///
-/// It wraps the same flow file [`FlowFileRequest`] does, and is used the same
-/// way. Destructure it, or dereference it:
-///
-/// ```no_run
-/// use nififf3::StrictFlowFileRequest;
-///
-/// async fn handler(
-///     StrictFlowFileRequest(flow_file): StrictFlowFileRequest,
-/// ) -> Result<String, nififf3::Error> {
-///     let flow_file = flow_file.into_memory_async().await?;
-///     Ok(format!("got {} bytes", flow_file.size()))
-/// }
-/// ```
-#[derive(Debug)]
-pub struct StrictFlowFileRequest(pub FlowFile<tokio::io::Take<FlowFileBody>>);
+async fn extract_one(
+    body: &mut FlowFileBody,
+    config: &SpoolConfig,
+    content_type: Option<&str>,
+) -> Result<FlowFile<Spool>, Rejection> {
+    let parsed = FlowFile::parse_async(&mut *body)
+        .await
+        .map_err(|error| Rejection::from_error(error, content_type))?;
+    let (size, attributes, mut content) = parsed.into_parts();
+    let spool = spool::spool(&mut content, Some(size), config)
+        .await
+        .map_err(|error| Rejection::from_spool(error, content_type))?;
 
-impl std::ops::Deref for StrictFlowFileRequest {
-    type Target = FlowFile<tokio::io::Take<FlowFileBody>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for StrictFlowFileRequest {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-/// How much of a rejected `Content-Type` is named in the rejection.
-///
-/// The value comes from the client, and it goes back to the client in an error
-/// body, so it is bounded here: enough to tell what was sent, not however much
-/// was sent.
-const MAX_ECHOED_CONTENT_TYPE: usize = 64;
-
-/// The head of `value`, cut to a character boundary, with an ellipsis if
-/// anything was dropped.
-fn abbreviated(value: &str) -> String {
-    if value.len() <= MAX_ECHOED_CONTENT_TYPE {
-        return value.to_owned();
-    }
-    let mut end = MAX_ECHOED_CONTENT_TYPE;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &value[..end])
-}
-
-/// Reject the request unless it carries the content type
-/// `application/flowfile-v3`.
-///
-/// Compares the media type only, ignoring any parameters. The comparison sees
-/// the whole header; only what travels back to the client is abbreviated.
-fn require_media_type(req: &Request) -> Result<(), StrictRejection> {
-    let content_type = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    let media_type = content_type.map(|value| value.split(';').next().unwrap_or("").trim());
-    if media_type.is_some_and(|value| value.eq_ignore_ascii_case(MEDIA_TYPE)) {
-        Ok(())
-    } else {
-        // A 415 that the handler never runs to see, decided by a header the
-        // caller of this service chose.
-        #[cfg(feature = "tracing")]
-        tracing::warn!(
+    // Anything after the content is not this flow file's, and reading it
+    // also leaves the connection drained, which a client that sends before
+    // it reads depends on.
+    let trailing = drain(body)
+        .await
+        .map_err(|error| Rejection::from_error(Error::Io(error), content_type))?;
+    if trailing > 0 {
+        return Err(Rejection::from_error(
+            Error::TrailingData(trailing),
             content_type,
-            "rejecting request: content type is not {MEDIA_TYPE}"
-        );
-        Err(StrictRejection::UnsupportedMediaType(
-            content_type.map(abbreviated),
-        ))
+        ));
     }
+    Ok(FlowFile::from_raw_parts(size, attributes, spool))
 }
 
-/// Rejection returned by the strict extractors.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum StrictRejection {
-    /// The request's `Content-Type` was missing or not
-    /// `application/flowfile-v3`; responds with `415 Unsupported Media Type`.
-    ///
-    /// The value carried here is abbreviated to the first 64 bytes, since it
-    /// is reflected into the response body.
-    #[error("expected content type \"application/flowfile-v3\", got {0:?}")]
-    UnsupportedMediaType(Option<String>),
-
-    /// The body was not a valid flow file; responds with `400 Bad Request`.
-    #[error(transparent)]
-    Parse(#[from] Error),
-}
-
-impl IntoResponse for StrictRejection {
-    fn into_response(self) -> Response {
-        match self {
-            Self::UnsupportedMediaType(_) => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, self.to_string()).into_response()
-            }
-            Self::Parse(err) => err.into_response(),
-        }
-    }
-}
-
-impl<S: Send + Sync> FromRequest<S> for StrictFlowFileRequest {
-    type Rejection = StrictRejection;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        require_media_type(&req)?;
-        Ok(Self(FlowFileRequest::from_request(req, state).await?.0))
-    }
-}
-
-/// Every flow file in a request body, read one at a time.
+/// Extract the whole request body into a [`Spool`], read in full before the
+/// handler runs.
 ///
-/// The many-in counterpart to [`FlowFilesResponse`], and what NiFi's own
-/// `PostHTTP` sends: several flow files concatenated under one
-/// `application/flowfile-v3` request. [`FlowFileRequest`] parses exactly one
-/// and rejects a body with more.
-///
-/// Each flow file's content is buffered in memory as it is yielded. The number
-/// of flow files is unbounded, and the size of any one is bounded by
-/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) as usual. To stream
-/// the contents instead, build a [`FlowFileBody`] and drive
-/// [`FlowFile::parse_next_async`] over it yourself.
-///
-/// Headers are parsed with [`Limits::untrusted`], as for the single-flow-file
-/// extractors. Parse errors surface from [`next`](FlowFilesAsync::next) rather
-/// than from extraction, since nothing is read until then: the extractor itself
-/// only fails if the request cannot be taken apart at all.
+/// This is the extractor for a body holding several flow files, which is
+/// what NiFi sends when it merges flow files with the `FlowFile Stream, v3`
+/// format and posts the result. Read them off the spool with
+/// [`FlowFilesReaderAsync`](crate::FlowFilesReaderAsync), which streams each
+/// content, or [`FlowFilesAsync`](crate::FlowFilesAsync), which buffers it:
 ///
 /// ```no_run
-/// use nififf3::FlowFilesRequest;
+/// use nififf3::{Error, FlowFilesReaderAsync, Spool};
 ///
-/// async fn handler(
-///     FlowFilesRequest(mut flow_files): FlowFilesRequest,
-/// ) -> Result<String, nififf3::Error> {
-///     let mut count = 0;
-///     while let Some(flow_file) = flow_files.next().await {
-///         let flow_file = flow_file?;
-///         count += flow_file.size();
+/// async fn handler(body: Spool) -> Result<String, Error> {
+///     let mut flow_files = FlowFilesReaderAsync::new(body);
+///     let mut total = 0;
+///     while let Some(flow_file) = flow_files.next().await? {
+///         total += flow_file.size();
 ///     }
-///     Ok(format!("{count} content bytes in total"))
+///     Ok(format!("{total} content bytes in total"))
 /// }
 /// ```
-#[derive(Debug)]
-pub struct FlowFilesRequest(pub FlowFilesAsync<FlowFileBody>);
-
-impl std::ops::Deref for FlowFilesRequest {
-    type Target = FlowFilesAsync<FlowFileBody>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for FlowFilesRequest {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<S: Send + Sync> FromRequest<S> for FlowFilesRequest {
-    type Rejection = Error;
-
-    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(FlowFilesAsync::with_limits(
-            limited_body(req),
-            Limits::untrusted(),
-        )))
-    }
-}
-
-/// [`FlowFilesRequest`], additionally requiring
-/// `Content-Type: application/flowfile-v3`.
 ///
-/// The many-in counterpart to [`StrictFlowFileRequest`], rejecting a missing or
-/// different content type with `415 Unsupported Media Type` before any of the
-/// body is read.
-#[derive(Debug)]
-pub struct StrictFlowFilesRequest(pub FlowFilesAsync<FlowFileBody>);
+/// Nothing is parsed at extraction, so a body that is not flow files is
+/// reported by the reader rather than by a rejection. The body is subject to
+/// axum's [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) and goes to
+/// memory or disk as the [`SpoolConfig`] in the router's extensions says,
+/// exactly as for `FlowFile<Spool>`.
+impl<S: Send + Sync> FromRequest<S> for Spool {
+    type Rejection = Rejection;
 
-impl std::ops::Deref for StrictFlowFilesRequest {
-    type Target = FlowFilesAsync<FlowFileBody>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for StrictFlowFilesRequest {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<S: Send + Sync> FromRequest<S> for StrictFlowFilesRequest {
-    type Rejection = StrictRejection;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        require_media_type(&req)?;
-        Ok(Self(FlowFilesRequest::from_request(req, state).await?.0))
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "info", name = "spool_request", skip_all)
+    )]
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let config = spool_config(&req);
+        let content_type = content_type(&req);
+        let mut body = limited_body(req);
+        let result = spool::spool(&mut body, None, &config)
+            .await
+            .map_err(|error| Rejection::from_spool(error, content_type.as_deref()));
+        match &result {
+            Ok(spool) => {
+                #[cfg(feature = "tracing")]
+                tracing::info!(
+                    bytes = spool.len(),
+                    spool = if spool.is_in_memory() {
+                        "memory"
+                    } else {
+                        "disk"
+                    },
+                    "spooled request body"
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = spool;
+            }
+            Err(rejection) => rejection.log(),
+        }
+        result
     }
 }
 
@@ -447,11 +456,11 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFilesRequest {
 /// computed from the header and the declared content size. Exactly
 /// [`size`](FlowFile::size) bytes are read from the content reader.
 ///
-/// The bound is on the content, so this covers every reader-backed flow file.
-/// It does not cover an in-memory `FlowFile<Vec<u8>>`, because `Vec<u8>` is not
-/// an [`AsyncRead`], and coherence forbids a second impl for it. Call
-/// [`into_reader`](FlowFile::into_reader) on one of those first. It wraps the
-/// content in a [`std::io::Cursor`], which is an [`AsyncRead`]:
+/// The bound is on the content, so this covers every reader-backed flow file,
+/// including a `FlowFile<Spool>` straight from the extractor. It does not
+/// cover an in-memory `FlowFile<Vec<u8>>`, because `Vec<u8>` is not an
+/// [`AsyncRead`] and coherence forbids a second impl for it. Call
+/// [`into_reader`](FlowFile::into_reader) on one of those first:
 ///
 /// ```
 /// use axum::response::IntoResponse;
@@ -466,11 +475,9 @@ impl<S: Send + Sync> FromRequest<S> for StrictFlowFilesRequest {
 ///
 /// The `Content-Length` is committed before a content byte has been read, so a
 /// reader that ends before [`size`](FlowFile::size) cannot be reported as a
-/// status. The headers are gone by then. It fails the body instead, the way
-/// [`FlowFilesResponse`] does for a producer error. The client then sees an
-/// aborted response, rather than a complete one carrying a flow file whose
-/// header declares more content than it holds. A reader that yields more than
-/// `size` is cut to it, as everywhere else in this crate.
+/// status. It fails the body instead, so the client sees an aborted response
+/// rather than a complete one carrying a flow file whose header declares more
+/// content than it holds. A reader that yields more than `size` is cut to it.
 impl<R> IntoResponse for FlowFile<R>
 where
     R: AsyncRead + Send + 'static,
@@ -486,7 +493,7 @@ where
                 (header::CONTENT_LENGTH, total.to_string()),
             ],
             Body::from_stream(ExactLength {
-                inner: Box::pin(ReaderStream::new(reader)),
+                inner: Box::pin(ReaderStream::with_capacity(reader, RESPONSE_CHUNK)),
                 declared: size,
                 remaining: total,
                 done: false,
@@ -498,9 +505,6 @@ where
 
 /// Fails the body if the wrapped reader yields fewer bytes than the response
 /// committed to, rather than ending it short of its `Content-Length`.
-///
-/// The header is served from an in-memory cursor and so always arrives whole;
-/// any shortfall is content, which is what the error reports.
 struct ExactLength {
     inner: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
     declared: u64,
@@ -523,6 +527,8 @@ impl Stream for ExactLength {
             }
             Some(Err(err)) => {
                 this.done = true;
+                #[cfg(feature = "tracing")]
+                tracing::warn!(error = %err, "content reader failed, failing the response body");
                 Poll::Ready(Some(Err(err)))
             }
             None => {
@@ -530,9 +536,9 @@ impl Stream for ExactLength {
                 Poll::Ready(if this.remaining == 0 {
                     None
                 } else {
-                    // Saturating because `remaining` covers the header too:
-                    // the header is served from an in-memory cursor and always
-                    // drains, but nothing here depends on that being true.
+                    // The header is served from memory and always drains, so
+                    // any shortfall is content. Saturating in case that ever
+                    // stops being true.
                     let delivered = this.declared.saturating_sub(this.remaining);
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
@@ -547,38 +553,17 @@ impl Stream for ExactLength {
     }
 }
 
-/// Whether `err`, or anything in its source chain, is axum's
-/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) being hit.
-///
-/// The limit is enforced by the body, several layers below the reader this
-/// crate parses from, so it arrives as an opaque [`io::Error`] like any other
-/// transport failure. Only the chain distinguishes it.
-///
-/// That makes this a guess about how axum nests its errors, checked against
-/// axum 0.8 and http-body-util 0.1. If either re-wraps `LengthLimitError` the
-/// check stops matching, and an over-large body silently becomes a 400 rather
-/// than a 413. The test that notices is
-/// `extractor_honors_the_default_body_limit` in `tests/axum.rs`.
-fn is_body_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    // Matches `io::Error::get_ref`; the chain itself drops the auto traits.
-    let err: &(dyn std::error::Error + 'static) = err;
-    std::iter::successors(Some(err), |err| err.source())
-        .any(<dyn std::error::Error + 'static>::is::<http_body_util::LengthLimitError>)
-}
-
-/// Respond with the error message as the body, under `400 Bad Request`. The
-/// size failures get `413 Payload Too Large` instead, because that input was
-/// well-formed and only too big. Those are the [`Limits`] failures, plus a body
-/// that ran past axum's
+/// Respond with the error message as the body, under `400 Bad Request`, or
+/// `413 Payload Too Large` for a body that ran past axum's
 /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit).
+///
+/// This is what lets a handler return `Result<_, nififf3::Error>` and use `?`
+/// on this crate's calls. The extractors have a [`Rejection`] of their own,
+/// which tells the server's failures from the client's.
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let status = match self {
-            Error::TooManyAttributes { .. }
-            | Error::AttributeTooLong { .. }
-            | Error::HeaderTooLarge { .. }
-            | Error::ContentTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            Error::Io(ref err) if err.get_ref().is_some_and(is_body_limit) => {
+        let status = match &self {
+            Error::Io(err) if err.get_ref().is_some_and(is_body_limit) => {
                 StatusCode::PAYLOAD_TOO_LARGE
             }
             _ => StatusCode::BAD_REQUEST,
@@ -587,119 +572,72 @@ impl IntoResponse for Error {
     }
 }
 
-/// How much serialized output may sit between the producer and the socket
-/// before writes start waiting.
+/// How much serialized output may sit between the producer and the body
+/// before the producer waits.
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Any error, boxed: what a [`FlowFilesResponse`] producer reports failure
 /// with.
 ///
-/// The same alias as [`axum::BoxError`], and the same type the response body
-/// would erase a producer's error to in any case. Because every
-/// `std::error::Error` converts into it, a producer can use `?` on whatever
-/// its decoder, its I/O or this crate hands it without converting between
-/// error types first.
+/// The same alias as [`axum::BoxError`]. Because every `std::error::Error`
+/// converts into it, a producer can use `?` on whatever its decoder, its I/O
+/// or this crate hands it without converting between error types first.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The writer a [`FlowFilesResponse::new`] producer is handed.
+pub type ResponseWriter = FlowFilesWriterAsync<DuplexStream>;
+
+/// The writer a [`FlowFilesResponse::blocking`] producer is handed.
+pub type BlockingResponseWriter = FlowFilesWriter<SyncIoBridge<DuplexStream>>;
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
 
+type AsyncProducer = Box<dyn FnOnce(ResponseWriter) -> BoxFuture + Send>;
+
+type BlockingProducer = Box<dyn FnOnce(BlockingResponseWriter) -> Result<(), BoxError> + Send>;
+
 enum Source {
-    Producer(Box<dyn FnOnce(FlowFilesWriterAsync<ResponseSink>) -> BoxFuture + Send>),
-    Blocking(Box<dyn FnOnce(FlowFilesWriter<BlockingResponseSink>) -> Result<(), BoxError> + Send>),
+    Producer(AsyncProducer),
+    Blocking(BlockingProducer),
     Bytes(Vec<u8>),
 }
 
 /// A response carrying *many* flow files, concatenated as NiFi expects them.
 ///
-/// The 1-to-many counterpart to [`FlowFileRequest`]: a handler takes one flow
-/// file in and answers with a flow file per part it found inside. Parts are
-/// produced lazily and streamed, so neither their number nor the size of any
-/// one of them is bounded by memory. See [`new`](Self::new) for the shape of a
-/// handler.
-///
-/// # Reading the request while writing the response
-///
-/// A producer that reads the request body and writes parts from the same task
-/// can deadlock. What triggers it is the client, so the same handler can work
-/// for years and then stop when one arrives that behaves differently.
-///
-/// Some HTTP clients send the whole request body before they read any of the
-/// response. NiFi's does. Against one of those, this happens:
-///
-/// 1. The producer writes parts until
-///    [`buffer_size`](Self::buffer_size) and the socket buffers are full.
-/// 2. Blocked on that write, the producer stops reading the request body.
-/// 3. The client's socket fills, so the client blocks writing. It will not
-///    read the response until it has sent the whole request.
-/// 4. Nothing drains the response, so the producer never wakes.
-///
-/// Each side is waiting for the other. curl reads the response while it
-/// writes, so it never triggers this, and that makes the failure look like a
-/// problem with one particular client.
-///
-/// It takes a request large enough that the client cannot fit what is left of
-/// it into the socket buffers. Under that size the client finishes sending,
-/// starts reading, and the response drains. So this appears at some size and
-/// not below it. How many parts you write does not matter.
-///
-/// Knowing every part's size up front does not avoid it. A producer that
-/// streams parts starts writing sooner than one that buffers each part first,
-/// which brings it to step 1 earlier rather than later.
-///
-/// ## Keeping the request moving
-///
-/// The fix is to go on reading the request whatever the response is doing.
-/// [`FlowFile::spool_async`] does exactly that. It copies the body to a
-/// temporary file in the background, and hands back a flow file you read in
-/// place of the socket:
-///
-/// ```ignore
-/// let parent = parent.spool_async()?;
-/// // Build the response from `parent`, which no longer touches the socket.
-/// ```
-///
-/// Memory stays bounded however large the request is, because the bytes go to
-/// disk. The copy also starts at once and runs whether you read or not, so
-/// the first part still goes out immediately. `tests/response_deadlock.rs`
-/// measures that: the first part is ready after 1 ms, against 2439 ms for a
-/// handler that waits for the whole request before it starts. That file also
-/// asserts the deadlock itself, so it fails if this ever stops happening.
-///
-/// Raising [`buffer_size`](Self::buffer_size) past the size of the whole
-/// response also works, because the producer then never blocks on a write.
-/// It costs memory in proportion to the response, and it fails again as soon
-/// as a response outgrows the buffer.
+/// The one-to-many counterpart to extracting a `FlowFile<Spool>`: a handler
+/// takes one flow file in and answers with a flow file per part it found
+/// inside. Parts are produced lazily and streamed, so neither their number
+/// nor the size of any one of them is bounded by memory. See
+/// [`new`](Self::new) for the shape of a producer.
 ///
 /// # Status codes
 ///
-/// Returning a `FlowFilesResponse` commits you to a 2xx status, because the
-/// status line has been sent by the time the producer runs. So validate up
-/// front, while a real status code is still available. Report a problem with
-/// an individual part as a part of its own, meaning a flow file whose
-/// attributes say what went wrong, and the good parts still arrive. Returning
-/// `Err` from the producer aborts the body instead, leaving the client with a
-/// truncated response and no status to explain it.
+/// Returning a `FlowFilesResponse` commits you to a `2xx` status, because the
+/// status line is sent before the producer runs. So validate up front, while
+/// a real status code is still available. Report a problem with an individual
+/// part as a part of its own, meaning a flow file whose attributes say what
+/// went wrong, and the good parts still arrive. Returning `Err` from the
+/// producer aborts the body instead, leaving the client with a truncated
+/// response and no status to explain it.
 ///
 /// Which failures you can report as a part follows from the format writing a
-/// part's size before its content:
+/// part's size before its content. A failure found before the part is written
+/// is always reportable. A failure found while
+/// [`write`](FlowFilesWriterAsync::write) streams a part's content is not,
+/// because the size is already on the wire. To vouch for a part's content,
+/// read it into memory and use
+/// [`write_bytes`](FlowFilesWriterAsync::write_bytes), which learns of the
+/// failure before committing to anything.
 ///
-/// - A failure found before the part is written is always reportable. A bad
-///   archive header, or an entry that will not open, is found there.
-/// - A failure found while [`write`](FlowFilesWriterAsync::write) streams a
-///   part's content is not reportable, because the size is already on the
-///   wire.
+/// # How the producer runs
 ///
-/// To vouch for a part's content, read it into memory and use
-/// [`write_bytes`](FlowFilesWriterAsync::write_bytes) instead, which learns of
-/// the failure before committing to anything. Decide that per part: stream the
-/// large ones, and buffer the ones whose integrity matters.
-///
-/// # Panics
-///
-/// Turning one of the streaming variants into a response spawns the producer,
-/// so it has to happen inside a tokio runtime. An axum handler always is one.
-/// Converting a response by hand outside a runtime panics.
-/// [`buffered`](Self::buffered) spawns nothing and is fine anywhere.
+/// The producer is not spawned. The response body polls it whenever the
+/// connection can take more, so it runs exactly as far as the client reads,
+/// and dropping the response drops the producer at its next `await`. A
+/// [`blocking`](Self::blocking) producer runs on a blocking thread instead,
+/// started when the body is first polled, and cannot be stopped from outside:
+/// it ends when it returns, or when its next write fails because the client
+/// has gone.
 pub struct FlowFilesResponse {
     source: Source,
     buffer_size: usize,
@@ -716,18 +654,15 @@ impl std::fmt::Debug for FlowFilesResponse {
 impl FlowFilesResponse {
     /// Stream flow files from an async producer.
     ///
-    /// `producer` is handed a [`FlowFilesWriterAsync`] and writes parts to it
-    /// in whatever shape it likes, and the response ends when the future
-    /// completes. A write resolves once its bytes are in the response body, and
-    /// the body runs at most [`buffer_size`](Self::buffer_size) ahead of the
-    /// socket. So a slow client applies backpressure within a buffer rather
-    /// than filling memory, and writing a part from a reader never buffers its
+    /// `producer` is handed a [`ResponseWriter`] and writes parts to it in
+    /// whatever shape it likes, and the response ends when the future
+    /// completes. A write resolves once its bytes are in the response body,
+    /// and the body runs at most [`buffer_size`](Self::buffer_size) ahead of
+    /// the connection, so writing a part from a reader never buffers its
     /// content.
     ///
     /// Failure is reported as a [`BoxError`], so `?` works directly on whatever
-    /// a decoder, plain I/O, or this crate returns. A producer never has to
-    /// convert between error types to satisfy this signature. One that already
-    /// has its own error type can adapt with `.map_err(Into::into)`.
+    /// a decoder, plain I/O, or this crate returns.
     ///
     /// ```
     /// use axum::response::IntoResponse;
@@ -760,12 +695,9 @@ impl FlowFilesResponse {
     /// # }
     /// # });
     /// ```
-    ///
-    /// If the client disconnects the next write fails; a producer that is
-    /// working rather than writing is aborted when the body is dropped.
     pub fn new<F, Fut>(producer: F) -> Self
     where
-        F: FnOnce(FlowFilesWriterAsync<ResponseSink>) -> Fut + Send + 'static,
+        F: FnOnce(ResponseWriter) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     {
         Self {
@@ -779,15 +711,15 @@ impl FlowFilesResponse {
     ///
     /// The same shape as [`new`](Self::new), for producers that are
     /// unavoidably synchronous. Prefer `new` where an async decoder exists: a
-    /// blocking producer cannot be aborted mid-computation, so it keeps
-    /// running after the client goes away until its next write fails.
+    /// blocking producer cannot be stopped when the client goes away, so it
+    /// keeps running until its next write fails.
     ///
-    /// The parent's content is an [`AsyncRead`]; wrap it in
-    /// [`SyncIoBridge`](tokio_util::io::SyncIoBridge) to feed a synchronous
-    /// decoder.
+    /// A [`Spool`] is an [`AsyncRead`]; wrap it in
+    /// [`SyncIoBridge`](tokio_util::io::SyncIoBridge) inside the producer to
+    /// feed a synchronous decoder.
     pub fn blocking<F>(producer: F) -> Self
     where
-        F: FnOnce(FlowFilesWriter<BlockingResponseSink>) -> Result<(), BoxError> + Send + 'static,
+        F: FnOnce(BlockingResponseWriter) -> Result<(), BoxError> + Send + 'static,
     {
         Self {
             source: Source::Blocking(Box::new(producer)),
@@ -797,10 +729,9 @@ impl FlowFilesResponse {
 
     /// Stream flow files from a [`Stream`] of in-memory parts.
     ///
-    /// This is a convenience for producers that already yield whole flow
-    /// files. The stream's error type can be anything that converts into a
-    /// [`BoxError`], and a `Stream` error ends the response the same way an
-    /// error from [`new`](Self::new)'s producer does.
+    /// A convenience for producers that already yield whole flow files. A
+    /// `Stream` error ends the response the same way an error from
+    /// [`new`](Self::new)'s producer does.
     pub fn from_stream<S, E>(parts: S) -> Self
     where
         S: Stream<Item = Result<FlowFile<Vec<u8>>, E>> + Send + 'static,
@@ -819,13 +750,8 @@ impl FlowFilesResponse {
     ///
     /// Unlike the streaming constructors this knows the total length up
     /// front, so the response carries an exact `Content-Length` instead of
-    /// being chunked. That is what it costs: every part is serialized into one
-    /// buffer before the response starts, so the whole body sits in memory at
-    /// once. Use [`new`](Self::new) or [`from_stream`](Self::from_stream) when
-    /// that is not a trade worth making.
-    ///
-    /// Takes anything iterable, so a `Vec`, an array, or a mapped iterator all
-    /// work without collecting first.
+    /// being chunked. Every part is serialized into one buffer before the
+    /// response starts, so the whole body sits in memory at once.
     ///
     /// ```
     /// use axum::http::header;
@@ -847,19 +773,11 @@ impl FlowFilesResponse {
     /// or a part whose declared size disagrees with its content.
     #[must_use]
     pub fn buffered(parts: impl IntoIterator<Item = FlowFile<Vec<u8>>>) -> Self {
-        let parts = parts.into_iter();
         let mut bytes = Vec::new();
-        // The parts arrive one at a time, so the total is not known up front;
-        // reserving each one's exact length as it comes is the next best
-        // thing, and keeps the body out of the doubling sequence a plain
-        // `extend` would put it through.
         for part in parts {
-            // A part whose length does not fit a `usize` cannot be in memory to
-            // begin with, so this is unreachable; reserving nothing is still
-            // the right fallback, since `write_bytes_to` grows the buffer on
-            // its own and asking for `usize::MAX` would abort the process.
-            let len = usize::try_from(part.serialized_len()).unwrap_or(0);
-            bytes.reserve(len);
+            // A part whose length does not fit a `usize` cannot be in memory
+            // to begin with; reserving nothing is still the right fallback.
+            bytes.reserve(usize::try_from(part.serialized_len()).unwrap_or(0));
             part.write_bytes_to(&mut bytes)
                 .expect("writing to a Vec cannot fail");
         }
@@ -870,13 +788,11 @@ impl FlowFilesResponse {
     }
 
     /// Set how many serialized bytes may be in flight between the producer
-    /// and the socket. Defaults to 64 KiB; ignored by
+    /// and the body. Defaults to 64 KiB; ignored by
     /// [`buffered`](Self::buffered).
     ///
-    /// Rounded up to at least one byte: a buffer of zero can never accept a
-    /// write, so the producer would park on its first one and the response
-    /// would hang rather than fail. One byte is pathological but it makes
-    /// progress; pick a real size for a real response.
+    /// Rounded up to at least one byte, since a buffer of zero could never
+    /// accept a write.
     #[must_use]
     pub fn buffer_size(mut self, bytes: usize) -> Self {
         self.buffer_size = bytes.max(1);
@@ -891,171 +807,218 @@ impl FlowFilesResponse {
 impl IntoResponse for FlowFilesResponse {
     fn into_response(self) -> Response {
         let buffer_size = self.buffer_size;
-        match self.source {
-            Source::Bytes(bytes) => (
-                [
-                    (header::CONTENT_TYPE, MEDIA_TYPE.to_string()),
-                    (header::CONTENT_LENGTH, bytes.len().to_string()),
-                ],
-                Body::from(bytes),
-            )
-                .into_response(),
-            Source::Producer(producer) => {
-                // Only one direction of this duplex is used. The producer
-                // writes to `sink`, and the body reads from `body`. That
-                // makes `tokio::io::simplex` look like the better fit, but it
-                // cannot replace this.
-                //
-                // What ends the body is `DuplexStream`'s `Drop`, which calls
-                // `close_write`. The producer future completes, the writer it
-                // owns is dropped, and the reader sees EOF. `SimplexStream`
-                // has no `Drop`, and neither do the halves `split` returns.
-                // A reader over one would wait for an `is_closed` that
-                // nothing ever sets. No producer calls `shutdown`, so nothing
-                // else would close it either.
-                //
-                // The unused half costs little. Both halves start at
-                // `BytesMut::new()`, and `buffer_size` only caps how far one
-                // may grow. So the unused half holds an empty buffer for the
-                // life of the response, rather than `buffer_size` bytes.
-                let (sink, body) = tokio::io::duplex(buffer_size);
-                let writer = FlowFilesWriterAsync::new(ResponseSink { inner: sink });
-                streamed(body, tokio::spawn(producer(writer)))
+        let producer = match self.source {
+            Source::Bytes(bytes) => {
+                return (
+                    [
+                        (header::CONTENT_TYPE, MEDIA_TYPE.to_string()),
+                        (header::CONTENT_LENGTH, bytes.len().to_string()),
+                    ],
+                    Body::from(bytes),
+                )
+                    .into_response();
             }
-            Source::Blocking(producer) => {
-                // A duplex for the same reason as above.
-                let (sink, body) = tokio::io::duplex(buffer_size);
-                let sink = SyncIoBridge::new_with_handle(sink, tokio::runtime::Handle::current());
-                let handle = tokio::task::spawn_blocking(move || {
-                    producer(FlowFilesWriter::new(BlockingResponseSink { inner: sink }))
-                });
-                streamed(body, handle)
-            }
-        }
+            Source::Producer(producer) => Producer::Pending(producer),
+            Source::Blocking(producer) => Producer::PendingBlocking(producer),
+        };
+        // Only the one direction is used: the producer writes to `sink`, the
+        // body reads from `pipe`. What ends the body is the sink being
+        // dropped, which happens when the producer finishes. A simplex has
+        // no such signal.
+        let (sink, pipe) = tokio::io::duplex(buffer_size);
+        let body = ProducerBody {
+            pipe: ReaderStream::with_capacity(pipe, RESPONSE_CHUNK),
+            sink: Some(sink),
+            producer,
+            bytes: 0,
+            done: false,
+            #[cfg(feature = "tracing")]
+            span: tracing::debug_span!("flow_files_response"),
+        };
+        (
+            [(header::CONTENT_TYPE, MEDIA_TYPE.to_string())],
+            Body::from_stream(body),
+        )
+            .into_response()
     }
 }
 
-fn streamed(body: DuplexStream, producer: JoinHandle<Result<(), BoxError>>) -> Response {
-    let stream = ProducerStream {
-        inner: ReaderStream::new(body),
-        producer: Some(producer),
-    };
-    (
-        [(header::CONTENT_TYPE, MEDIA_TYPE.to_string())],
-        Body::from_stream(stream),
-    )
-        .into_response()
+/// Where the producer is in its life. It starts when the body is first
+/// polled, so that building a response commits nothing.
+enum Producer {
+    Pending(AsyncProducer),
+    Running(BoxFuture),
+    PendingBlocking(BlockingProducer),
+    RunningBlocking(JoinHandle<Result<(), BoxError>>),
+    Finished(Result<(), BoxError>),
 }
 
 /// The response body: serialized bytes as the producer writes them, followed
 /// by the producer's own outcome.
 ///
 /// Draining the pipe is not enough to call the response complete. A producer
-/// that failed after its last successful write must still poison the stream,
-/// so that the client sees a truncated body rather than a plausible one.
-struct ProducerStream {
-    inner: ReaderStream<DuplexStream>,
-    producer: Option<JoinHandle<Result<(), BoxError>>>,
+/// that failed after its last successful write must still poison the body, so
+/// that the client sees a truncated response rather than a plausible one.
+struct ProducerBody {
+    pipe: ReaderStream<DuplexStream>,
+    /// The producer's end of the pipe, until the producer is started and
+    /// takes it.
+    sink: Option<DuplexStream>,
+    producer: Producer,
+    bytes: u64,
+    done: bool,
+    #[cfg(feature = "tracing")]
+    span: tracing::Span,
 }
 
-impl Stream for ProducerStream {
+impl ProducerBody {
+    /// Start the producer if it has not been started, then drive it. Returns
+    /// `Pending` while it is still running.
+    fn poll_producer(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            match &mut self.producer {
+                Producer::Pending(_) => {
+                    let Producer::Pending(start) =
+                        std::mem::replace(&mut self.producer, Producer::Finished(Ok(())))
+                    else {
+                        unreachable!()
+                    };
+                    let writer = FlowFilesWriterAsync::new(self.take_sink());
+                    self.producer = Producer::Running(start(writer));
+                }
+                Producer::PendingBlocking(_) => {
+                    let Producer::PendingBlocking(start) =
+                        std::mem::replace(&mut self.producer, Producer::Finished(Ok(())))
+                    else {
+                        unreachable!()
+                    };
+                    let sink = SyncIoBridge::new_with_handle(
+                        self.take_sink(),
+                        tokio::runtime::Handle::current(),
+                    );
+                    let writer = FlowFilesWriter::new(sink);
+                    self.producer =
+                        Producer::RunningBlocking(tokio::task::spawn_blocking(move || {
+                            start(writer)
+                        }));
+                }
+                Producer::Running(future) => {
+                    let outcome = ready!(future.as_mut().poll(cx));
+                    self.producer = Producer::Finished(outcome);
+                }
+                Producer::RunningBlocking(handle) => {
+                    let outcome = match ready!(Pin::new(handle).poll(cx)) {
+                        Ok(outcome) => outcome,
+                        Err(join) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(error = %join, "blocking producer panicked");
+                            Err(join.into())
+                        }
+                    };
+                    self.producer = Producer::Finished(outcome);
+                }
+                Producer::Finished(_) => return Poll::Ready(()),
+            }
+        }
+    }
+
+    fn take_sink(&mut self) -> DuplexStream {
+        self.sink
+            .take()
+            .expect("the sink is taken once, when the producer starts")
+    }
+
+    /// The producer's outcome, once it has one.
+    fn outcome(&mut self) -> Option<Result<(), BoxError>> {
+        match std::mem::replace(&mut self.producer, Producer::Finished(Ok(()))) {
+            Producer::Finished(outcome) => Some(outcome),
+            other => {
+                self.producer = other;
+                None
+            }
+        }
+    }
+}
+
+impl Stream for ProducerBody {
     type Item = Result<Bytes, BoxError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let Some(producer) = this.producer.as_mut() else {
+        #[cfg(feature = "tracing")]
+        let _entered = this.span.clone().entered();
+        if this.done {
             return Poll::Ready(None);
-        };
-        match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
-            Some(Ok(chunk)) => Poll::Ready(Some(Ok(chunk))),
-            Some(Err(err)) => {
-                this.producer = None;
+        }
+        loop {
+            // Whatever the producer has written goes out first.
+            match Pin::new(&mut this.pipe).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.bytes += chunk.len() as u64;
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    this.done = true;
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(error = %err, "response body failed mid-stream");
+                    return Poll::Ready(Some(Err(err.into())));
+                }
+                // The sink is gone and the pipe is read dry. The producer is
+                // done, or has dropped its writer and is finishing up.
+                Poll::Ready(None) => break,
+                Poll::Pending => {}
+            }
+            // Nothing buffered. A finished producer has dropped its writer,
+            // which the pipe reports as its end, so reaching here finished
+            // means the writer was leaked: nothing more can come.
+            if matches!(this.producer, Producer::Finished(_)) {
+                break;
+            }
+            // Run the producer until it writes something or finishes, then
+            // go round again to read what it wrote.
+            ready!(this.poll_producer(cx));
+        }
+        // The pipe is dry. The outcome decides how the body ends.
+        ready!(this.poll_producer(cx));
+        this.done = true;
+        let outcome = this.outcome().expect("the producer has finished");
+        Poll::Ready(match outcome {
+            Ok(()) => {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(error = %err, "response body failed mid-stream");
-                Poll::Ready(Some(Err(err.into())))
+                tracing::debug!(
+                    bytes = this.bytes,
+                    "producer finished, response body complete"
+                );
+                None
             }
-            None => {
-                let outcome = ready!(Pin::new(producer).poll(cx));
-                this.producer = None;
-                Poll::Ready(match outcome {
-                    Ok(Ok(())) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("producer finished, response body complete");
-                        None
-                    }
-                    Ok(Err(err)) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(error = %err, "producer failed, truncating the body");
-                        Some(Err(err))
-                    }
-                    Err(join) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(error = %join, "producer panicked or was aborted");
-                        Some(Err(join.into()))
-                    }
-                })
+            Err(err) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(error = %err, bytes = this.bytes, "producer failed, truncating the body");
+                Some(Err(err))
             }
-        }
+        })
     }
 }
 
-impl Drop for ProducerStream {
+impl Drop for ProducerBody {
     fn drop(&mut self) {
-        // Covers a producer that is computing rather than writing; one that
-        // is writing notices on its own when the read half goes away.
-        if let Some(producer) = &self.producer {
-            producer.abort();
+        match &self.producer {
+            Producer::Finished(_) if self.done => {}
+            Producer::RunningBlocking(handle) => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    bytes = self.bytes,
+                    "response body dropped; the blocking producer stops at its next write"
+                );
+                handle.abort();
+            }
+            _ => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    bytes = self.bytes,
+                    "response body dropped before it completed"
+                );
+            }
         }
-    }
-}
-
-/// The [`AsyncWrite`] a [`FlowFilesResponse`] producer writes into.
-pub struct ResponseSink {
-    inner: DuplexStream,
-}
-
-impl std::fmt::Debug for ResponseSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResponseSink").finish_non_exhaustive()
-    }
-}
-
-impl AsyncWrite for ResponseSink {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// The [`Write`] a [`FlowFilesResponse::blocking`] producer writes into.
-pub struct BlockingResponseSink {
-    inner: SyncIoBridge<DuplexStream>,
-}
-
-impl std::fmt::Debug for BlockingResponseSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockingResponseSink")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Write for BlockingResponseSink {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
     }
 }

@@ -1,4 +1,5 @@
-//! Encoding primitives for the FlowFile V3 binary format.
+//! The FlowFile V3 wire format: encoding a header, and decoding one a few
+//! bytes at a time.
 //!
 //! The layout matches NiFi's `FlowFilePackagerV3`:
 //!
@@ -21,39 +22,294 @@
 
 use std::collections::HashMap;
 
+use crate::{Error, Result};
+
 pub(crate) const MAGIC: [u8; 7] = *b"NiFiFF3";
-pub(crate) const MAX_VALUE_2_BYTES: usize = 0xFFFF;
+
+/// The two-byte field length that announces a four-byte one.
+const EXTENDED_LEN: u16 = 0xFFFF;
+
+/// How much to reserve for a declared length before any of it has arrived to
+/// justify the allocation.
+///
+/// Nothing in this crate sizes a buffer from a declared length alone. A
+/// corrupt header can claim four gigabytes over a four-byte input, and
+/// allocating for the claim would abort the process on garbage. So the first
+/// reservation is capped here, and every one after it is capped by how much
+/// has already arrived. Bytes that have arrived are the part a header cannot
+/// fake. Anything at or under this size is allocated once, at exactly its
+/// size, and that covers every ordinary attribute and most content.
+pub(crate) const RESERVE_AHEAD: usize = 64 * 1024;
+
+/// How large the next reservation may be, given how much has arrived and how
+/// much is still to come.
+pub(crate) fn reserve_step(done: usize, left: usize) -> usize {
+    left.min(done.max(RESERVE_AHEAD))
+}
+
+/// A decoded header: everything that precedes the content.
+#[derive(Debug)]
+pub(crate) struct Header {
+    pub(crate) attributes: HashMap<String, String>,
+    pub(crate) size: u64,
+}
+
+/// Which of the two strings of an attribute is being decoded.
+#[derive(Clone, Copy, Debug)]
+enum Part {
+    Key,
+    Value,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Stage {
+    Magic,
+    Count,
+    CountExt,
+    Len(Part),
+    LenExt(Part),
+    Bytes(Part),
+    Size,
+    Done,
+}
+
+/// Decodes a header incrementally, so one decoder serves readers of every
+/// kind: a byte slice, a `std::io::Read` and a `tokio::io::AsyncRead`.
+///
+/// The protocol is a loop of two calls. [`next_read`](Self::next_read) hands
+/// out a buffer that the driver fills completely, from wherever its bytes come
+/// from, and [`advance`](Self::advance) decodes what was filled. The buffers
+/// are exactly as large as the next piece of the header, so the driver never
+/// reads past the header into the content. Attribute bytes are handed out in
+/// chunks bounded by [`RESERVE_AHEAD`] and by what has already arrived, so a
+/// corrupt length costs an allocation proportional to real input, never to
+/// the claim.
+pub(crate) struct HeaderDecoder {
+    stage: Stage,
+    attributes: HashMap<String, String>,
+    /// Attribute pairs still to decode, counting the one in progress.
+    remaining: usize,
+    /// The key of the pair in progress, once decoded.
+    key: Option<String>,
+    /// The bytes of the string in progress, as far as they have arrived.
+    field: Vec<u8>,
+    /// The declared length of the string in progress.
+    field_len: usize,
+    /// Room for the fixed-size pieces: magic, lengths and the content size.
+    scratch: [u8; 8],
+    /// Whether any byte at all has been decoded. A stream that ends before
+    /// the first one ended cleanly, on a flow file boundary.
+    started: bool,
+}
+
+impl HeaderDecoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            stage: Stage::Magic,
+            attributes: HashMap::new(),
+            remaining: 0,
+            key: None,
+            field: Vec::new(),
+            field_len: 0,
+            scratch: [0; 8],
+            started: false,
+        }
+    }
+
+    /// Whether any byte has been decoded yet.
+    pub(crate) fn started(&self) -> bool {
+        self.started
+    }
+
+    /// What the next read is for, in words, for an error that says where the
+    /// input ended.
+    pub(crate) fn expecting(&self) -> &'static str {
+        match self.stage {
+            Stage::Magic => "the magic header",
+            Stage::Count | Stage::CountExt => "the attribute count",
+            Stage::Len(Part::Key) | Stage::LenExt(Part::Key) => "an attribute key length",
+            Stage::Len(Part::Value) | Stage::LenExt(Part::Value) => "an attribute value length",
+            Stage::Bytes(Part::Key) => "an attribute key",
+            Stage::Bytes(Part::Value) => "an attribute value",
+            Stage::Size => "the content size",
+            Stage::Done => "nothing",
+        }
+    }
+
+    /// The buffer to fill next. It is empty once the header is complete.
+    ///
+    /// Fill all of it, then call [`advance`](Self::advance). Calling this
+    /// twice without an `advance` in between hands out a second buffer for the
+    /// same piece, so do not.
+    pub(crate) fn next_read(&mut self) -> &mut [u8] {
+        match self.stage {
+            Stage::Magic => &mut self.scratch[..MAGIC.len()],
+            Stage::Count | Stage::Len(_) => &mut self.scratch[..2],
+            Stage::CountExt | Stage::LenExt(_) => &mut self.scratch[..4],
+            Stage::Bytes(_) => {
+                let have = self.field.len();
+                let step = reserve_step(have, self.field_len - have);
+                self.field.reserve_exact(step);
+                self.field.resize(have + step, 0);
+                &mut self.field[have..]
+            }
+            Stage::Size => &mut self.scratch[..8],
+            Stage::Done => &mut self.scratch[..0],
+        }
+    }
+
+    /// Decode the buffer the last [`next_read`](Self::next_read) handed out.
+    /// Returns the header once the last piece of it has been decoded.
+    pub(crate) fn advance(&mut self) -> Result<Option<Header>> {
+        self.started = true;
+        match self.stage {
+            Stage::Magic => {
+                let mut magic = [0u8; 7];
+                magic.copy_from_slice(&self.scratch[..7]);
+                if magic != MAGIC {
+                    return Err(Error::InvalidMagic(magic));
+                }
+                self.stage = Stage::Count;
+            }
+            Stage::Count => match self.short() {
+                EXTENDED_LEN => self.stage = Stage::CountExt,
+                count => self.start_attributes(count as usize),
+            },
+            Stage::CountExt => self.start_attributes(self.long()),
+            Stage::Len(part) => match self.short() {
+                EXTENDED_LEN => self.stage = Stage::LenExt(part),
+                len => self.start_field(part, len as usize)?,
+            },
+            Stage::LenExt(part) => self.start_field(part, self.long())?,
+            Stage::Bytes(part) => {
+                if self.field.len() == self.field_len {
+                    self.finish_field(part)?;
+                }
+            }
+            Stage::Size => {
+                let size = u64::from_be_bytes(self.scratch);
+                self.stage = Stage::Done;
+                return Ok(Some(Header {
+                    attributes: std::mem::take(&mut self.attributes),
+                    size,
+                }));
+            }
+            Stage::Done => {}
+        }
+        Ok(None)
+    }
+
+    fn short(&self) -> u16 {
+        u16::from_be_bytes([self.scratch[0], self.scratch[1]])
+    }
+
+    fn long(&self) -> usize {
+        // `u32` always fits a `usize` on the targets this crate supports.
+        u32::from_be_bytes([
+            self.scratch[0],
+            self.scratch[1],
+            self.scratch[2],
+            self.scratch[3],
+        ]) as usize
+    }
+
+    fn start_attributes(&mut self, count: usize) {
+        // Sized from the claim only up to a point. Past it the map grows as
+        // attributes actually arrive.
+        self.attributes = HashMap::with_capacity(count.min(1024));
+        self.remaining = count;
+        self.stage = if count == 0 {
+            Stage::Size
+        } else {
+            Stage::Len(Part::Key)
+        };
+    }
+
+    fn start_field(&mut self, part: Part, len: usize) -> Result<()> {
+        self.field = Vec::new();
+        self.field_len = len;
+        if len == 0 {
+            self.finish_field(part)
+        } else {
+            self.stage = Stage::Bytes(part);
+            Ok(())
+        }
+    }
+
+    fn finish_field(&mut self, part: Part) -> Result<()> {
+        let text =
+            String::from_utf8(std::mem::take(&mut self.field)).map_err(Error::InvalidAttribute)?;
+        match part {
+            Part::Key => {
+                self.key = Some(text);
+                self.stage = Stage::Len(Part::Value);
+            }
+            Part::Value => {
+                let key = self.key.take().expect("a value follows its key");
+                self.attributes.insert(key, text);
+                self.remaining -= 1;
+                self.stage = if self.remaining == 0 {
+                    Stage::Size
+                } else {
+                    Stage::Len(Part::Key)
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Decode a header from the front of `bytes`, returning it and how many bytes
+/// it occupied.
+pub(crate) fn decode_header(bytes: &[u8]) -> Result<(Header, usize)> {
+    let mut decoder = HeaderDecoder::new();
+    let mut rest = bytes;
+    loop {
+        let chunk = decoder.next_read();
+        if rest.len() < chunk.len() {
+            return Err(Error::TruncatedHeader {
+                needed: chunk.len() - rest.len(),
+                expecting: decoder.expecting(),
+            });
+        }
+        let (now, later) = rest.split_at(chunk.len());
+        chunk.copy_from_slice(now);
+        rest = later;
+        if let Some(header) = decoder.advance()? {
+            return Ok((header, bytes.len() - rest.len()));
+        }
+    }
+}
 
 pub(crate) fn write_field_len(buf: &mut Vec<u8>, len: usize) {
     if let Ok(short) = u16::try_from(len)
-        && len < MAX_VALUE_2_BYTES
+        && short < EXTENDED_LEN
     {
         buf.extend_from_slice(&short.to_be_bytes());
     } else {
         let len = u32::try_from(len).expect("field length exceeds u32::MAX");
-        buf.extend_from_slice(&[0xFF, 0xFF]);
+        buf.extend_from_slice(&EXTENDED_LEN.to_be_bytes());
         buf.extend_from_slice(&len.to_be_bytes());
     }
 }
 
-pub(crate) fn write_string(buf: &mut Vec<u8>, value: &str) {
+fn write_string(buf: &mut Vec<u8>, value: &str) {
     write_field_len(buf, value.len());
     buf.extend_from_slice(value.as_bytes());
 }
 
-/// How many bytes [`write_field_len`] writes for `len`. That is two bytes, or
-/// six in the extended form.
+/// How many bytes [`write_field_len`] writes for `len`: two, or six in the
+/// extended form.
 const fn field_len_bytes(len: usize) -> usize {
-    if len < MAX_VALUE_2_BYTES { 2 } else { 6 }
+    if len < EXTENDED_LEN as usize { 2 } else { 6 }
 }
 
 /// The exact number of bytes [`encode_header`] will produce.
 ///
-/// This costs one pass over the attributes doing arithmetic, and the pass pays
-/// for itself. A header buffer and a whole serialized flow file can both be
-/// allocated once at the right size, rather than grown into. It is also the
-/// answer [`FlowFile::serialized_len`](crate::FlowFile::serialized_len) gives,
-/// so it lives here rather than being written out again at each site.
+/// One pass of arithmetic over the attributes, which pays for itself: a header
+/// buffer and a whole serialized flow file can both be allocated once at the
+/// right size. It is also what
+/// [`FlowFile::serialized_len`](crate::FlowFile::serialized_len) reports.
 pub(crate) fn header_len(attributes: &HashMap<String, String>) -> usize {
     let fields: usize = attributes
         .iter()
@@ -65,9 +321,6 @@ pub(crate) fn header_len(attributes: &HashMap<String, String>) -> usize {
 }
 
 /// Serialize the header, meaning everything before the content bytes.
-///
-/// Attributes are written in sorted key order, so the output is
-/// deterministic. NiFi itself accepts any order.
 pub(crate) fn encode_header(attributes: &HashMap<String, String>, size: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(header_len(attributes));
     encode_header_into(&mut buf, attributes, size);
@@ -76,9 +329,8 @@ pub(crate) fn encode_header(attributes: &HashMap<String, String>, size: u64) -> 
 
 /// Serialize the header into a buffer the caller has already sized.
 ///
-/// Use this to serialize a whole flow file into one allocation. The header and
-/// the content go into the same buffer, so the header does not need a buffer
-/// of its own and a copy out of it.
+/// Attributes are written in sorted key order, so the output is
+/// deterministic. NiFi itself accepts any order.
 pub(crate) fn encode_header_into(
     buf: &mut Vec<u8>,
     attributes: &HashMap<String, String>,
@@ -86,13 +338,9 @@ pub(crate) fn encode_header_into(
 ) {
     buf.extend_from_slice(&MAGIC);
     write_field_len(buf, attributes.len());
-    // Taken as pairs rather than as keys to look up again. Sorting borrowed
-    // entries costs one small allocation. Sorting the keys and indexing the
-    // map costs a hash and a probe per attribute, and on a header with many
-    // attributes that is most of the work of writing one. The sort is
-    // `sort_unstable` because map keys are distinct, so there are no equal
-    // elements whose order stability could preserve. It also needs no scratch
-    // buffer of its own, where `sort` does.
+    // Sorted as borrowed pairs rather than as keys looked up again: one small
+    // allocation instead of a hash and a probe per attribute. Keys are
+    // distinct, so the unstable sort has no equal elements to reorder.
     let mut entries: Vec<(&str, &str)> = attributes
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -160,8 +408,8 @@ mod tests {
     }
 
     /// A header with enough attributes to cross the two-byte boundary on the
-    /// attribute count as well. That is a different branch of the same
-    /// arithmetic from the one the case above covers.
+    /// attribute count as well, which is a different branch of the same
+    /// arithmetic.
     #[test]
     fn the_predicted_length_holds_across_the_count_boundary() {
         for count in [0xFFFE, 0xFFFF, 0x1_0000] {
@@ -184,5 +432,134 @@ mod tests {
         expected.extend_from_slice(b"x");
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 5]);
         assert_eq!(header, expected);
+    }
+
+    /// Whatever the encoder writes, the decoder reads back, including the
+    /// extended lengths and an empty value.
+    #[test]
+    fn the_decoder_undoes_the_encoder() {
+        let attributes: HashMap<String, String> = [
+            ("k".to_string(), "v".to_string()),
+            ("empty".to_string(), String::new()),
+            ("long".to_string(), "x".repeat(0x1_0000)),
+            ("é→🙂".to_string(), "🙂".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut bytes = encode_header(&attributes, 1234);
+        bytes.extend_from_slice(b"content follows");
+
+        let (header, consumed) = decode_header(&bytes).unwrap();
+        assert_eq!(header.attributes, attributes);
+        assert_eq!(header.size, 1234);
+        assert_eq!(&bytes[consumed..], b"content follows");
+    }
+
+    /// The decoder is incremental, so feeding it one byte at a time through a
+    /// reader must give the same answer as feeding it the slice.
+    #[test]
+    fn the_decoder_is_the_same_byte_by_byte() {
+        let attributes: HashMap<String, String> = (0..40)
+            .map(|i| (format!("key-{i}"), "value".repeat(i)))
+            .collect();
+        let bytes = encode_header(&attributes, 7);
+
+        let mut decoder = HeaderDecoder::new();
+        let mut source = bytes.iter().copied();
+        let header = loop {
+            let chunk = decoder.next_read();
+            for slot in chunk.iter_mut() {
+                *slot = source.next().expect("the header is complete");
+            }
+            if let Some(header) = decoder.advance().unwrap() {
+                break header;
+            }
+        };
+        assert_eq!(header.attributes, attributes);
+        assert_eq!(header.size, 7);
+        assert!(source.next().is_none(), "nothing read past the header");
+    }
+
+    /// Each place the input can end is named, so the error says what was
+    /// missing rather than just that something was.
+    #[test]
+    fn a_truncated_header_says_what_was_expected() {
+        let attributes = HashMap::from([("key".to_string(), "value".to_string())]);
+        let bytes = encode_header(&attributes, 5);
+
+        let expectations = [
+            (3, "the magic header"),
+            (8, "the attribute count"),
+            (10, "an attribute key length"),
+            (12, "an attribute key"),
+            (15, "an attribute value length"),
+            (18, "an attribute value"),
+            (25, "the content size"),
+        ];
+        for (cut, expecting) in expectations {
+            match decode_header(&bytes[..cut]) {
+                Err(Error::TruncatedHeader { expecting: got, .. }) => {
+                    assert_eq!(got, expecting, "cut at {cut}");
+                }
+                other => panic!("cut at {cut}: {other:?}"),
+            }
+        }
+        assert!(decode_header(&bytes).is_ok());
+    }
+
+    /// A length the input never backs with bytes must not be allocated for.
+    #[test]
+    fn a_huge_declared_length_costs_no_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
+        bytes.extend_from_slice(&[0xFF, 0xFF]); // extended key length
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(b"tiny");
+
+        let mut decoder = HeaderDecoder::new();
+        let mut rest = bytes.as_slice();
+        let mut largest = 0;
+        let err = loop {
+            let chunk = decoder.next_read();
+            largest = largest.max(chunk.len());
+            if rest.len() < chunk.len() {
+                break Error::TruncatedHeader {
+                    needed: chunk.len() - rest.len(),
+                    expecting: decoder.expecting(),
+                };
+            }
+            let (now, later) = rest.split_at(chunk.len());
+            chunk.copy_from_slice(now);
+            rest = later;
+            if let Err(err) = decoder.advance() {
+                break err;
+            }
+        };
+        assert!(matches!(err, Error::TruncatedHeader { .. }), "{err:?}");
+        assert!(
+            largest <= RESERVE_AHEAD,
+            "asked for {largest} bytes at once"
+        );
+    }
+
+    #[test]
+    fn bad_magic_is_rejected_before_anything_else() {
+        assert!(matches!(
+            decode_header(b"NOT-FF3 and then a lot more bytes"),
+            Err(Error::InvalidMagic(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_in_an_attribute_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x00, 0x02, 0xFF, 0xFE]);
+        bytes.extend_from_slice(&[0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            decode_header(&bytes),
+            Err(Error::InvalidAttribute(_))
+        ));
     }
 }

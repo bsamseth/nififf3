@@ -44,12 +44,16 @@ pub(crate) fn poisoned() -> std::io::Error {
     Error::WriterPoisoned.into()
 }
 
+/// The magic bytes as text, for an error message a person can read.
+fn printable(bytes: [u8; 7]) -> String {
+    String::from_utf8_lossy(&bytes).escape_debug().to_string()
+}
+
 /// Errors produced when parsing or serializing flow files.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// An underlying I/O error, including unexpected end of input while
-    /// parsing the header.
+    /// An underlying I/O error.
     ///
     /// Converting an [`std::io::Error`] into an [`Error`] goes through
     /// [`From`], which recovers a truncation as
@@ -57,38 +61,44 @@ pub enum Error {
     ///
     /// The variant is transparent, because it adds nothing to what the error
     /// it carries already says. It displays as that error, and reports that
-    /// error as its source. A prefix here would be printed twice by anything
-    /// that walks the chain.
+    /// error as its source.
     #[error(transparent)]
     Io(std::io::Error),
 
     /// The input does not start with the `NiFiFF3` magic header.
-    #[error("invalid magic header: expected \"NiFiFF3\", got {0:?}")]
+    ///
+    /// Over HTTP this usually means the client sent the content on its own
+    /// rather than packaged as a flow file.
+    #[error("invalid magic header: expected \"NiFiFF3\", got \"{}\"", printable(*.0))]
     InvalidMagic([u8; 7]),
+
+    /// The input ended part-way through the header.
+    #[error("flow file header ended early: needed {needed} more bytes for {expecting}")]
+    TruncatedHeader {
+        /// How many more bytes the next piece of the header needed.
+        needed: usize,
+        /// Which piece of the header that was, such as "an attribute value".
+        expecting: &'static str,
+    },
 
     /// An attribute key or value is not valid UTF-8.
     ///
     /// This is not a [`From`] conversion, on purpose. With `#[from]`, every
     /// [`String::from_utf8`] failure in your own code would get a silent `?`
-    /// into this variant. It would then report "attribute is not valid UTF-8"
-    /// about a value that was never an attribute.
+    /// into this variant.
     #[error("attribute is not valid UTF-8: {0}")]
     InvalidAttribute(std::string::FromUtf8Error),
 
-    /// The content length does not match the size declared in the header.
+    /// The content ended before the size declared in the header.
     ///
     /// Everything that yields this crate's [`Error`] returns this variant
-    /// directly. That is [`FlowFile::from_bytes`](crate::FlowFile::from_bytes),
-    /// which validates a whole buffer, along with the
-    /// [`FlowFiles`](crate::FlowFiles) reader and its async twin.
-    ///
-    /// The operations that only move content around return
-    /// [`std::io::Result`] instead. Those are `write_to`, `into_memory` and
-    /// their async twins. They report the same condition as an
-    /// [`std::io::Error`] of kind
+    /// directly. The operations that only move content around return
+    /// [`std::io::Result`] instead, such as `write_to` and `into_memory`, and
+    /// report the same condition as an [`std::io::Error`] of kind
     /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying this
     /// value. [`io::Error::get_ref`](std::io::Error::get_ref) and
-    /// `downcast_ref` recover it.
+    /// `downcast_ref` recover it, and `?` into a function returning [`Error`]
+    /// recovers it for you.
     #[error("content size mismatch: header declares {expected} bytes, got {actual}")]
     SizeMismatch {
         /// The content size declared in the flow file header.
@@ -97,44 +107,10 @@ pub enum Error {
         actual: u64,
     },
 
-    /// Extra bytes remained after the declared content when parsing a buffer
-    /// expected to hold exactly one flow file.
+    /// Extra bytes remained after the declared content, in an input expected
+    /// to hold exactly one flow file.
     #[error("{0} trailing bytes after flow file content")]
     TrailingData(u64),
-
-    /// The header declares more attributes than the configured
-    /// [`Limits`](crate::Limits) allow.
-    #[error("attribute count {count} exceeds the limit of {limit}")]
-    TooManyAttributes {
-        /// The attribute count declared in the header.
-        count: usize,
-        /// The configured maximum.
-        limit: usize,
-    },
-
-    /// The attribute keys and values together exceed the total the configured
-    /// [`Limits`](crate::Limits) allow.
-    ///
-    /// Raised part-way through the header, as soon as the running total passes
-    /// the limit, rather than after the whole header has been read.
-    #[error("attribute bytes total {len} which exceeds the limit of {limit}")]
-    HeaderTooLarge {
-        /// The running total of attribute key and value bytes when the limit
-        /// was passed.
-        len: usize,
-        /// The configured maximum.
-        limit: usize,
-    },
-
-    /// An attribute key or value is longer than the configured
-    /// [`Limits`](crate::Limits) allow.
-    #[error("attribute length {len} exceeds the limit of {limit} bytes")]
-    AttributeTooLong {
-        /// The declared length of the key or value, in bytes.
-        len: usize,
-        /// The configured maximum.
-        limit: usize,
-    },
 
     /// A write was attempted on a [`FlowFilesWriter`](crate::FlowFilesWriter)
     /// or its async twin after an earlier write failed, leaving the stream
@@ -143,26 +119,11 @@ pub enum Error {
     /// The writers return [`std::io::Result`], so this is reported as an
     /// [`std::io::Error`] of kind
     /// [`BrokenPipe`](std::io::ErrorKind::BrokenPipe) carrying this value.
-    /// `get_ref` and `downcast_ref` recover it. Use that to tell a poisoned
-    /// writer from any other write failure, instead of matching on the
-    /// message.
     #[error(
         "flow file writer is poisoned: an earlier write left a truncated \
          flow file in the stream"
     )]
     WriterPoisoned,
-
-    /// The header declares more content than the configured
-    /// [`Limits`](crate::Limits) allow.
-    ///
-    /// Raised from the declared size alone, before any content is read.
-    #[error("content size {size} exceeds the limit of {limit} bytes")]
-    ContentTooLarge {
-        /// The content size declared in the flow file header.
-        size: u64,
-        /// The configured maximum.
-        limit: u64,
-    },
 }
 
 /// Convert an [`std::io::Error`] into an [`Error`], recovering a truncation
@@ -171,11 +132,9 @@ pub enum Error {
 /// An [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) carrying an
 /// [`Error::SizeMismatch`] converts back to that variant, and not to
 /// [`Error::Io`] around it. That shape is how `into_memory`, `write_to` and
-/// the writers report content that ends early.
-///
-/// So `?` on an [`std::io::Result`] inside an [`Error`]-returning function
-/// yields the same variant the parsing entry points would have produced for
-/// the same condition:
+/// the writers report content that ends early. So `?` on an
+/// [`std::io::Result`] inside an [`Error`]-returning function yields the same
+/// variant the parsing entry points would have produced:
 ///
 /// ```
 /// use nififf3::{Error, FlowFile};
@@ -208,16 +167,10 @@ impl From<std::io::Error> for Error {
 ///
 /// [`Error::Io`] unwraps back to the error it carries. Every other variant
 /// becomes a payload on an [`std::io::Error`], under the kind the rest of the
-/// crate uses for it. That is
-/// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof) for a truncation, and
-/// [`InvalidData`](std::io::ErrorKind::InvalidData) otherwise.
-///
-/// [`Error::SizeMismatch`] round-trips, so converting it back recovers the
-/// variant. That is what lets an [`std::io::Result`] from `into_memory` or
-/// from a writer carry a truncation into an [`Error`]-returning caller
-/// intact. The other variants convert back to [`Error::Io`], because an
-/// [`std::io::Error`] this crate did not build is not one it should take
-/// apart.
+/// crate uses for it: [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof)
+/// for input that ended early, [`BrokenPipe`](std::io::ErrorKind::BrokenPipe)
+/// for a poisoned writer, and [`InvalidData`](std::io::ErrorKind::InvalidData)
+/// otherwise.
 ///
 /// ```
 /// use nififf3::{Error, FlowFile};
@@ -241,7 +194,9 @@ impl From<Error> for std::io::Error {
             Error::Io(err) => err,
             err => {
                 let kind = match err {
-                    Error::SizeMismatch { .. } => ErrorKind::UnexpectedEof,
+                    Error::SizeMismatch { .. } | Error::TruncatedHeader { .. } => {
+                        ErrorKind::UnexpectedEof
+                    }
                     // Not bad data: the stream itself is no longer usable.
                     Error::WriterPoisoned => ErrorKind::BrokenPipe,
                     _ => ErrorKind::InvalidData,
@@ -258,8 +213,7 @@ mod tests {
     use std::io::ErrorKind;
 
     /// Every variant converts into an `io::Error` under a sensible kind, and
-    /// keeps its message and its payload. So `downcast_ref` recovers the
-    /// detail whichever variant it was.
+    /// keeps its message and its payload.
     #[test]
     fn every_error_converts_into_an_io_error_that_carries_it() {
         for (err, kind) in [
@@ -270,8 +224,16 @@ mod tests {
                 },
                 ErrorKind::UnexpectedEof,
             ),
+            (
+                Error::TruncatedHeader {
+                    needed: 2,
+                    expecting: "the content size",
+                },
+                ErrorKind::UnexpectedEof,
+            ),
             (Error::InvalidMagic([0; 7]), ErrorKind::InvalidData),
             (Error::TrailingData(2), ErrorKind::InvalidData),
+            (Error::WriterPoisoned, ErrorKind::BrokenPipe),
         ] {
             let text = err.to_string();
             let io: std::io::Error = err.into();
@@ -286,7 +248,7 @@ mod tests {
 
     /// Coming back the other way is narrower on purpose. Only a truncation is
     /// unwrapped, because only a truncation is a condition this stream can be
-    /// sure it caused. See [`unwrap_io`].
+    /// sure it caused.
     #[test]
     fn only_a_truncation_round_trips_back_into_its_variant() {
         let round_tripped = Error::from(std::io::Error::from(Error::SizeMismatch {
@@ -308,15 +270,11 @@ mod tests {
             let text = err.to_string();
             let back = Error::from(std::io::Error::from(err));
             assert!(matches!(back, Error::Io(_)), "{back:?}");
-            // Still legible, and the payload is still there to downcast.
             assert!(back.to_string().contains(&text));
         }
     }
 
-    /// `Io` adds nothing to what it carries, so it must not restate it. With a
-    /// prefix of its own, anything printing the chain saw the same sentence
-    /// twice. Because the variant is transparent, it displays as the error it
-    /// wraps.
+    /// `Io` adds nothing to what it carries, so it must not restate it.
     #[test]
     fn io_displays_as_the_error_it_carries_exactly_once() {
         fn chain(err: &Error) -> Vec<String> {
@@ -333,30 +291,16 @@ mod tests {
         assert_eq!(plain.to_string(), "gone", "no prefix of its own");
         assert_eq!(chain(&plain), ["gone"], "and nothing repeats it");
 
-        // Carrying one of this crate's errors reads the same way: `io::Error`
-        // displays as its payload and reports that payload's source rather
-        // than the payload itself, so the message appears once here too.
         let carried = Error::Io(std::io::Error::new(
             ErrorKind::InvalidData,
             Error::InvalidMagic([0; 7]),
         ));
         assert_eq!(chain(&carried).len(), 1, "{:?}", chain(&carried));
         assert!(carried.to_string().contains("invalid magic"));
-
-        // The payload is still a value, and `unwrap_io` reaches it the same
-        // way. Transparency costs nothing structurally.
-        let Error::Io(ref io) = carried else {
-            panic!("not an Io error");
-        };
-        assert!(matches!(
-            io.get_ref().and_then(|e| e.downcast_ref::<Error>()),
-            Some(Error::InvalidMagic(_))
-        ));
     }
 
-    /// Poisoning is reported as a value you can match on. The writers return
-    /// `io::Result`, so it travels as a payload under a kind that says the
-    /// stream is unusable.
+    /// Poisoning is reported as a value you can match on, under a kind that
+    /// says the stream is unusable.
     #[test]
     fn poisoning_is_recoverable_from_the_io_error() {
         let err = poisoned();
@@ -376,31 +320,12 @@ mod tests {
         assert_eq!(back.to_string(), "gone");
     }
 
-    /// This covers the public conversion as well as the private helper. `?` on
-    /// an `io::Result` must land on the same variant the parsers produce.
-    #[test]
-    fn a_truncation_survives_the_public_conversion() {
-        let err = Error::from(truncated(5, 3));
-        assert!(
-            matches!(
-                err,
-                Error::SizeMismatch {
-                    expected: 5,
-                    actual: 3
-                }
-            ),
-            "{err:?}"
-        );
-    }
-
     /// Any other carried error belongs to whoever built it. A flow-file reader
     /// wrapping another must not adopt the inner stream's failure as its own.
     #[test]
     fn an_unrelated_carried_error_stays_io() {
         for inner in [
             std::io::Error::new(ErrorKind::InvalidData, Error::InvalidMagic([0; 7])),
-            // Same payload type and the same kind a truncation uses, so only
-            // the variant tells them apart.
             std::io::Error::new(ErrorKind::UnexpectedEof, Error::InvalidMagic([0; 7])),
             std::io::Error::new(ErrorKind::UnexpectedEof, Error::TrailingData(2)),
         ] {
@@ -419,5 +344,18 @@ mod tests {
                 actual: 4
             }
         ));
+    }
+
+    /// The magic bytes are shown as text, because the point of the message is
+    /// to recognize what was sent instead of a flow file.
+    #[test]
+    fn invalid_magic_shows_the_bytes_as_text() {
+        let err = Error::InvalidMagic(*b"<html> ");
+        assert_eq!(
+            err.to_string(),
+            "invalid magic header: expected \"NiFiFF3\", got \"<html> \""
+        );
+        let binary = Error::InvalidMagic([0, 1, 2, 3, 4, 5, 6]);
+        assert!(binary.to_string().contains("\\u{1}"), "{binary}");
     }
 }

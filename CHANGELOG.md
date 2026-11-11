@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.4.0
+
+A rebuild of the parts of the crate that touch a network. The axum extractor
+now reads the whole request before the handler runs, into memory or to disk by
+size, so a handler can no longer deadlock against a client that sends before
+it reads, which is what NiFi's does. The `Limits` machinery is gone, since the
+clients this crate serves are the data engineer's own. Almost every public
+item is touched; the sections below say how.
+
+### Changed
+
+- The axum extractor is `FlowFile<Spool>`, and `Spool` extracts a whole body.
+  Both read the request in full before the handler runs, into memory up to a
+  threshold and into an anonymous temporary file above it. `FlowFileRequest`,
+  `StrictFlowFileRequest`, `FlowFilesRequest`, `StrictFlowFilesRequest` and
+  `StrictRejection` are gone. There is no content-type check: a body that is
+  not a flow file is rejected on its first seven bytes, and the rejection names
+  the `Content-Type` the client sent.
+- The extractors reject with a new `Rejection` type instead of `Error`. It
+  answers `400` for a body that is not exactly one flow file, `413` for one
+  past axum's `DefaultBodyLimit`, and `500` when the server could not spool
+  to disk. `Error` still implements `IntoResponse`, for handlers that return
+  it.
+- `FlowFile::spool_async` and the `SpooledContent` it produced are replaced by
+  `Spool`, a plain value with no task behind it. `spool_async` now reads the
+  content in full and returns a `FlowFile<Spool>`. `FlowFileBuilder::
+  tempfile_async` is replaced by `FlowFileBuilder::spool_async`, which goes to
+  memory or to disk by size. `SpoolConfig` sets the threshold and the
+  directory, and an `Extension(SpoolConfig)` on the router applies it to the
+  extractors.
+- `FlowFilesResponse` no longer spawns a task. The response body polls the
+  producer in place, so it runs exactly as far as the client reads, and
+  dropping the body drops the producer at its next `await`. A blocking
+  producer starts on a blocking thread when the body is first polled, not when
+  the response is built. `ResponseSink` and `BlockingResponseSink` are
+  replaced by the `ResponseWriter` and `BlockingResponseWriter` aliases over
+  `tokio::io::DuplexStream`.
+- `FlowFile::parse` and `parse_next` return a `FlowFile<Content<R>>` rather
+  than a `FlowFile<io::Take<R>>`. `Content` is limited to the declared size
+  like `Take`, and unlike `Take` it reports a stream that ends early as an
+  `UnexpectedEof` carrying `Error::SizeMismatch`, so a decoder reading it
+  fails at the truncation instead of treating it as the end of the data.
+  `StreamedContent` and its async twin do the same.
+- The axum feature implies `tempfile`, because the extractors spool.
+- Response bodies stream in 64 KiB chunks rather than 4 KiB, and spooled files
+  are read and written through 128 KiB buffers, so a large flow file costs far
+  fewer trips to the blocking pool.
+
+### Removed
+
+- `Limits`, every `*_with_limits` function, `FlowFiles::with_limits` and its
+  siblings, and the error variants `TooManyAttributes`, `AttributeTooLong`,
+  `HeaderTooLarge` and `ContentTooLarge`. The crate serves trusted clients, and
+  the limits existed for hostile ones. Corrupt input is still safe: no buffer
+  is ever sized from a declared length, so a header claiming four gigabytes
+  over four bytes of input costs an allocation proportional to the four bytes.
+- The CLI's `--max-*` flags.
+
+### Added
+
+- `Error::TruncatedHeader`, for input that ends inside the header. It says
+  which piece was missing, such as "an attribute value", where the old
+  `Error::Io(UnexpectedEof)` said only that something was.
+- `Error::InvalidMagic` displays the bytes as text, so a client that sent its
+  raw content instead of a flow file can be recognized from the message.
+- `Spool::as_bytes`, `into_bytes`, `rewind` and `AsyncSeek`, so a spooled
+  content can be read twice, or fed to a decoder that seeks.
+- `tests/nifi_client.rs`, which drives the crate over a real socket with a
+  client that writes its whole request before reading: it pins the stall for
+  a handler that streams from the socket, shows the extractor completing
+  against the same client, and runs 32 concurrent uploads at once.
+
+### Fixed
+
+- One incremental header decoder now serves the slice, sync and async parsers,
+  where three copies of the parsing logic used to.
+- The extractor reads any bytes after the one flow file it was asked for and
+  rejects the request as `TrailingData`, where it used to parse the first flow
+  file of a batch and silently drop the rest. Reading them also leaves the
+  connection drained, which a client that sends before it reads depends on.
+
 ## 0.3.7
 
 This release adds tracing. Under a `tracing` feature, on by default, the crate

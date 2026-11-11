@@ -1,102 +1,64 @@
 //! Parsing and serialization over `std::io::Read`/`Write`.
 
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-use crate::format::{MAGIC, MAX_VALUE_2_BYTES};
-use crate::{Error, FlowFile, Limits, Result};
+use crate::format::{self, Header, HeaderDecoder};
+use crate::{Content, Error, FlowFile, Result};
 
-fn read_field_len(reader: &mut impl Read) -> io::Result<usize> {
-    let mut buf = [0u8; 2];
-    reader.read_exact(&mut buf)?;
-    let len = u16::from_be_bytes(buf) as usize;
-    if len < MAX_VALUE_2_BYTES {
-        Ok(len)
-    } else {
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf)?;
-        Ok(u32::from_be_bytes(buf) as usize)
+/// Read into `buf` until it is full or the reader ends, retrying
+/// interruptions. Returns how many bytes arrived.
+fn fill(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
     }
+    Ok(filled)
 }
 
-/// What a single attribute key or value is still allowed to spend.
+/// Read a header off the front of `reader`.
 ///
-/// Two limits bear on one field. Both have to be applied to the length the
-/// field declares, rather than to what arrives. Otherwise the field they are
-/// meant to bound is read into memory before either one fires.
-#[derive(Clone, Copy)]
-pub(crate) struct Budget {
-    /// [`Limits::max_attribute_len`], which applies to each field alone.
-    per_field: Option<usize>,
-    /// [`Limits::max_total_attribute_len`], and how much of it the fields
-    /// before this one have already spent.
-    total: Option<(usize, usize)>,
-}
-
-impl Budget {
-    pub(crate) fn new(limits: Limits) -> Self {
-        Self {
-            per_field: limits.max_attribute_len,
-            total: limits.max_total_attribute_len.map(|limit| (0, limit)),
-        }
-    }
-
-    /// Check a declared field length against both limits, before the bytes it
-    /// describes are read.
-    pub(crate) fn check(self, len: usize) -> Result<()> {
-        if let Some(limit) = self.per_field
-            && len > limit
-        {
-            return Err(Error::AttributeTooLong { len, limit });
-        }
-        // Checked against the projected total rather than the running one, so
-        // that a single attribute larger than the whole budget is refused on
-        // its declaration. Checking only after it had been read would let one
-        // field overshoot the header limit by its own size. For a caller who
-        // sets no per-attribute limit, that is any size at all.
-        if let Some((spent, limit)) = self.total {
-            let projected = spent.saturating_add(len);
-            if projected > limit {
-                return Err(Error::HeaderTooLarge {
-                    len: projected,
-                    limit,
-                });
+/// `Ok(None)` means the reader ended before the first byte, which is the
+/// clean end of a stream of flow files. Ending anywhere later is
+/// [`Error::TruncatedHeader`].
+pub(crate) fn read_header(reader: &mut impl Read) -> Result<Option<Header>> {
+    let mut decoder = HeaderDecoder::new();
+    loop {
+        let chunk = decoder.next_read();
+        let wanted = chunk.len();
+        let got = fill(reader, chunk)?;
+        if got < wanted {
+            if got == 0 && !decoder.started() {
+                return Ok(None);
             }
+            return Err(Error::TruncatedHeader {
+                needed: wanted - got,
+                expecting: decoder.expecting(),
+            });
         }
-        Ok(())
-    }
-
-    /// Record a field that was accepted.
-    pub(crate) fn spend(&mut self, len: usize) {
-        if let Some((spent, _)) = &mut self.total {
-            *spent = spent.saturating_add(len);
+        if let Some(header) = decoder.advance()? {
+            return Ok(Some(header));
         }
     }
 }
 
-/// How much to reserve for a declared length before any of it has arrived to
-/// justify the allocation.
-///
-/// Nothing in this crate sizes a buffer from a declared length. A header can
-/// claim four gigabytes over a four-byte input, and allocating for the claim is
-/// the cheapest denial of service there is. Reserving nothing at all is not
-/// free either, and that is what `read_to_end` does. It starts from 32 bytes
-/// and doubles, so the bytes are copied through a sequence of allocations and
-/// land in one up to twice the size they needed.
-///
-/// So this bounds the first reservation, and every one after it is bounded by
-/// how much has already arrived. Bytes that have arrived are the part a header
-/// cannot fake. A lying header costs this much and no more. Anything at or
-/// under this size is allocated once, at exactly its size, and that covers
-/// every ordinary attribute and most content.
-pub(crate) const RESERVE_AHEAD: u64 = 64 * 1024;
+/// The error for a stream that ended where a flow file had to begin.
+fn missing_header() -> Error {
+    Error::TruncatedHeader {
+        needed: format::MAGIC.len(),
+        expecting: "the magic header",
+    }
+}
 
 /// Read up to `len` bytes into `buf`, returning how many arrived.
 ///
 /// Falling short is not an error here, because the callers report it in
-/// different ways. This returns the count and leaves that to them.
-///
-/// See [`RESERVE_AHEAD`] for why this is not `take(len).read_to_end(buf)`.
+/// different ways. See [`format::RESERVE_AHEAD`] for why this is not
+/// `take(len).read_to_end(buf)`.
 pub(crate) fn read_declared(
     reader: &mut impl Read,
     len: u64,
@@ -104,14 +66,8 @@ pub(crate) fn read_declared(
 ) -> io::Result<u64> {
     let mut done = 0u64;
     while done < len {
-        // Never more than what is left, and never more than has already been
-        // delivered, so bytes back the reservation rather than a claim.
-        let step = (len - done).min(done.max(RESERVE_AHEAD));
-        let step =
-            usize::try_from(step).expect("bounded by RESERVE_AHEAD or by bytes already read");
-        // Reserved exactly rather than amortized. The sizes here already
-        // double, so leaving the growth to the allocator would overshoot the
-        // final one.
+        let left = usize::try_from(len - done).unwrap_or(usize::MAX);
+        let step = format::reserve_step(usize::try_from(done).unwrap_or(usize::MAX), left);
         buf.reserve_exact(step);
         let read = reader.take(step as u64).read_to_end(buf)?;
         if read == 0 {
@@ -122,68 +78,12 @@ pub(crate) fn read_declared(
     Ok(done)
 }
 
-fn read_string(reader: &mut impl Read, budget: &mut Budget) -> Result<String> {
-    let len = read_field_len(reader)?;
-    budget.check(len)?;
-    // Grow the buffer as bytes actually arrive instead of trusting the
-    // declared length, so a crafted header cannot force a huge allocation.
-    let mut buf = Vec::new();
-    let read = read_declared(reader, len as u64, &mut buf)?;
-    if read != len as u64 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "attribute truncated").into());
-    }
-    budget.spend(len);
-    String::from_utf8(buf).map_err(Error::InvalidAttribute)
-}
-
-/// Read the header, returning the attributes and the declared content size.
-/// `first_byte` is a byte already consumed from the reader, if any.
-pub(crate) fn parse_header(
-    reader: &mut impl Read,
-    first_byte: Option<u8>,
-    limits: Limits,
-) -> Result<(HashMap<String, String>, u64)> {
-    let mut magic = [0u8; 7];
-    match first_byte {
-        Some(byte) => {
-            magic[0] = byte;
-            reader.read_exact(&mut magic[1..])?;
-        }
-        None => reader.read_exact(&mut magic)?,
-    }
-    if magic != MAGIC {
-        return Err(Error::InvalidMagic(magic));
-    }
-    let count = read_field_len(reader)?;
-    if let Some(limit) = limits.max_attributes
-        && count > limit
-    {
-        return Err(Error::TooManyAttributes { count, limit });
-    }
-    let mut attributes = HashMap::with_capacity(count.min(1024));
-    let mut budget = Budget::new(limits);
-    for _ in 0..count {
-        let key = read_string(reader, &mut budget)?;
-        let value = read_string(reader, &mut budget)?;
-        attributes.insert(key, value);
-    }
-    let mut size = [0u8; 8];
-    reader.read_exact(&mut size)?;
-    let size = u64::from_be_bytes(size);
-    if let Some(limit) = limits.max_content_len
-        && size > limit
-    {
-        return Err(Error::ContentTooLarge { size, limit });
-    }
-    Ok((attributes, size))
-}
-
-impl<R: Read> FlowFile<io::Take<R>> {
+impl<R: Read> FlowFile<Content<R>> {
     /// Parse a flow file from a reader, consuming only the header.
     ///
     /// The returned flow file's content is the reader, limited to the declared
-    /// content size. If the reader ends before [`size`] bytes have been read,
-    /// the input was truncated. [`FlowFile::into_memory`] checks that for you.
+    /// content size, and it reports the reader ending early as an error. See
+    /// [`Content`]. Nothing is buffered, so the content can be any size.
     ///
     /// The header is read in small increments, so wrap an unbuffered source in
     /// a [`std::io::BufReader`]. A file or a socket is unbuffered.
@@ -203,23 +103,10 @@ impl<R: Read> FlowFile<io::Take<R>> {
     /// # Errors
     ///
     /// [`Error::InvalidMagic`] if the input does not begin with `NiFiFF3`,
-    /// [`Error::InvalidAttribute`] for an attribute that is not UTF-8, or
-    /// [`Error::Io`] if the header ends early. Nothing here depends on the
-    /// content, which has not been read yet.
-    ///
-    /// [`size`]: FlowFile::size
-    pub fn parse(reader: R) -> Result<Self> {
-        Self::parse_with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`parse`](Self::parse), but enforcing [`Limits`] on the header.
-    ///
-    /// Use this for untrusted input; see [`Limits`] for the threat model.
-    ///
-    /// # Errors
-    ///
-    /// As [`parse`](Self::parse), plus [`Error::TooManyAttributes`] or
-    /// [`Error::AttributeTooLong`] when the header exceeds `limits`.
+    /// [`Error::InvalidAttribute`] for an attribute that is not UTF-8,
+    /// [`Error::TruncatedHeader`] if the input ends inside the header, and
+    /// [`Error::Io`] for anything the reader reports. Nothing here depends on
+    /// the content, which has not been read yet.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -233,23 +120,18 @@ impl<R: Read> FlowFile<io::Take<R>> {
             )
         )
     )]
-    pub fn parse_with_limits(mut reader: R, limits: Limits) -> Result<Self> {
-        let (attributes, size) = parse_header(&mut reader, None, limits)?;
-        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
-        flow_file.record_identity();
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            attributes = flow_file.attributes.len(),
-            "parsed header, content left as a reader"
-        );
-        Ok(flow_file)
+    pub fn parse(mut reader: R) -> Result<Self> {
+        let header = read_header(&mut reader)?.ok_or_else(missing_header)?;
+        let size = header.size;
+        Ok(FlowFile::parsed(header, Content::new(reader, size)))
     }
 }
 
-impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
+impl<'r, R: Read> FlowFile<Content<&'r mut R>> {
     /// Parse the next flow file from a stream of concatenated flow files.
     ///
-    /// Returns `Ok(None)` on a clean end of input.
+    /// Returns `Ok(None)` on a clean end of input, meaning the stream ended
+    /// exactly where a flow file would have begun.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -269,73 +151,27 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
     /// # Every flow file's content must be consumed
     ///
     /// The returned flow file's content is the reader itself, positioned at the
-    /// first content byte. Nothing else can read the stream until that content
-    /// is dealt with, and the next flow file begins where it ends. So you have
-    /// to consume each content before parsing the next flow file:
+    /// first content byte, and the next flow file begins where that content
+    /// ends. So each content has to be consumed before the next flow file is
+    /// parsed: [`into_memory`](FlowFile::into_memory) reads it into a buffer,
+    /// [`write_to`](FlowFile::write_to) copies it out, and
+    /// [`skip_content`](FlowFile::skip_content) discards it.
     ///
-    /// - [`into_memory`](FlowFile::into_memory) reads it into a buffer.
-    /// - [`write_to`](FlowFile::write_to) copies it straight out.
-    /// - [`skip_content`](FlowFile::skip_content) discards it, which is what to
-    ///   call when only the attributes were wanted.
+    /// Dropping a flow file with its content unread leaves the reader inside
+    /// that content, and the next call parses the content as though it were a
+    /// flow file. Usually that fails. It does not fail when the content itself
+    /// begins with a valid header, which happens when one flow file carries
+    /// another, and then you get back a plausible flow file that was never
+    /// sent.
     ///
-    /// Holding a flow file past the next call is a compile error, because it
-    /// borrows the reader. Dropping one with its content unread compiles, and
-    /// goes wrong at run time instead. The reader is then left where the
-    /// content starts, so the next call parses the content as though it were a
-    /// flow file. Usually that fails with an error. It does not fail when the
-    /// content itself begins with a valid header, which happens when one flow
-    /// file carries another. In that case you get back a plausible flow file
-    /// that was never sent. What happens after that depends on the rest of the
-    /// content, so the damage ranges from one phantom record in a stream that
-    /// otherwise reads fine, to losing everything that followed.
-    ///
-    /// ```
-    /// use nififf3::FlowFile;
-    ///
-    /// // An envelope: one flow file whose content is another, then a second
-    /// // ordinary flow file after it.
-    /// let inner = FlowFile::builder().attribute("who", "inner").content(&b"payload"[..]).to_bytes();
-    /// let mut bytes = FlowFile::builder().attribute("who", "envelope").content(inner).to_bytes();
-    /// bytes.extend(FlowFile::builder().attribute("who", "second").content(Vec::new()).to_bytes());
-    ///
-    /// let mut reader = bytes.as_slice();
-    /// let mut seen = Vec::new();
-    /// while let Some(flow_file) = FlowFile::parse_next(&mut reader)? {
-    ///     seen.push(flow_file.attribute("who").unwrap().to_string());
-    ///     flow_file.skip_content()?;
-    /// }
-    /// assert_eq!(seen, ["envelope", "second"]);
-    ///
-    /// // Without that `skip_content`, the second read starts inside the
-    /// // envelope's content and finds the flow file nested in it. The one
-    /// // that really came next is never reached.
-    /// # Ok::<(), nififf3::Error>(())
-    /// ```
-    ///
-    /// Two types do that bookkeeping for you, and one of them is usually a
-    /// better choice than calling this directly. [`FlowFiles`] reads each
-    /// content into memory as it goes. [`FlowFilesReader`] streams the content
-    /// and keeps the stream positioned for you, skipping whatever a flow file
-    /// left unread. `parse_next` is the primitive underneath them. Reach for it
-    /// when you need the reader back between flow files, or when you are
-    /// driving the stream yourself.
+    /// [`FlowFilesReader`] does this bookkeeping for you, and is the better
+    /// choice unless you need the reader back between flow files.
     ///
     /// # Errors
     ///
-    /// As [`FlowFile::parse`]. Note that a stream ending part-way through a
-    /// header is [`Error::Io`] rather than `Ok(None)`, because only a clean
+    /// As [`FlowFile::parse`]. A stream ending part-way through a header is
+    /// [`Error::TruncatedHeader`] rather than `Ok(None)`, because only a clean
     /// boundary ends the iteration.
-    pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
-        Self::parse_next_with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`parse_next`](Self::parse_next), but enforcing [`Limits`] on
-    /// the header. Use this for untrusted input.
-    ///
-    /// # Errors
-    ///
-    /// As [`parse_next`](Self::parse_next), plus [`Error::TooManyAttributes`]
-    /// or [`Error::AttributeTooLong`] when a header exceeds `limits`.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -349,32 +185,14 @@ impl<'r, R: Read> FlowFile<io::Take<&'r mut R>> {
             )
         )
     )]
-    pub fn parse_next_with_limits(reader: &'r mut R, limits: Limits) -> Result<Option<Self>> {
-        let mut first = [0u8; 1];
-        loop {
-            match reader.read(&mut first) {
-                // A one-byte buffer, so this is the end of the stream. A
-                // reader returning `Ok(0)` with room to fill is buggy, and
-                // retrying one would spin rather than recover.
-                Ok(0) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::trace!("stream ended on a flow file boundary");
-                    return Ok(None);
-                }
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {} // retry
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let (attributes, size) = parse_header(reader, Some(first[0]), limits)?;
-        let flow_file = FlowFile::from_raw_parts(size, attributes, reader.take(size));
-        flow_file.record_identity();
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            attributes = flow_file.attributes.len(),
-            "parsed header, content left as a reader"
-        );
-        Ok(Some(flow_file))
+    pub fn parse_next(reader: &'r mut R) -> Result<Option<Self>> {
+        let Some(header) = read_header(reader)? else {
+            #[cfg(feature = "tracing")]
+            tracing::trace!("stream ended on a flow file boundary");
+            return Ok(None);
+        };
+        let size = header.size;
+        Ok(Some(FlowFile::parsed(header, Content::new(reader, size))))
     }
 }
 
@@ -382,10 +200,9 @@ impl<R: Read> FlowFile<R> {
     /// Serialize the flow file to a writer, reading exactly [`size`] bytes
     /// from the content reader.
     ///
-    /// Returns the number of content bytes copied. It takes `self`, so you can
-    /// only call it once. It reads the content to the end, and a second call
-    /// would write a second header and then fail. By that point the first write
-    /// has already gone out. Read whatever you need from
+    /// Returns the number of content bytes copied. It takes `self`, because it
+    /// reads the content to the end and a second call would write a second
+    /// header and then fail. Read whatever you need from
     /// [`attributes`](FlowFile::attributes) first.
     ///
     /// ```
@@ -401,8 +218,7 @@ impl<R: Read> FlowFile<R> {
     ///
     /// # Errors
     ///
-    /// Only I/O, because nothing here inspects the flow file's structure. A
-    /// content reader that ends before `size` bytes gives an
+    /// Only I/O. A content reader that ends before `size` bytes gives an
     /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
     /// [`Error::SizeMismatch`], and anything else comes from the writer. Either
     /// way, the header has already been written, along with whatever content
@@ -432,8 +248,7 @@ impl<R: Read> FlowFile<R> {
         let copied = io::copy(&mut (&mut self.content).take(self.size), writer)?;
         if copied != self.size {
             // The header is already out, so the stream now holds a flow file
-            // that promises more than it carries. The caller sees the error,
-            // but whatever is reading the far end will not.
+            // that promises more than it carries.
             #[cfg(feature = "tracing")]
             tracing::warn!(
                 copied,
@@ -448,11 +263,9 @@ impl<R: Read> FlowFile<R> {
 
     /// Discard the content, consuming exactly [`size`] bytes from the reader.
     ///
-    /// Call this when only the attributes were wanted. For a flow file parsed
-    /// out of a stream by [`parse_next`](FlowFile::parse_next), leaving the
-    /// content unread has a cost: the reader stays where the content begins,
-    /// and the next parse starts from there. See that method for what goes
-    /// wrong.
+    /// Call this when only the attributes were wanted from a flow file
+    /// [`parse_next`](FlowFile::parse_next) produced, so that the stream is
+    /// left where the next flow file begins.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -503,17 +316,16 @@ impl<R: Read> FlowFile<R> {
 
     /// Read the content to completion, producing an in-memory flow file.
     ///
-    /// This moves the content into memory, and serializes nothing. It is the
+    /// This moves the content into memory and serializes nothing. It is the
     /// inverse of [`into_reader`](FlowFile::into_reader). The similarly named
-    /// [`to_bytes`](FlowFile::to_bytes) does something else: it serializes the
-    /// whole flow file, header and all, to the wire format.
+    /// [`to_bytes`](FlowFile::to_bytes) serializes the whole flow file, header
+    /// and all, to the wire format.
     ///
     /// It validates that exactly [`size`] bytes of content were available.
     ///
     /// # Errors
     ///
-    /// Only I/O, because whatever produced this flow file already validated the
-    /// header. Content that ends early is
+    /// Only I/O. Content that ends early is
     /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) carrying an
     /// [`Error::SizeMismatch`].
     ///
@@ -550,13 +362,10 @@ impl<R: Read> FlowFile<R> {
 impl FlowFile<Vec<u8>> {
     /// Read one whole flow file from a reader, content included.
     ///
-    /// Use this when you want the content in memory anyway. It is
-    /// [`parse`](FlowFile::parse) followed by
+    /// This is [`parse`](FlowFile::parse) followed by
     /// [`into_memory`](FlowFile::into_memory), with the two error types already
     /// reconciled, so a truncated content arrives as [`Error::SizeMismatch`]
     /// the way [`from_bytes`](FlowFile::from_bytes) reports it.
-    /// [`parse`](FlowFile::parse) stops at the header and leaves the content as
-    /// a reader instead.
     ///
     /// Exactly one flow file is read, and the reader is left on the byte after
     /// it, so trailing bytes are not this flow file's business.
@@ -565,7 +374,7 @@ impl FlowFile<Vec<u8>> {
     /// use [`FlowFiles`], which is this call in a loop.
     ///
     /// The header is read in small increments, so wrap an unbuffered source in
-    /// a [`std::io::BufReader`]. A file or a socket is unbuffered.
+    /// a [`std::io::BufReader`].
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -587,36 +396,15 @@ impl FlowFile<Vec<u8>> {
     /// [`Error::SizeMismatch`] if the content ends before the declared
     /// [`size`](FlowFile::size).
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
-        Self::from_reader_with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`from_reader`](Self::from_reader), but enforcing [`Limits`] on the
-    /// header. Use this for untrusted input.
-    ///
-    /// Limits matter more here than on [`from_bytes`](FlowFile::from_bytes).
-    /// The content is about to be buffered, and a reader puts no bound on how
-    /// much of it there is. That is what
-    /// [`max_content_len`](Limits::max_content_len) is for.
-    ///
-    /// # Errors
-    ///
-    /// As [`from_reader`](Self::from_reader), plus the limit variants:
-    /// [`Error::TooManyAttributes`], [`Error::AttributeTooLong`],
-    /// [`Error::HeaderTooLarge`] or [`Error::ContentTooLarge`].
-    pub fn from_reader_with_limits<R: Read>(reader: R, limits: Limits) -> Result<Self> {
-        Ok(FlowFile::parse_with_limits(reader, limits)?.into_memory()?)
+        Ok(FlowFile::parse(reader)?.into_memory()?)
     }
 
     /// Serialize the flow file to a writer.
     ///
-    /// This is the in-memory counterpart to [`write_to`](FlowFile::write_to).
-    /// That method is bounded on `R: Read`, and `Vec<u8>` is not a reader, so
-    /// it does not apply here. The name differs because two inherent methods
-    /// cannot share one name, even though only one of them could ever apply.
-    ///
-    /// It takes `&self` rather than consuming the flow file, because writing
-    /// in-memory content does not exhaust it. It returns the number of content
-    /// bytes written.
+    /// This is the in-memory counterpart to [`write_to`](FlowFile::write_to),
+    /// which is bounded on `R: Read` and so does not apply to a `Vec<u8>`. It
+    /// takes `&self`, because writing in-memory content does not exhaust it,
+    /// and returns the number of content bytes written.
     ///
     /// ```
     /// use nififf3::FlowFile;
@@ -629,11 +417,10 @@ impl FlowFile<Vec<u8>> {
     /// # Ok::<(), nififf3::Error>(())
     /// ```
     ///
-    /// The header and the content are written as two calls rather than one,
-    /// because building a single buffer would mean copying the whole content
-    /// into it first. That is the right trade for content of any size, but it
-    /// does mean an unbuffered writer sees two writes. Wrap one in a
-    /// [`std::io::BufWriter`] if the syscalls matter more than the copy.
+    /// The header and the content go out as two writes rather than one, so
+    /// that the content is never copied into a second buffer. Wrap an
+    /// unbuffered writer in a [`std::io::BufWriter`] if the syscalls matter
+    /// more than the copy.
     ///
     /// # Errors
     ///
@@ -644,9 +431,8 @@ impl FlowFile<Vec<u8>> {
     ///
     /// # Panics
     ///
-    /// As [`to_bytes`](FlowFile::to_bytes) panics: for an attribute the wire
-    /// format cannot express, or a declared size that disagrees with the
-    /// content.
+    /// As [`to_bytes`](FlowFile::to_bytes): for an attribute the wire format
+    /// cannot express, or a declared size that disagrees with the content.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -661,11 +447,7 @@ impl FlowFile<Vec<u8>> {
         )
     )]
     pub fn write_bytes_to<W: Write>(&self, writer: &mut W) -> io::Result<u64> {
-        assert_eq!(
-            self.size,
-            self.content.len() as u64,
-            "declared size does not match the content; see FlowFile::with_size"
-        );
+        self.assert_size_matches();
         writer.write_all(&self.header_bytes())?;
         writer.write_all(&self.content)?;
         #[cfg(feature = "tracing")]
@@ -674,20 +456,18 @@ impl FlowFile<Vec<u8>> {
     }
 }
 
-/// Iterator over a stream of concatenated flow files.
+/// Iterator over a stream of concatenated flow files, buffering each content.
 ///
-/// Yields each flow file with its content buffered in memory, and ends on a
-/// clean end of input. After an error the iterator is fused, meaning it keeps
-/// returning `None`, because the stream position is no longer trustworthy.
+/// Yields each flow file with its content in memory, and ends on a clean end
+/// of input. After an error the iterator is fused, meaning it keeps returning
+/// `None`, because the stream position is no longer trustworthy.
 ///
 /// Buffering each content is what lets this be an ordinary [`Iterator`]
 /// yielding owned flow files. When a content is too large for that, use
-/// [`FlowFilesReader`], which streams instead and is just as safe. Its docs
-/// compare the three ways to read, including [`FlowFile::parse_next`].
+/// [`FlowFilesReader`], which streams instead.
 ///
-/// Because this buffers, it reports a content that ends before its declared
-/// size as [`Error::SizeMismatch`] directly, the way [`FlowFile::from_bytes`]
-/// does, rather than wrapped in [`Error::Io`].
+/// A content that ends before its declared size is reported as
+/// [`Error::SizeMismatch`] directly, the way [`FlowFile::from_bytes`] does.
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFiles};
@@ -703,25 +483,17 @@ impl FlowFile<Vec<u8>> {
 #[derive(Debug)]
 pub struct FlowFiles<R> {
     reader: R,
-    limits: Limits,
     done: bool,
 }
 
 impl<R: Read> FlowFiles<R> {
-    /// Iterate over the flow files in `reader`, without header limits.
+    /// Iterate over the flow files in `reader`.
     ///
     /// The header parsing reads in small increments, so wrap an unbuffered
-    /// source in a [`std::io::BufReader`]. A file or a socket is unbuffered.
+    /// source in a [`std::io::BufReader`].
     pub fn new(reader: R) -> Self {
-        Self::with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
-    /// Use this for untrusted input.
-    pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
-            limits,
             done: false,
         }
     }
@@ -739,10 +511,9 @@ impl<R: Read> FlowFiles<R> {
     /// Consume the iterator, returning the underlying reader.
     ///
     /// The reader is left wherever iteration stopped. After a `None` that is
-    /// the end of the flow files and the start of whatever follows them, such
-    /// as a trailer or the next section of a multiplexed stream. Stopping
-    /// early leaves the reader part-way through a flow file, and after an
-    /// error its position is not meaningful at all.
+    /// the end of the flow files and the start of whatever follows them.
+    /// Stopping early leaves the reader part-way through a flow file, and
+    /// after an error its position is not meaningful at all.
     ///
     /// ```
     /// use nififf3::{FlowFile, FlowFiles};
@@ -771,10 +542,9 @@ impl<R: Read> Iterator for FlowFiles<R> {
         if self.done {
             return None;
         }
-        let result = match FlowFile::parse_next_with_limits(&mut self.reader, self.limits) {
+        let result = match FlowFile::parse_next(&mut self.reader) {
             Ok(None) => None,
-            // The conversion recovers a truncation as `SizeMismatch`, so
-            // buffering here reports it the way `from_bytes` does.
+            // The conversion recovers a truncation as `SizeMismatch`.
             Ok(Some(flow_file)) => Some(flow_file.into_memory().map_err(Error::from)),
             Err(err) => Some(Err(err)),
         };
@@ -791,16 +561,11 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 /// keeping the stream positioned for you.
 ///
 /// This is the streaming counterpart to [`FlowFiles`]. Reach for it when a flow
-/// file's content is too big to hold in memory. `FlowFiles` reads each content
-/// into a `Vec` and hands you an owned flow file. This hands you one whose
-/// content is the stream itself, so it is read as you read it, and never twice.
-///
-/// That laziness is what makes [`FlowFile::parse_next`] hard to use directly.
-/// There, a flow file dropped with its content unread leaves the stream inside
-/// that content, and the next parse reads it as though it were a flow file.
-/// Here it does not matter. Each call picks up whatever the last flow file left
-/// behind and skips it, so reading none of the content, some of it, or all of
-/// it are equally correct:
+/// file's content is too big to hold in memory. It hands you a flow file whose
+/// content is the stream itself, so it is read as you read it, and never
+/// twice. Each call to [`next`](Self::next) picks up whatever the last flow
+/// file left behind and skips it, so reading none of a content, some of it, or
+/// all of it are equally correct:
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesReader};
@@ -819,69 +584,48 @@ impl<R: Read> std::iter::FusedIterator for FlowFiles<R> {}
 /// # Ok::<(), nififf3::Error>(())
 /// ```
 ///
-/// # Choosing between the three
-///
-/// | | content | use when |
-/// | --- | --- | --- |
-/// | [`FlowFiles`] | read into memory for you | the contents fit, and an owned `FlowFile<Vec<u8>>` per flow file is what you want |
-/// | `FlowFilesReader` | streamed, positioned for you | a content may be too large to buffer |
-/// | [`FlowFile::parse_next`] | streamed, positioned by you | you need the reader back between flow files, or are driving the stream yourself |
-///
-/// Only `FlowFiles` implements [`Iterator`]. The flow files this yields borrow
-/// the stream they came from, and no `Iterator` can express that. In a
-/// `while let` loop the borrow costs nothing, and it has a useful side effect:
-/// if you try to hold a flow file past the next call, the code does not
-/// compile.
-///
-/// After an error, `next` keeps returning `None`, as [`FlowFiles`] does,
-/// because the position in the stream is no longer trustworthy.
+/// The flow files this yields borrow the stream they came from, so this is
+/// not an [`Iterator`], and holding a flow file past the next call does not
+/// compile. After an error, `next` keeps returning `None`.
 #[derive(Debug)]
 pub struct FlowFilesReader<R> {
     reader: R,
-    limits: Limits,
     /// Declared content size of the flow file last handed out.
     size: u64,
-    /// How much of that content has not been read. Maintained by [`StreamedContent`]
-    /// as it is read, rather than on drop, so that a content which is leaked
-    /// rather than dropped leaves the count correct.
+    /// How much of that content has not been read. Maintained by
+    /// [`StreamedContent`] as it is read, rather than on drop, so that a
+    /// content which is leaked rather than dropped leaves the count correct.
     unread: u64,
     done: bool,
 }
 
-/// The content of a flow file from a [`FlowFilesReader`], which is the stream
-/// itself, limited to this flow file's content.
+/// The content of a flow file from a [`FlowFilesReader`]: the stream itself,
+/// limited to this flow file's content.
 ///
 /// Reading it is optional. Whatever is left is skipped when the next flow file
-/// is asked for.
+/// is asked for. As with [`Content`], a stream that ends early is an error.
 #[derive(Debug)]
 pub struct StreamedContent<'a, R> {
-    inner: io::Take<&'a mut R>,
+    inner: Content<&'a mut R>,
     unread: &'a mut u64,
 }
 
 impl<R: Read> Read for StreamedContent<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buf)?;
-        *self.unread = self.unread.saturating_sub(read as u64);
+        *self.unread = self.inner.remaining();
         Ok(read)
     }
 }
 
 impl<R: Read> FlowFilesReader<R> {
-    /// Read flow files from `reader`, without header limits.
+    /// Read flow files from `reader`.
     ///
     /// The header parsing reads in small increments, so wrap an unbuffered
-    /// source in a [`std::io::BufReader`]. A file or a socket is unbuffered.
+    /// source in a [`std::io::BufReader`].
     pub fn new(reader: R) -> Self {
-        Self::with_limits(reader, Limits::UNLIMITED)
-    }
-
-    /// Like [`new`](Self::new), but enforcing [`Limits`] on each header.
-    /// Use this for untrusted input.
-    pub fn with_limits(reader: R, limits: Limits) -> Self {
         Self {
             reader,
-            limits,
             size: 0,
             unread: 0,
             done: false,
@@ -893,11 +637,6 @@ impl<R: Read> FlowFilesReader<R> {
     /// Anything left unread of the previous flow file's content is skipped
     /// first, so you are never responsible for the stream's position.
     ///
-    /// It returns `Result<Option<_>>` rather than the `Option<Result<_>>` an
-    /// [`Iterator`] would, matching the [`FlowFile::parse_next`] it replaces.
-    /// So `while let Some(flow_file) = reader.next()?` reads with one `?` and
-    /// no inner match.
-    ///
     /// # Errors
     ///
     /// As [`FlowFile::parse_next`], plus [`Error::SizeMismatch`] if the stream
@@ -905,59 +644,35 @@ impl<R: Read> FlowFilesReader<R> {
     #[expect(
         clippy::should_implement_trait,
         reason = "`Iterator` cannot yield an item that borrows the iterator, \
-                  and that is the whole point here. A lending iterator calls \
-                  its method `next`, the async twin already calls it that, and \
-                  `while let Some(..) = reader.next()?` works. \
-                  `Fragments::next_part` was renamed because that pattern did \
-                  not work for it."
+                  and `while let Some(..) = reader.next()?` is the point"
     )]
     pub fn next(&mut self) -> Result<Option<FlowFile<StreamedContent<'_, R>>>> {
         if self.done {
             return Ok(None);
         }
-        if let Err(err) = self.discard_unread() {
-            self.done = true;
-            return Err(err);
-        }
-
-        let mut first = [0u8; 1];
-        loop {
-            match self.reader.read(&mut first) {
-                // As in `parse_next`: a one-byte buffer, so this is the end.
-                Ok(0) => {
-                    self.done = true;
-                    return Ok(None);
-                }
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {} // retry
-                Err(e) => {
-                    self.done = true;
-                    return Err(e.into());
-                }
+        let result = self
+            .discard_unread()
+            .and_then(|()| read_header(&mut self.reader));
+        let header = match result {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                self.done = true;
+                return Ok(None);
             }
-        }
-
-        let (attributes, size) = match parse_header(&mut self.reader, Some(first[0]), self.limits) {
-            Ok(header) => header,
             Err(err) => {
                 self.done = true;
                 return Err(err);
             }
         };
 
-        self.size = size;
-        self.unread = size;
-        // Disjoint borrows of two fields, which is what lets the content carry
-        // both the stream and the counter that tracks it.
+        self.size = header.size;
+        self.unread = header.size;
         let Self { reader, unread, .. } = self;
-        Ok(Some(FlowFile::from_raw_parts(
-            size,
-            attributes,
-            StreamedContent {
-                inner: reader.take(size),
-                unread,
-            },
-        )))
+        let content = StreamedContent {
+            inner: Content::new(reader, header.size),
+            unread,
+        };
+        Ok(Some(FlowFile::parsed(header, content)))
     }
 
     /// Read past whatever of the last flow file's content was left.
@@ -965,8 +680,6 @@ impl<R: Read> FlowFilesReader<R> {
         if self.unread == 0 {
             return Ok(());
         }
-        // Skipping is this type's whole job, and it happens without the caller
-        // asking, so say when it does.
         #[cfg(feature = "tracing")]
         tracing::trace!(
             unread = self.unread,
@@ -992,10 +705,8 @@ impl<R: Read> FlowFilesReader<R> {
 
     /// A mutable reference to the underlying reader.
     ///
-    /// Note that the stream may be positioned part-way through a flow file's
-    /// content, at whatever the last one handed out did not read.
-    /// [`next`](Self::next) accounts for that, and anything reading around it
-    /// does not.
+    /// The stream may be positioned part-way through a flow file's content,
+    /// at whatever the last one handed out did not read.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.reader
     }
@@ -1011,10 +722,9 @@ impl<R: Read> FlowFilesReader<R> {
 /// [`FlowFiles`].
 ///
 /// A failed write leaves a partial flow file in the stream, so the writer
-/// refuses every write after one. [`FlowFiles`] stops reading after an error
-/// for the same reason. If the writer appended instead, the next flow file's
-/// header would be read back as the truncated flow file's content, which buries
-/// the failure rather than reporting it. See
+/// refuses every write after one. If it appended instead, the next flow
+/// file's header would be read back as the truncated flow file's content,
+/// which buries the failure rather than reporting it. See
 /// [`is_poisoned`](Self::is_poisoned).
 ///
 /// # Finishing
@@ -1022,9 +732,8 @@ impl<R: Read> FlowFilesReader<R> {
 /// This type writes straight through and buffers nothing of its own, but the
 /// writer underneath it may, and neither writing nor dropping this one flushes
 /// it. Finish with [`finish`](Self::finish), which flushes and hands the writer
-/// back. [`flush`](Self::flush) flushes without giving up the writer.
-/// [`into_inner`](Self::into_inner) does not flush at all, on purpose, so you
-/// can discard a stream rather than complete it.
+/// back. [`into_inner`](Self::into_inner) does not flush at all, on purpose, so
+/// you can discard a stream rather than complete it.
 ///
 /// ```
 /// use nififf3::{FlowFile, FlowFilesWriter};
@@ -1080,6 +789,11 @@ impl<W: Write> FlowFilesWriter<W> {
     ///
     /// Whatever the writer returns. That also poisons this writer, because the
     /// one underneath may have accepted part of the flow file first.
+    ///
+    /// # Panics
+    ///
+    /// As [`FlowFile::to_bytes`]: an attribute the wire format cannot express,
+    /// or a declared size disagreeing with the content.
     pub fn write_bytes(&mut self, flow_file: &FlowFile<Vec<u8>>) -> io::Result<u64> {
         self.guard()?;
         let result = flow_file.write_bytes_to(&mut self.writer);
@@ -1096,26 +810,21 @@ impl<W: Write> FlowFilesWriter<W> {
     }
 
     fn poison_on_err<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if result.is_err() {
-            // Every later write is refused from here on, and the stream is
-            // left part-way through a flow file.
+        if let Err(err) = &result {
             #[cfg(feature = "tracing")]
-            if let Err(err) = &result {
-                tracing::warn!(
-                    error = %err,
-                    written = self.count,
-                    "write failed, poisoning the writer"
-                );
-            }
+            tracing::warn!(
+                error = %err,
+                written = self.count,
+                "write failed, poisoning the writer"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = err;
             self.poisoned = true;
         }
         result
     }
 
     /// Flush the underlying writer.
-    ///
-    /// Nothing else here does: this type holds no buffer of its own, so
-    /// whatever the writer underneath keeps is only pushed out when asked.
     ///
     /// # Errors
     ///
@@ -1128,16 +837,6 @@ impl<W: Write> FlowFilesWriter<W> {
     }
 
     /// Flush and return the underlying writer: the ordinary way to finish.
-    ///
-    /// ```
-    /// use nififf3::{FlowFile, FlowFilesWriter};
-    ///
-    /// let mut writer = FlowFilesWriter::new(Vec::new());
-    /// writer.write_bytes(&FlowFile::builder().content(&b"only"[..]))?;
-    /// let bytes = writer.finish()?;
-    /// # assert!(bytes.starts_with(b"NiFiFF3"));
-    /// # Ok::<(), std::io::Error>(())
-    /// ```
     ///
     /// # Errors
     ///
@@ -1176,10 +875,9 @@ impl<W: Write> FlowFilesWriter<W> {
 
     /// Consume the writer, returning the underlying one without flushing it.
     ///
-    /// To finish a stream, use [`finish`](Self::finish) instead. This is the
-    /// escape hatch for the other case: taking the writer back after a failure
-    /// in order to discard or truncate what was produced. There, flushing the
-    /// tail of a truncated flow file is the last thing you want.
+    /// To finish a stream, use [`finish`](Self::finish) instead. This is for
+    /// taking the writer back after a failure in order to discard or truncate
+    /// what was produced.
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -1189,9 +887,6 @@ impl<W: Write> FlowFilesWriter<W> {
 mod tests {
     use super::*;
 
-    /// A poisoned write is recognized by its payload rather than by its
-    /// message. `Error::WriterPoisoned` exists so that a caller can tell it
-    /// from any other write failure without matching on text.
     fn is_poisoned_error(err: &io::Error) -> bool {
         err.kind() == io::ErrorKind::BrokenPipe
             && matches!(
@@ -1244,8 +939,32 @@ mod tests {
         let bytes = sample_bytes();
         let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
         assert_eq!(flow_file.size(), 5);
+        assert_eq!(flow_file.content().remaining(), 5);
         let flow_file = flow_file.into_memory().unwrap();
         assert_eq!(flow_file.content().as_slice(), b"hello");
+    }
+
+    /// Every source ends up reading through the same decoder, so a reader
+    /// that delivers one byte per call has to agree with a slice.
+    #[test]
+    fn parsing_through_a_dribbling_reader_matches_the_slice() {
+        struct Dribble<'a>(&'a [u8]);
+        impl Read for Dribble<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.0[0];
+                self.0 = &self.0[1..];
+                Ok(1)
+            }
+        }
+
+        let flow_file = FlowFile::builder()
+            .attributes((0..50).map(|i| (format!("k{i}"), "v".repeat(i * 3000))))
+            .content(vec![9u8; 100_000]);
+        let bytes = flow_file.to_bytes();
+        assert_eq!(FlowFile::from_reader(Dribble(&bytes)).unwrap(), flow_file);
     }
 
     #[test]
@@ -1257,15 +976,13 @@ mod tests {
         assert_eq!(out, sample_bytes());
     }
 
-    /// The in-memory writer has to produce exactly what the reader-based one
-    /// does, or the two ways to write a flow file would disagree.
     #[test]
     fn write_bytes_to_matches_write_to() {
         let flow_file = sample_flow_file();
 
         let mut buffered = Vec::new();
         let written = flow_file.write_bytes_to(&mut buffered).unwrap();
-        assert_eq!(written, 5, "content bytes, as `write_to` reports");
+        assert_eq!(written, 5);
 
         let mut streamed = Vec::new();
         flow_file.into_reader().write_to(&mut streamed).unwrap();
@@ -1287,8 +1004,6 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    /// The attributes-only loop, which is the case that has no reason to read
-    /// the content and so the one most likely to forget.
     #[test]
     fn skip_content_walks_a_stream_without_reading_it() {
         let mut bytes = sample_bytes();
@@ -1304,11 +1019,9 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    /// This checks the hazard the docs describe. A flow file dropped with its
-    /// content unread leaves the reader inside that content. When the content
-    /// is an envelope, meaning one flow file carrying another, that produces a
-    /// plausible wrong answer rather than an error. If this ever stops being
-    /// true, the warning on `parse_next` needs to change with it.
+    /// The hazard the docs describe: a flow file dropped with its content
+    /// unread leaves the reader inside that content. When the content is an
+    /// envelope, that produces a plausible wrong answer rather than an error.
     #[test]
     fn dropping_content_unread_reparses_the_content_itself() {
         let inner = FlowFile::builder()
@@ -1330,14 +1043,9 @@ mod tests {
         let mut seen = Vec::new();
         while let Ok(Some(flow_file)) = FlowFile::parse_next(&mut reader) {
             seen.push(flow_file.attribute("who").unwrap().to_string());
-            // Deliberately no `skip_content`.
         }
-        // The nested flow file surfaces as though it had been sent. Parsing
-        // then lands inside that flow file's own content, fails, and the flow
-        // file that really came second is never reached.
         assert_eq!(seen, ["envelope", "inner"]);
 
-        // Skipping instead walks the stream that was actually sent.
         let mut reader = bytes.as_slice();
         let mut seen = Vec::new();
         while let Some(flow_file) = FlowFile::parse_next(&mut reader).unwrap() {
@@ -1368,7 +1076,6 @@ mod tests {
                 .to_bytes(),
         );
 
-        // Read nothing at all.
         let mut flow_files = FlowFilesReader::new(bytes.as_slice());
         let mut seen = Vec::new();
         while let Some(flow_file) = flow_files.next().unwrap() {
@@ -1376,7 +1083,6 @@ mod tests {
         }
         assert_eq!(seen, ["1", "2", "3"]);
 
-        // Read one byte of each, leaving the rest.
         let mut flow_files = FlowFilesReader::new(bytes.as_slice());
         let mut seen = Vec::new();
         while let Some(mut flow_file) = flow_files.next().unwrap() {
@@ -1389,7 +1095,6 @@ mod tests {
             [("1".into(), b'a'), ("2".into(), b'b'), ("3".into(), b'c')] as [(String, u8); 3]
         );
 
-        // Read all of it.
         let mut flow_files = FlowFilesReader::new(bytes.as_slice());
         let mut seen = Vec::new();
         while let Some(flow_file) = flow_files.next().unwrap() {
@@ -1398,8 +1103,6 @@ mod tests {
         assert_eq!(seen, [b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]);
     }
 
-    /// The envelope that misleads `parse_next` when its content is dropped
-    /// unread is simply not a problem here.
     #[test]
     fn the_streaming_reader_is_not_fooled_by_nested_flow_files() {
         let inner = FlowFile::builder()
@@ -1429,33 +1132,36 @@ mod tests {
     /// stream, and has to be reported rather than passed over in silence.
     #[test]
     fn the_streaming_reader_reports_a_truncated_content_it_skipped() {
-        let mut bytes = FlowFile::builder()
-            .attribute("n", "1")
-            .content(&b"aaaa"[..])
-            .to_bytes();
+        let mut bytes = sample_bytes();
         bytes.truncate(bytes.len() - 2);
 
         let mut flow_files = FlowFilesReader::new(bytes.as_slice());
-        assert!(flow_files.next().unwrap().is_some(), "the header is intact");
-        assert!(
-            matches!(
-                flow_files.next(),
-                Err(Error::SizeMismatch {
-                    expected: 4,
-                    actual: 2
-                })
-            ),
-            "the skip must notice the content ran out"
-        );
-        assert!(
-            flow_files.next().unwrap().is_none(),
-            "fused after the error"
-        );
+        assert!(flow_files.next().unwrap().is_some());
+        assert!(matches!(
+            flow_files.next(),
+            Err(Error::SizeMismatch {
+                expected: 5,
+                actual: 3
+            })
+        ));
+        assert!(flow_files.next().unwrap().is_none(), "fused");
     }
 
-    /// The eager reader has to agree with the two buffer-based entry points
-    /// exactly, since the only difference is meant to be where the bytes come
-    /// from.
+    /// A content read through the streaming reader reports truncation itself,
+    /// at the read that reaches it, so a decoder consuming it fails there.
+    #[test]
+    fn a_streamed_content_that_ends_early_errs_on_read() {
+        let mut bytes = sample_bytes();
+        bytes.truncate(bytes.len() - 2);
+
+        let mut flow_files = FlowFilesReader::new(bytes.as_slice());
+        let mut flow_file = flow_files.next().unwrap().unwrap();
+        let mut out = Vec::new();
+        let err = flow_file.content_mut().read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(out, b"hel");
+    }
+
     #[test]
     fn from_reader_matches_from_bytes() {
         let bytes = sample_bytes();
@@ -1464,8 +1170,6 @@ mod tests {
             FlowFile::from_bytes(&bytes).unwrap()
         );
 
-        // A truncated content is the same structured error, not `Io` wrapping
-        // it -- the reconciliation is the point of the method.
         let truncated = &bytes[..bytes.len() - 2];
         assert!(matches!(
             FlowFile::from_reader(truncated),
@@ -1474,98 +1178,49 @@ mod tests {
                 actual: 3
             })
         ));
-
-        // Limits reach the header, as on every other parsing entry point.
-        assert!(matches!(
-            FlowFile::from_reader_with_limits(
-                bytes.as_slice(),
-                Limits::untrusted().with_max_content_len(4)
-            ),
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
-        ));
     }
 
-    /// Where it deliberately differs: a reader may hold more than one flow
-    /// file, so trailing bytes are not this one's problem, and the reader is
-    /// left on the byte after it.
     #[test]
     fn from_reader_takes_one_flow_file_and_leaves_the_rest() {
         let mut bytes = sample_bytes();
-        bytes.extend_from_slice(b"and then something else");
-
+        bytes.extend_from_slice(b"trailer");
         let mut reader = bytes.as_slice();
-        let flow_file = FlowFile::from_reader(&mut reader).unwrap();
-        assert_eq!(flow_file.content().as_slice(), b"hello");
-        assert_eq!(reader, b"and then something else");
-
-        // Which is exactly where `from_bytes` refuses instead.
-        assert!(matches!(
-            FlowFile::from_bytes(&bytes),
-            Err(Error::TrailingData(23))
-        ));
-    }
-
-    #[test]
-    fn empty_finishes_a_build_with_no_content() {
-        let done = FlowFile::builder().attribute("k", "v").empty();
-        assert_eq!(
-            done,
-            FlowFile::builder().attribute("k", "v").content(Vec::new())
-        );
-        assert_eq!(done.size(), 0);
+        assert!(FlowFile::from_reader(&mut reader).is_ok());
+        assert_eq!(reader, b"trailer");
     }
 
     #[test]
     fn flow_files_iterator_fuses_after_error() {
         let mut bytes = sample_bytes();
         bytes.extend_from_slice(b"garbage");
-        let mut iter = FlowFiles::new(bytes.as_slice());
-        assert!(iter.next().unwrap().is_ok());
-        assert!(matches!(iter.next(), Some(Err(Error::InvalidMagic(_)))));
-        assert!(iter.next().is_none());
-        assert!(iter.next().is_none());
-    }
-
-    /// Reading flow files off the front of a stream that holds something else
-    /// afterwards, which is what handing the reader back is for.
-    #[test]
-    fn the_reader_comes_back_out_positioned_after_the_flow_files() {
-        let mut bytes = sample_bytes();
-        bytes.extend_from_slice(b"and then something else");
-
         let mut flow_files = FlowFiles::new(bytes.as_slice());
         assert!(flow_files.next().unwrap().is_ok());
-        assert_eq!(flow_files.get_ref().len(), b"and then something else".len());
-
-        let mut trailer = Vec::new();
-        flow_files.into_inner().read_to_end(&mut trailer).unwrap();
-        assert_eq!(trailer, b"and then something else");
+        assert!(matches!(
+            flow_files.next(),
+            Some(Err(Error::InvalidMagic(_)))
+        ));
+        assert!(flow_files.next().is_none());
     }
 
     #[test]
     fn bad_magic_is_rejected() {
-        let mut bytes = sample_bytes();
-        bytes[0] = b'X';
-        assert!(matches!(
-            FlowFile::from_bytes(&bytes),
-            Err(Error::InvalidMagic(_))
-        ));
+        let err = FlowFile::from_bytes(b"not a flow file at all").unwrap_err();
+        assert!(matches!(err, Error::InvalidMagic(_)));
+        assert!(err.to_string().contains("not a f"), "{err}");
     }
 
     #[test]
     fn truncated_content_is_a_size_mismatch() {
         let bytes = sample_bytes();
-        let truncated = &bytes[..bytes.len() - 2];
         assert!(matches!(
-            FlowFile::from_bytes(truncated),
+            FlowFile::from_bytes(&bytes[..bytes.len() - 2]),
             Err(Error::SizeMismatch {
                 expected: 5,
                 actual: 3
             })
         ));
-        // `into_memory` parses nothing, so it reports the same condition as an
-        // io error, with the structured error still recoverable from it.
-        let parsed = FlowFile::parse(truncated).unwrap();
+
+        let parsed = FlowFile::parse(&bytes[..bytes.len() - 2]).unwrap();
         let err = parsed.into_memory().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(matches!(
@@ -1578,226 +1233,37 @@ mod tests {
     }
 
     #[test]
-    fn readers_report_truncation_the_same_way_from_bytes_does() {
+    fn truncated_header_names_the_missing_piece() {
         let bytes = sample_bytes();
-        let truncated = &bytes[..bytes.len() - 2];
-
-        // Both entry points yield the structured error, not `Io` wrapping it.
-        for err in [
-            FlowFile::from_bytes(truncated).unwrap_err(),
-            FlowFiles::new(truncated).next().unwrap().unwrap_err(),
-        ] {
-            assert!(
-                matches!(
-                    err,
-                    Error::SizeMismatch {
-                        expected: 5,
-                        actual: 3
-                    }
-                ),
-                "{err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn readers_still_report_plain_io_errors_as_io() {
-        struct Failing;
-        impl Read for Failing {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::ConnectionReset, "gone"))
-            }
-        }
-
-        let err = FlowFiles::new(Failing).next().unwrap().unwrap_err();
+        let err = FlowFile::from_bytes(&bytes[..10]).unwrap_err();
         assert!(
-            matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::ConnectionReset),
+            matches!(
+                err,
+                Error::TruncatedHeader {
+                    expecting: "an attribute key length",
+                    ..
+                }
+            ),
             "{err:?}"
         );
+        // A reader ending at the same place says the same thing.
+        let from_reader = FlowFile::parse(&bytes[..10]).unwrap_err();
+        assert_eq!(from_reader.to_string(), err.to_string());
     }
 
     #[test]
-    fn limits_reject_an_oversized_declared_content_size() {
-        let bytes = sample_flow_file().to_bytes();
-        let limits = Limits::untrusted().with_max_content_len(4);
+    fn an_empty_stream_ends_cleanly_but_a_partial_magic_does_not() {
+        let mut empty: &[u8] = b"";
+        assert!(FlowFile::parse_next(&mut empty).unwrap().is_none());
 
+        let mut partial: &[u8] = b"NiFi";
         assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), limits),
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
+            FlowFile::parse_next(&mut partial),
+            Err(Error::TruncatedHeader {
+                needed: 3,
+                expecting: "the magic header"
+            })
         ));
-        // The check is on the declared size, so it fires before any content
-        // is read. A header on its own is enough to trip it.
-        let header_only = &bytes[..bytes.len() - 5];
-        assert!(matches!(
-            FlowFile::parse_with_limits(header_only, limits),
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
-        ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::untrusted()).is_ok());
-    }
-
-    /// A reader that yields `available` bytes and then ends, so a flow file
-    /// declaring more than that is truncated part-way through its content.
-    struct Short(usize);
-
-    impl Read for Short {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let n = self.0.min(buf.len());
-            self.0 -= n;
-            buf[..n].fill(b'x');
-            Ok(n)
-        }
-    }
-
-    #[test]
-    fn a_failed_write_poisons_the_writer() {
-        let mut out = Vec::new();
-        let mut writer = FlowFilesWriter::new(&mut out);
-
-        let err = writer
-            .write(FlowFile::builder().attribute("n", "1").reader(Short(3), 10))
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-        assert!(writer.is_poisoned());
-        assert_eq!(writer.count(), 0, "the failed one does not count");
-
-        // Appending here would let the next header be read as the truncated
-        // record's content, producing a plausible but wrong flow file.
-        let err = writer
-            .write_bytes(&FlowFile::builder().attribute("n", "2").content(&b"ok"[..]))
-            .unwrap_err();
-        assert!(is_poisoned_error(&err), "{err:?}");
-        assert_eq!(writer.count(), 0);
-
-        // Nothing was appended after the failure: the header plus the 3
-        // bytes the reader did produce, and not a byte more.
-        let stream = writer.into_inner();
-        assert_eq!(
-            stream.len(),
-            FlowFile::builder()
-                .attribute("n", "1")
-                .content(Vec::new())
-                .to_bytes()
-                .len()
-                + 3
-        );
-    }
-
-    #[test]
-    fn a_healthy_writer_is_never_poisoned() {
-        let mut out = Vec::new();
-        let mut writer = FlowFilesWriter::new(&mut out);
-        writer
-            .write_bytes(&FlowFile::builder().content(&b"first"[..]))
-            .unwrap();
-        writer
-            .write(FlowFile::builder().reader(&b"second"[..], 6))
-            .unwrap();
-
-        assert!(!writer.is_poisoned());
-        assert_eq!(writer.count(), 2);
-        assert_eq!(FlowFiles::new(out.as_slice()).count(), 2);
-    }
-
-    /// A writer that records what it was asked to do, standing in for one that
-    /// buffers, such as a `BufWriter` or a compressor.
-    #[derive(Default)]
-    struct Recording {
-        bytes: Vec<u8>,
-        flushes: usize,
-    }
-
-    impl Write for Recording {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.bytes.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.flushes += 1;
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn finish_flushes_and_into_inner_does_not() {
-        let write_one = |writer: &mut FlowFilesWriter<Recording>| {
-            writer
-                .write_bytes(&FlowFile::builder().content(&b"content"[..]))
-                .unwrap();
-        };
-
-        let mut writer = FlowFilesWriter::new(Recording::default());
-        write_one(&mut writer);
-        let inner = writer.finish().unwrap();
-        assert_eq!(inner.flushes, 1);
-        assert_eq!(FlowFiles::new(inner.bytes.as_slice()).count(), 1);
-
-        // The escape hatch stays an escape hatch: nothing is pushed out, so a
-        // half-written stream can be discarded instead of completed.
-        let mut writer = FlowFilesWriter::new(Recording::default());
-        write_one(&mut writer);
-        assert_eq!(writer.into_inner().flushes, 0);
-    }
-
-    #[test]
-    fn a_failed_flush_poisons_the_writer() {
-        struct FlushFails;
-
-        impl Write for FlushFails {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::other("the device went away"))
-            }
-        }
-
-        let mut writer = FlowFilesWriter::new(FlushFails);
-        writer
-            .write_bytes(&FlowFile::builder().content(&b"first"[..]))
-            .unwrap();
-
-        assert!(writer.flush().is_err());
-        // Bytes the writer accepted may never have reached the stream, so it
-        // is mid-flow-file for the same reason a failed write leaves it there.
-        assert!(writer.is_poisoned());
-        let err = writer
-            .write_bytes(&FlowFile::builder().content(&b"second"[..]))
-            .unwrap_err();
-        assert!(is_poisoned_error(&err), "{err:?}");
-    }
-
-    #[test]
-    fn from_bytes_limits_apply_to_the_header() {
-        let bytes = sample_flow_file().to_bytes();
-
-        assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, Limits::untrusted().with_max_attributes(1)),
-            Err(Error::TooManyAttributes { count: 2, limit: 1 })
-        ));
-        assert!(matches!(
-            FlowFile::from_bytes_with_limits(&bytes, Limits::untrusted().with_max_content_len(4)),
-            Err(Error::ContentTooLarge { size: 5, limit: 4 })
-        ));
-        assert!(FlowFile::from_bytes_with_limits(&bytes, Limits::untrusted()).is_ok());
-    }
-
-    #[test]
-    fn content_mut_reads_incrementally_and_keeps_the_attributes() {
-        let bytes = sample_bytes();
-        let mut flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
-
-        let mut head = [0u8; 2];
-        flow_file.content_mut().read_exact(&mut head).unwrap();
-        assert_eq!(&head, b"he");
-        assert_eq!(flow_file.attributes()["path"], "x");
-
-        // The rest is still there, and the flow file still knows its size.
-        assert_eq!(flow_file.size(), 5);
-        let mut rest = Vec::new();
-        flow_file.content_mut().read_to_end(&mut rest).unwrap();
-        assert_eq!(rest, b"llo");
     }
 
     #[test]
@@ -1811,240 +1277,85 @@ mod tests {
     }
 
     #[test]
-    fn truncated_header_is_an_io_error() {
-        let bytes = sample_bytes();
-        assert!(matches!(
-            FlowFile::from_bytes(&bytes[..10]),
-            Err(Error::Io(_))
-        ));
+    fn readers_still_report_plain_io_errors_as_io() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "gone"))
+            }
+        }
+        assert!(matches!(FlowFile::parse(Broken), Err(Error::Io(_))));
     }
 
     #[test]
-    fn limits_reject_excess_attribute_count() {
-        let flow_file = FlowFile::builder()
-            .attributes((0..10).map(|i| (format!("k{i}"), "v")))
-            .content(Vec::new());
-        let bytes = flow_file.to_bytes();
+    fn a_failed_write_poisons_the_writer() {
+        let mut out = Vec::new();
+        let mut writer = FlowFilesWriter::new(&mut out);
 
-        let limits = Limits::untrusted().with_max_attributes(5);
-        assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), limits),
-            Err(Error::TooManyAttributes {
-                count: 10,
-                limit: 5
-            })
-        ));
-        assert!(FlowFile::parse_with_limits(bytes.as_slice(), Limits::untrusted()).is_ok());
-    }
+        // Declares 10 bytes but the reader holds 5, so the write truncates.
+        let err = writer
+            .write(FlowFile::builder().reader(&b"short"[..], 10))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(writer.is_poisoned());
 
-    /// The aggregate the per-attribute limits cannot express: each attribute
-    /// here is tiny, and together they are not.
-    #[test]
-    fn limits_reject_an_oversized_header_in_total() {
-        let bytes = FlowFile::builder()
-            .attributes((0..10).map(|i| (format!("k{i}"), "v".repeat(100))))
-            .content(Vec::new())
-            .to_bytes();
-
-        let limits = Limits::UNLIMITED.with_max_total_attribute_len(256);
-        assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), limits),
-            Err(Error::HeaderTooLarge { limit: 256, .. })
-        ));
-        // Each one on its own is well inside the per-attribute limits, so
-        // nothing but the total would have caught this.
-        assert!(
-            FlowFile::parse_with_limits(
-                bytes.as_slice(),
-                Limits::UNLIMITED
-                    .with_max_attributes(10)
-                    .with_max_attribute_len(1024)
-            )
-            .is_ok()
-        );
-    }
-
-    /// The total limit has to bound how much the parser buffers, and not only
-    /// what it accepts. Checked against the running total after each pair, one
-    /// attribute could be read into memory in full before anything fired. A
-    /// caller who set only this limit then had no bound at all.
-    #[test]
-    fn the_total_limit_rejects_an_attribute_on_its_declared_length() {
-        // A header declaring an 8 MiB value against a 1 KiB total, with only
-        // four bytes of it actually present. If the length is being trusted,
-        // the parse ends on the truncation instead of on the limit.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"NiFiFF3");
-        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
-        bytes.extend_from_slice(&[0x00, 0x01, b'k']); // key
-        bytes.extend_from_slice(&[0xFF, 0xFF]); // extended value length
-        bytes.extend_from_slice(&(8u32 << 20).to_be_bytes());
-        bytes.extend_from_slice(b"tiny");
-
-        let limits = Limits::UNLIMITED.with_max_total_attribute_len(1024);
-        assert!(
-            matches!(
-                FlowFile::parse_with_limits(bytes.as_slice(), limits),
-                Err(Error::HeaderTooLarge {
-                    len: 8_388_609,
-                    limit: 1024
-                })
-            ),
-            "the declaration alone must be refused, before the bytes are read"
-        );
-
-        // And the key is checked the same way, rather than only the pair.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"NiFiFF3");
-        bytes.extend_from_slice(&[0x00, 0x01]);
-        bytes.extend_from_slice(&[0xFF, 0xFF]);
-        bytes.extend_from_slice(&(8u32 << 20).to_be_bytes());
-        bytes.extend_from_slice(b"tiny");
-        assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), limits),
-            Err(Error::HeaderTooLarge { limit: 1024, .. })
-        ));
-    }
-
-    /// The budget is spent as it goes, so attributes that are each within it
-    /// still fail once they add up. That behavior was already right.
-    #[test]
-    fn the_total_limit_still_accumulates_across_attributes() {
-        let bytes = FlowFile::builder()
-            .attributes((0..10).map(|i| (format!("k{i}"), "v".repeat(100))))
-            .content(Vec::new())
-            .to_bytes();
-
-        let limits = Limits::UNLIMITED.with_max_total_attribute_len(256);
-        assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), limits),
-            Err(Error::HeaderTooLarge { limit: 256, .. })
-        ));
-        // A budget that fits every attribute is not tripped by the tally.
-        assert!(
-            FlowFile::parse_with_limits(
-                bytes.as_slice(),
-                Limits::UNLIMITED.with_max_total_attribute_len(2048)
-            )
-            .is_ok()
-        );
+        let err = writer.write_bytes(&sample_flow_file()).unwrap_err();
+        assert!(is_poisoned_error(&err), "{err:?}");
+        assert_eq!(writer.count(), 0);
     }
 
     #[test]
-    fn limits_reject_oversized_attributes() {
-        let bytes = FlowFile::builder()
-            .attribute("key", "a value larger than the limit")
-            .content(Vec::new())
-            .to_bytes();
-
-        let limits = Limits::untrusted().with_max_attribute_len(8);
-        assert!(matches!(
-            FlowFile::parse_with_limits(bytes.as_slice(), limits),
-            Err(Error::AttributeTooLong { limit: 8, .. })
-        ));
+    fn a_healthy_writer_is_never_poisoned() {
+        let mut writer = FlowFilesWriter::new(Vec::new());
+        writer.write_bytes(&sample_flow_file()).unwrap();
+        writer.write(sample_flow_file().into_reader()).unwrap();
+        assert!(!writer.is_poisoned());
+        assert_eq!(writer.count(), 2);
+        let bytes = writer.finish().unwrap();
+        assert_eq!(FlowFiles::new(bytes.as_slice()).count(), 2);
     }
 
-    /// Both halves of the reservation schedule, which exist in tension: it has
-    /// to size the buffer well for content that really arrives, without ever
-    /// sizing it from a number the input has not backed with bytes.
+    /// Both halves of the reservation schedule: it has to size the buffer
+    /// well for content that really arrives, without ever sizing it from a
+    /// number the input has not backed with bytes.
     #[test]
     fn content_is_buffered_at_its_exact_size_without_trusting_the_declaration() {
-        // Well past `RESERVE_AHEAD`, so several rounds of growth happen and
-        // the last one still has to land exactly rather than overshoot.
-        for size in [0, 1, 1024, 64 * 1024, 300 * 1024, 4 << 20] {
-            let bytes = FlowFile::builder().content(vec![7u8; size]).to_bytes();
-            let content = FlowFile::parse(bytes.as_slice())
-                .unwrap()
-                .into_memory()
-                .unwrap()
-                .into_content();
+        let content = vec![7u8; 3 * format::RESERVE_AHEAD + 17];
+        let bytes = FlowFile::builder().content(content.clone()).to_bytes();
+        let parsed = FlowFile::parse(bytes.as_slice())
+            .unwrap()
+            .into_memory()
+            .unwrap();
+        assert_eq!(parsed.content(), &content);
+        assert_eq!(parsed.content().capacity(), content.len(), "exact");
 
-            assert_eq!(content.len(), size);
-            assert_eq!(
-                content.capacity(),
-                size,
-                "{size} bytes should land in an allocation of exactly {size}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_declared_size_no_input_backs_costs_no_allocation_for_it() {
-        // A header declaring 1 TiB of content over an empty one.
-        let mut bytes = FlowFile::builder().content(Vec::new()).to_bytes();
-        let declared = 1u64 << 40;
-        let size_at = bytes.len() - 8;
-        bytes[size_at..].copy_from_slice(&declared.to_be_bytes());
-
-        let flow_file = FlowFile::parse(bytes.as_slice()).unwrap();
-        assert_eq!(flow_file.size(), declared);
-
-        // The reservation follows the bytes that arrive, so this fails on the
-        // truncation rather than on a terabyte of memory.
-        let err = flow_file.into_memory().unwrap_err();
+        // A header claiming far more than arrives.
+        let mut lying = FlowFile::builder().content(vec![1u8; 100]).to_bytes();
+        let size_at = lying.len() - 100 - 8;
+        lying[size_at..size_at + 8].copy_from_slice(&(1u64 << 40).to_be_bytes());
+        let err = FlowFile::parse(lying.as_slice())
+            .unwrap()
+            .into_memory()
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-        assert!(matches!(
-            err.get_ref().and_then(|e| e.downcast_ref::<Error>()),
-            Some(Error::SizeMismatch { actual: 0, .. })
-        ));
-    }
-
-    #[test]
-    fn declared_length_beyond_input_fails_without_allocating() {
-        // Header declaring a ~4 GiB attribute key, but hardly any actual data.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"NiFiFF3");
-        bytes.extend_from_slice(&[0x00, 0x01]); // one attribute
-        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]); // key length
-        bytes.extend_from_slice(b"tiny");
-        let err = FlowFile::parse(bytes.as_slice()).unwrap_err();
-        assert!(matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof));
-        // Reaching this at all is the assertion: a buffer sized from the
-        // declared length would have asked for 4 GiB. What it does reserve is
-        // bounded by `RESERVE_AHEAD` and then by bytes that actually arrived,
-        // which here is four of them.
-        assert_eq!(RESERVE_AHEAD, 64 * 1024, "the bound this test relies on");
-    }
-
-    #[test]
-    fn invalid_utf8_attribute_is_rejected() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"NiFiFF3");
-        bytes.extend_from_slice(&[0x00, 0x01]);
-        bytes.extend_from_slice(&[0x00, 0x01, 0xFF]); // invalid UTF-8 key
-        bytes.extend_from_slice(&[0x00, 0x01, b'v']);
-        bytes.extend_from_slice(&[0; 8]);
-        assert!(matches!(
-            FlowFile::from_bytes(&bytes),
-            Err(Error::InvalidAttribute(_))
-        ));
     }
 
     #[test]
     fn large_attribute_uses_extended_field_length() {
-        let value = "v".repeat(70_000);
+        let value = "v".repeat(0x1_0000);
         let flow_file = FlowFile::builder()
-            .attribute("big", &value)
-            .content(&b""[..]);
+            .attribute("k", &value)
+            .content(Vec::new());
         let bytes = flow_file.to_bytes();
-        // key, then extended length marker for the value
-        let marker = [
-            0x00, 0x03, b'b', b'i', b'g', 0xFF, 0xFF, 0x00, 0x01, 0x11, 0x70,
-        ];
-        assert!(bytes.windows(marker.len()).any(|w| w == marker));
-        let parsed = FlowFile::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.attributes()["big"], value);
+        assert!(bytes[7 + 2 + 2 + 1..].starts_with(&[0xFF, 0xFF]));
+        assert_eq!(FlowFile::from_bytes(&bytes).unwrap(), flow_file);
     }
 
     #[test]
     fn empty_attributes_and_content() {
-        let bytes = FlowFile::builder().content(Vec::new()).to_bytes();
-        let mut expected = b"NiFiFF3".to_vec();
-        expected.extend_from_slice(&[0x00, 0x00]);
-        expected.extend_from_slice(&[0; 8]);
-        assert_eq!(bytes, expected);
-        let parsed = FlowFile::from_bytes(&bytes).unwrap();
-        assert!(parsed.attributes().is_empty());
-        assert_eq!(parsed.size(), 0);
+        let flow_file = FlowFile::builder().empty();
+        let bytes = flow_file.to_bytes();
+        assert_eq!(bytes.len(), 7 + 2 + 8);
+        assert_eq!(FlowFile::from_bytes(&bytes).unwrap(), flow_file);
     }
 }

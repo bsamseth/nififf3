@@ -1,4 +1,4 @@
-//! A service that streams large flow files: split, transform and merge.
+//! A service that handles large flow files: split, transform and merge.
 //!
 //! This is meant to be copied. Everything above the harness banner is what a
 //! pipeline handling inputs and outputs too large to buffer needs, and the
@@ -13,53 +13,46 @@
 //! three handlers differ only in where that size comes from:
 //!
 //! - `POST /split` cuts the input into fixed-size chunks, so every size is
-//!   known in advance. Nothing is ever held: the input streams into the parts.
+//!   known in advance. Each part streams straight out of the spool.
 //! - `POST /transform` gzips the input, and compression reports its length
-//!   only by finishing. The output goes to a temporary file, and the response
-//!   streams from there.
+//!   only by finishing. The output is spooled, and the response streams from
+//!   there.
 //! - `POST /merge` concatenates flow files, so the length is the sum of
-//!   theirs. That is not known until every header has been read, and reading a
-//!   header means consuming the content before it. The request is spooled and
-//!   read twice: once to add up the sizes, once to stream.
+//!   theirs. The spool is read twice: once to add up the sizes, once to
+//!   stream.
 //!
 //! # What the wiring has to do
 //!
-//! Every handler spools its request with `spool_async`, so that reading the
-//! request never waits on the response. Without it, a client that sends its
-//! whole request before reading any of the answer deadlocks against a handler
-//! that answers as it reads. NiFi's client is one of those.
-//! `FlowFilesResponse` describes the deadlock and
-//! `tests/response_deadlock.rs` reproduces it.
+//! The extractors read each request in full before the handler runs, into
+//! memory or to disk by size, so no handler here ever reads from the socket
+//! while it writes to it. That is what keeps a client which sends before it
+//! reads, as NiFi's does, from deadlocking the service.
 //!
-//! `DefaultBodyLimit` is raised rather than disabled. It caps the bytes a
-//! client actually sends, which is the only bound that means anything on a
-//! public endpoint. Disabling it lets any client hold as much of your disk as
-//! it likes. The header is bounded separately: both extractors apply
-//! `Limits::untrusted`, so a crafted header is rejected before its
-//! attributes are read.
+//! `DefaultBodyLimit` is raised to what the service is willing to accept,
+//! because axum's default of 2 MiB fails most flow files. `SpoolConfig` says
+//! how large a request may be before it goes to disk.
 //!
 //! Validation happens before a `FlowFilesResponse` is returned, because
 //! returning one commits the status to 200. After that a problem can only be
 //! reported inside the body.
 //!
-//!     cargo run --features axum,tempfile --example axum_service_large_files
+//!     cargo run --features axum --example axum_service_large_files
 
 use async_compression::tokio::bufread::GzipEncoder;
-use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{StatusCode, header};
 use axum::routing::post;
-use axum::{Router, response::IntoResponse};
-use nififf3::{
-    Error, FlowFile, FlowFileBody, FlowFilesAsync, FlowFilesReaderAsync, FlowFilesResponse,
-    StrictFlowFileRequest, attr,
-};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
+use axum::{Extension, Router, response::IntoResponse};
+use nififf3::{Error, FlowFile, FlowFilesReaderAsync, FlowFilesResponse, Spool, SpoolConfig, attr};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 /// The largest request the service will accept.
 const MAX_UPLOAD: usize = 64 << 20;
+
+/// Requests over this size are spooled to disk rather than held in memory.
+const MAX_IN_MEMORY: usize = 1 << 20;
 
 /// How much content goes in each part `/split` produces.
 const CHUNK: u64 = 1 << 20;
@@ -72,9 +65,7 @@ const INPUT: usize = 4 << 20;
 /// The chunk size decides every part's length up front, so each part can be a
 /// reader over the next stretch of the input. `write` streams exactly the
 /// declared number of bytes, so a part is never resident however large it is.
-async fn split(
-    StrictFlowFileRequest(parent): StrictFlowFileRequest,
-) -> Result<FlowFilesResponse, (StatusCode, String)> {
+async fn split(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, (StatusCode, String)> {
     // Check what can be checked here, while a status code is still available.
     // Returning the response below commits this request to 200, and after that
     // a problem can only be reported as a flow file inside the body.
@@ -85,9 +76,6 @@ async fn split(
         ));
     };
 
-    let parent = parent
-        .spool_async()
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     let remaining = parent.size();
     let mut parts = parent.fragments();
     let mut content = parent.into_content();
@@ -116,42 +104,29 @@ async fn split(
 /// One in, one out, where the transform changes the length.
 ///
 /// Compression only reports its length by running to the end, so there is no
-/// size to declare until it has. `tempfile_async` reads the encoder to
-/// completion into an anonymous temporary file and takes the size from what it
-/// wrote. Memory stays flat; the bytes live on disk until the response streams
-/// them out.
-async fn transform(
-    StrictFlowFileRequest(parent): StrictFlowFileRequest,
-) -> Result<impl IntoResponse, Error> {
-    let parent = parent.spool_async()?;
+/// size to declare until it has. `spool_async` reads the encoder to completion
+/// and takes the size from what it read, holding the output in memory or on
+/// disk by the same rule the extractor uses.
+async fn transform(parent: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
     let builder = parent
         .derive()
-        .attribute("mime.type", "application/gzip")
+        .attribute(attr::MIME_TYPE, "application/gzip")
         .attribute("transformed", "gzip");
     let encoder = GzipEncoder::new(BufReader::new(parent.into_content()));
-    Ok(builder.tempfile_async(encoder).await?)
+    Ok(builder.spool_async(encoder).await?)
 }
 
 /// Many in, one out.
 ///
 /// The merged length is the sum of the inputs', and a flow file's size is only
-/// known once its header has been read. Reading the next header means
-/// consuming the content before it, so one pass cannot both learn the total
-/// and still have the content to send. The request is spooled to a file and
-/// read twice instead: the first pass adds up the sizes and takes the
-/// attributes from the first part, the second streams the contents out.
-async fn merge(body: Body) -> Result<impl IntoResponse, Error> {
-    // The route disables `DefaultBodyLimit`, so nothing is lost by reading the
-    // body directly. Behind a limit, go through `RequestExt::with_limited_body`.
-    let spool = FlowFile::builder()
-        .tempfile_async(FlowFileBody::from_body(body))
-        .await?;
-    let mut file = spool.into_content();
-
+/// known once its header has been read. The spool is read twice: the first
+/// pass adds up the sizes and takes the attributes from the first part, and
+/// the second streams the contents out one after another.
+async fn merge(mut body: Spool) -> Result<impl IntoResponse, Error> {
     let mut merged = None;
     let mut size = 0;
     {
-        let mut parts = FlowFilesReaderAsync::new(&mut file);
+        let mut parts = FlowFilesReaderAsync::new(&mut body);
         while let Some(part) = parts.next().await? {
             // `defragment` drops the fragment attributes and puts `filename`
             // back, so the result looks like the flow file the split started
@@ -165,13 +140,14 @@ async fn merge(body: Body) -> Result<impl IntoResponse, Error> {
             // when the next part is asked for.
         }
     }
-    file.rewind().await?;
+    body.rewind().await?;
 
     // The second pass feeds the response as it goes, so the merged content is
-    // never resident either.
+    // never resident either. The spool is a plain value, so the task copying
+    // from it waits on nothing but the client.
     let (mut sink, source) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
-        let mut parts = FlowFilesReaderAsync::new(file);
+        let mut parts = FlowFilesReaderAsync::new(body);
         while let Ok(Some(mut part)) = parts.next().await {
             if tokio::io::copy(part.content_mut(), &mut sink)
                 .await
@@ -196,6 +172,10 @@ fn app() -> Router {
         // The default is 2 MiB, which every request here would fail. Raise it
         // to what the service is willing to accept, rather than disabling it.
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
+        // Requests up to a MiB stay in memory; the rest go to disk.
+        .layer(Extension(
+            SpoolConfig::new().with_max_in_memory(MAX_IN_MEMORY),
+        ))
 }
 
 /// What `main` looks like in production.
@@ -242,12 +222,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (status, bundle) = send(&client, addr, "/split", incoming.clone()).await?;
     assert_eq!(status, StatusCode::OK, "split");
 
-    let mut flow_files = FlowFilesAsync::new(bundle.as_slice());
+    let mut flow_files = nififf3::FlowFilesAsync::new(bundle.as_slice());
     let (mut chunks, mut chunk_bytes, mut declared) = (0, 0u64, None);
     while let Some(part) = flow_files.next().await {
         let part = part?;
         // The terminator is the one carrying the count, and it has no content.
-        if let Some(count) = part.parse_attribute::<usize>("fragment.count")? {
+        if let Some(count) = part.parse_attribute::<usize>(attr::FRAGMENT_COUNT)? {
             declared = Some(count);
         } else {
             chunks += 1;
@@ -266,10 +246,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "POST /transform -> {} bytes gzipped, mime.type={}",
         compressed.size(),
-        compressed.attributes()["mime.type"],
+        compressed[attr::MIME_TYPE],
     );
     assert!(compressed.size() < content.len() as u64, "it compressed");
-    assert_eq!(compressed.attributes()["filename"], "large.bin");
+    assert_eq!(compressed[attr::FILENAME], "large.bin");
 
     // --- many in, one out --------------------------------------------------
     // The bundle `/split` produced goes straight back in.
@@ -279,11 +259,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "POST /merge -> {} bytes, filename={}",
         rejoined.size(),
-        rejoined.attributes()["filename"],
+        rejoined[attr::FILENAME],
     );
     assert_eq!(rejoined.content(), &content, "the split is undone exactly");
     assert!(
-        !rejoined.attributes().contains_key("fragment.index"),
+        !rejoined.attributes().contains_key(attr::FRAGMENT_INDEX),
         "defragment drops the fragment attributes"
     );
 
@@ -312,9 +292,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Send one flow file and return the status and the whole response body.
-///
-/// A real client would stream the response rather than collect it. This one
-/// collects because it has to assert on all of it.
 async fn send(
     client: &reqwest::Client,
     addr: std::net::SocketAddr,

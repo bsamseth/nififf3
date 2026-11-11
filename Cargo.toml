@@ -1,12 +1,12 @@
 [package]
 name = "nififf3"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2024"
 # Let-chains, which this crate uses throughout its parsing code, are stable
 # from 1.88 in edition 2024. Verified: 1.88 builds all features against the
 # locked dependency set, 1.87 rejects every let-chain.
 rust-version = "1.88"
-description = "Utilities for working with NiFi FlowFile V3 files: parsing, serialization, CLI and axum integration."
+description = "Read and write NiFi FlowFile V3 files, and serve them over HTTP with axum."
 license = "Unlicense"
 documentation = "https://docs.rs/nififf3"
 repository = "https://github.com/bsamseth/nififf3"
@@ -31,11 +31,15 @@ default = ["uuid", "tracing"]
 uuid = ["dep:uuid"]
 tracing = ["dep:tracing"]
 tokio = ["dep:tokio"]
-tempfile = ["dep:tempfile"]
+# Spooling to disk. With `tokio` as well it enables `Spool`, which needs a
+# runtime to create temporary files off the async threads.
+tempfile = ["dep:tempfile", "tokio?/rt"]
 stream = ["tokio", "dep:futures-core"]
+# The extractors spool every request, so `axum` needs `tempfile`.
 axum = [
     "tokio",
     "tokio/rt",
+    "tempfile",
     "stream",
     "dep:axum",
     "dep:tokio-util",
@@ -113,11 +117,9 @@ required-features = ["tokio", "uuid"]
 name = "axum_service"
 required-features = ["axum", "uuid"]
 
-# Also needs `tempfile`: it spools the request, and the gzip handler spools
-# its output to learn the length.
 [[example]]
 name = "axum_service_large_files"
-required-features = ["axum", "uuid", "tempfile"]
+required-features = ["axum", "uuid"]
 
 [[bench]]
 name = "flowfiles"
