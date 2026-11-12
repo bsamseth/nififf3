@@ -191,6 +191,7 @@ impl Rejection {
     }
 
     /// Say what happened, since the handler never runs to say it.
+    #[cfg_attr(not(feature = "tracing"), expect(clippy::unused_self))]
     fn log(&self) {
         #[cfg(feature = "tracing")]
         match self {
