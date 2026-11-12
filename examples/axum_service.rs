@@ -3,8 +3,9 @@
 //! Two handlers on one `Router`:
 //!
 //! - `POST /transform` takes one flow file in and sends one out. The
-//!   extractor is `FlowFile<Spool>`, and the answer is a flow file, which is
-//!   itself an `IntoResponse`.
+//!   extractor is `FlowFile`, whose content is a `Spool` unless said
+//!   otherwise, and the answer is a flow file, which is itself an
+//!   `IntoResponse`.
 //! - `POST /split` takes one flow file in and sends many out, through
 //!   `FlowFilesResponse`.
 //!
@@ -19,11 +20,11 @@ use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
 use axum::{Router, response::IntoResponse};
 use http_body_util::BodyExt;
-use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse, Spool};
+use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse};
 use tower::ServiceExt;
 
 /// One in, one out: the content is rewritten, the attributes carried over.
-async fn transform(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
+async fn transform(flow_file: FlowFile) -> Result<impl IntoResponse, Error> {
     let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file
         .derive()
@@ -38,7 +39,7 @@ async fn transform(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Erro
 /// `FlowFilesResponse` is returned. Past that point the status is already 200,
 /// so a problem with one record belongs in the body, as attributes on a flow
 /// file of its own.
-async fn split(flow_file: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
+async fn split(flow_file: FlowFile) -> Result<FlowFilesResponse, Error> {
     let parent = flow_file.into_memory_async().await?;
     let mut parts = parent.fragments();
 

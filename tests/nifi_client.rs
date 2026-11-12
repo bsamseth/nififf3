@@ -15,7 +15,7 @@ use axum::RequestExt as _;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::routing::post;
-use nififf3::{Error, FlowFile, FlowFileBody, FlowFilesResponse, Spool};
+use nififf3::{Error, FlowFile, FlowFileBody, FlowFilesResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio_stream::StreamExt;
@@ -57,7 +57,7 @@ async fn tar_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 /// One flow file per archive entry, streamed straight through. The parent is
 /// spooled by the extractor, so the response never waits on the socket.
-async fn split(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
+async fn split(parent: FlowFile) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = Archive::new(BufReader::new(parent.into_content()));
     Ok(FlowFilesResponse::new(move |mut writer| async move {
@@ -81,7 +81,7 @@ async fn split(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
 }
 
 /// The flow file straight back out.
-async fn echo(parent: FlowFile<Spool>) -> FlowFile<Spool> {
+async fn echo(parent: FlowFile) -> FlowFile {
     parent
 }
 

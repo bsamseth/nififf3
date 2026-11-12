@@ -14,9 +14,9 @@ Answering NiFi over HTTP is the shortest way to see it:
 ```rust
 # #[cfg(all(feature = "axum", feature = "uuid"))] {
 use axum::response::IntoResponse;
-use nififf3::{Error, FlowFile, Spool};
+use nififf3::{Error, FlowFile};
 
-async fn shout(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
+async fn shout(flow_file: FlowFile) -> Result<impl IntoResponse, Error> {
     let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file
         .derive()
@@ -27,11 +27,15 @@ async fn shout(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
 # }
 ```
 
-`FlowFile<Spool>` is the extractor. It reads the whole request before the
-handler runs, into memory below a size and into a temporary file above it.
-`derive` carries the attributes over and mints a fresh `uuid`, as NiFi does
-for a new flow file. The answer is a flow file, which is a response in its own
-right.
+`FlowFile` is the extractor. It reads the whole request before the handler
+runs, into memory below a size and into a temporary file above it. `derive`
+carries the attributes over and mints a fresh `uuid`, as NiFi does for a new
+flow file. The answer is a flow file, which is a response in its own right.
+
+A plain `FlowFile` is a `FlowFile<Spool>`: content read in full, in memory or
+in a temporary file by size. The type parameter only appears when the content
+is something else, such as a `Vec<u8>` built in memory or a reader that is
+still streaming.
 
 ## Parsing
 
@@ -108,11 +112,15 @@ ways to do that.
 
 ## Axum integration
 
-`FlowFile<Spool>` extracts one flow file, and `Spool` extracts a whole body,
-for a request holding several concatenated flow files. Both read the request in
-full before the handler runs. A flow file whose content is an `AsyncRead` is an
-`IntoResponse`, and `FlowFilesResponse` streams many of them out for a handler
-that turns one flow file into several.
+`FlowFile` extracts one flow file, and `Spool` extracts a whole body, for a
+request holding several concatenated flow files. Both read the request in full
+before the handler runs. A flow file whose content is an `AsyncRead` is an
+`IntoResponse`, which a plain `FlowFile` is, and `FlowFilesResponse` streams
+many of them out for a handler that turns one flow file into several.
+
+`FlowFileBody` is the escape hatch: an `AsyncRead` over the raw request body,
+for a handler that has a reason to parse while the request is still arriving
+and knows its client will read concurrently.
 
 Reading the request first is what makes the service safe against NiFi's HTTP
 client, which sends its whole request before it reads any of the response. A

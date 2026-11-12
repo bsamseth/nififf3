@@ -51,7 +51,9 @@ pub use async_io::{
 pub use futures_core::Stream;
 
 #[cfg(feature = "axum")]
-pub use axum_support::{BoxError, FlowFileBody, FlowFilesResponse, Rejection};
+pub use axum_support::{
+    BlockingResponseWriter, BoxError, FlowFileBody, FlowFilesResponse, Rejection, ResponseWriter,
+};
 
 #[cfg(all(feature = "tokio", feature = "tempfile"))]
 pub use spool::{Spool, SpoolConfig};
@@ -65,60 +67,82 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The media type of a flow file V3, as used by NiFi.
 pub const MEDIA_TYPE: &str = "application/flowfile-v3";
 
-/// A NiFi flow file: a content payload with associated string attributes.
-///
-/// The type is generic over the container of the content, `R`. Parsing
-/// produces either an in-memory [`FlowFile<Vec<u8>>`] (via
-/// [`FlowFile::from_bytes`]) or a lazy variant whose content is a
-/// size-limited reader (via [`FlowFile::parse`], and its `tokio` twin
-/// `parse_async`).
-///
-/// # Where to start
-///
-/// Being generic spreads the entry points over several `impl` blocks below,
-/// and each block is headed by a `Self` type rather than by what it is for.
-/// This table indexes them by what they do:
-///
-/// | | in memory | from a reader | many, concatenated |
-/// | --- | --- | --- | --- |
-/// | **parse** | [`from_bytes`], [`from_vec`] | [`from_reader`] buffers, [`parse`] streams | [`FlowFiles`] buffers, [`FlowFilesReader`] streams, [`parse_next`] is the primitive |
-/// | **serialize** | [`to_bytes`] | [`write_to`] | [`FlowFilesWriter`] |
-#[cfg_attr(
-    feature = "tokio",
-    doc = "| **parse, async** | | [`from_reader_async`] buffers, [`parse_async`] streams | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
-)]
-#[cfg_attr(
-    feature = "tokio",
-    doc = "| **serialize, async** | | [`write_to_async`] | [`FlowFilesWriterAsync`] |"
-)]
-///
-/// [`builder`](Self::builder) creates a flow file from scratch, `derive`
-/// creates one from another flow file's attributes, and `fragments` splits one
-/// into many.
-///
-/// [`from_bytes`]: Self::from_bytes
-/// [`from_vec`]: Self::from_vec
-/// [`from_reader`]: Self::from_reader
-/// [`parse`]: Self::parse
-/// [`parse_next`]: Self::parse_next
-/// [`to_bytes`]: Self::to_bytes
-/// [`write_to`]: Self::write_to
-#[cfg_attr(feature = "tokio", doc = "[`parse_async`]: Self::parse_async")]
-#[cfg_attr(
-    feature = "tokio",
-    doc = "[`from_reader_async`]: Self::from_reader_async"
-)]
-#[cfg_attr(
-    feature = "tokio",
-    doc = "[`parse_next_async`]: Self::parse_next_async"
-)]
-#[cfg_attr(feature = "tokio", doc = "[`write_to_async`]: Self::write_to_async")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlowFile<R> {
-    pub(crate) size: u64,
-    pub(crate) attributes: HashMap<String, String>,
-    pub(crate) content: R,
+// `R` defaults to `Spool` when that type exists. A default is a type, so the
+// struct is defined once per case through this macro, which keeps the feature
+// additive: turning it on lets a bare `FlowFile` compile, and changes nothing
+// that compiled before. The docs are written once and land on both.
+macro_rules! define_flow_file {
+    ($($generics:tt)+) => {
+        /// A NiFi flow file: a content payload with associated string attributes.
+        ///
+        /// The type is generic over the container of the content, `R`. Parsing
+        /// produces either an in-memory [`FlowFile<Vec<u8>>`] (via
+        /// [`FlowFile::from_bytes`]) or a lazy variant whose content is a
+        /// size-limited reader (via [`FlowFile::parse`], and its `tokio` twin
+        /// `parse_async`).
+        ///
+        #[cfg_attr(
+            all(feature = "tokio", feature = "tempfile"),
+            doc = "With the `tokio` and `tempfile` features, `R` defaults to [`Spool`]: content \
+                   read in full, held in memory or in a temporary file by size. A plain \
+                   `FlowFile` is what the axum extractor produces and what `spool_async` \
+                   returns, so the type parameter only appears when the content is \
+                   something else, such as a `Vec<u8>` or a reader that is still streaming."
+        )]
+        ///
+        /// # Where to start
+        ///
+        /// Being generic spreads the entry points over several `impl` blocks below,
+        /// and each block is headed by a `Self` type rather than by what it is for.
+        /// This table indexes them by what they do:
+        ///
+        /// | | in memory | from a reader | many, concatenated |
+        /// | --- | --- | --- | --- |
+        /// | **parse** | [`from_bytes`], [`from_vec`] | [`from_reader`] buffers, [`parse`] streams | [`FlowFiles`] buffers, [`FlowFilesReader`] streams, [`parse_next`] is the primitive |
+        /// | **serialize** | [`to_bytes`] | [`write_to`] | [`FlowFilesWriter`] |
+        #[cfg_attr(
+            feature = "tokio",
+            doc = "| **parse, async** | | [`from_reader_async`] buffers, [`parse_async`] streams | [`FlowFilesAsync`], [`FlowFilesReaderAsync`], [`parse_next_async`] |"
+        )]
+        #[cfg_attr(
+            feature = "tokio",
+            doc = "| **serialize, async** | | [`write_to_async`] | [`FlowFilesWriterAsync`] |"
+        )]
+        ///
+        /// [`builder`](Self::builder) creates a flow file from scratch, `derive`
+        /// creates one from another flow file's attributes, and `fragments` splits one
+        /// into many.
+        ///
+        /// [`from_bytes`]: Self::from_bytes
+        /// [`from_vec`]: Self::from_vec
+        /// [`from_reader`]: Self::from_reader
+        /// [`parse`]: Self::parse
+        /// [`parse_next`]: Self::parse_next
+        /// [`to_bytes`]: Self::to_bytes
+        /// [`write_to`]: Self::write_to
+        #[cfg_attr(feature = "tokio", doc = "[`parse_async`]: Self::parse_async")]
+        #[cfg_attr(
+            feature = "tokio",
+            doc = "[`from_reader_async`]: Self::from_reader_async"
+        )]
+        #[cfg_attr(
+            feature = "tokio",
+            doc = "[`parse_next_async`]: Self::parse_next_async"
+        )]
+        #[cfg_attr(feature = "tokio", doc = "[`write_to_async`]: Self::write_to_async")]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct FlowFile<$($generics)+> {
+            pub(crate) size: u64,
+            pub(crate) attributes: HashMap<String, String>,
+            pub(crate) content: R,
+        }
+    };
 }
+
+#[cfg(all(feature = "tokio", feature = "tempfile"))]
+define_flow_file!(R = Spool);
+#[cfg(not(all(feature = "tokio", feature = "tempfile")))]
+define_flow_file!(R);
 
 impl FlowFile<()> {
     /// Start building a flow file. See [`FlowFileBuilder`].

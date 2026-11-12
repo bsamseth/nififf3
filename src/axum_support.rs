@@ -283,9 +283,9 @@ async fn drain(body: &mut FlowFileBody) -> io::Result<u64> {
 ///
 /// ```no_run
 /// use axum::response::IntoResponse;
-/// use nififf3::{Error, FlowFile, Spool};
+/// use nififf3::{Error, FlowFile};
 ///
-/// async fn shout(flow_file: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
+/// async fn shout(flow_file: FlowFile) -> Result<impl IntoResponse, Error> {
 ///     let flow_file = flow_file.into_memory_async().await?;
 ///     Ok(flow_file
 ///         .derive()
@@ -320,7 +320,7 @@ async fn drain(body: &mut FlowFileBody) -> io::Result<u64> {
 ///     .route("/large", post(handler))
 ///     .layer(DefaultBodyLimit::max(8 << 30)); // or ::disable()
 /// ```
-impl<S: Send + Sync> FromRequest<S> for FlowFile<Spool> {
+impl<S: Send + Sync> FromRequest<S> for FlowFile {
     type Rejection = Rejection;
 
     #[cfg_attr(
@@ -365,7 +365,7 @@ async fn extract_one(
     body: &mut FlowFileBody,
     config: &SpoolConfig,
     content_type: Option<&str>,
-) -> Result<FlowFile<Spool>, Rejection> {
+) -> Result<FlowFile, Rejection> {
     let parsed = FlowFile::parse_async(&mut *body)
         .await
         .map_err(|error| Rejection::from_error(error, content_type))?;
@@ -415,7 +415,7 @@ async fn extract_one(
 /// reported by the reader rather than by a rejection. The body is subject to
 /// axum's [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) and goes to
 /// memory or disk as the [`SpoolConfig`] in the router's extensions says,
-/// exactly as for `FlowFile<Spool>`.
+/// exactly as for `FlowFile`.
 impl<S: Send + Sync> FromRequest<S> for Spool {
     type Rejection = Rejection;
 
@@ -458,7 +458,7 @@ impl<S: Send + Sync> FromRequest<S> for Spool {
 /// [`size`](FlowFile::size) bytes are read from the content reader.
 ///
 /// The bound is on the content, so this covers every reader-backed flow file,
-/// including a `FlowFile<Spool>` straight from the extractor. It does not
+/// including a plain `FlowFile` straight from the extractor. It does not
 /// cover an in-memory `FlowFile<Vec<u8>>`, because `Vec<u8>` is not an
 /// [`AsyncRead`] and coherence forbids a second impl for it. Call
 /// [`into_reader`](FlowFile::into_reader) on one of those first:
@@ -605,7 +605,7 @@ enum Source {
 
 /// A response carrying *many* flow files, concatenated as NiFi expects them.
 ///
-/// The one-to-many counterpart to extracting a `FlowFile<Spool>`: a handler
+/// The one-to-many counterpart to extracting a `FlowFile`: a handler
 /// takes one flow file in and answers with a flow file per part it found
 /// inside. Parts are produced lazily and streamed, so neither their number
 /// nor the size of any one of them is bounded by memory. See

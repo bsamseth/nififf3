@@ -65,7 +65,7 @@ const INPUT: usize = 4 << 20;
 /// The chunk size decides every part's length up front, so each part can be a
 /// reader over the next stretch of the input. `write` streams exactly the
 /// declared number of bytes, so a part is never resident however large it is.
-async fn split(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, (StatusCode, String)> {
+async fn split(parent: FlowFile) -> Result<FlowFilesResponse, (StatusCode, String)> {
     // Check what can be checked here, while a status code is still available.
     // Returning the response below commits this request to 200, and after that
     // a problem can only be reported as a flow file inside the body.
@@ -107,7 +107,7 @@ async fn split(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, (StatusCode
 /// size to declare until it has. `spool_async` reads the encoder to completion
 /// and takes the size from what it read, holding the output in memory or on
 /// disk by the same rule the extractor uses.
-async fn transform(parent: FlowFile<Spool>) -> Result<impl IntoResponse, Error> {
+async fn transform(parent: FlowFile) -> Result<impl IntoResponse, Error> {
     let builder = parent
         .derive()
         .attribute(attr::MIME_TYPE, "application/gzip")

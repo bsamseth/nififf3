@@ -97,8 +97,9 @@ impl Default for SpoolConfig {
 /// Content that has been read in full, held in memory or in a temporary file
 /// depending on its size. See [`SpoolConfig`].
 ///
-/// The axum extractor for `FlowFile<Spool>` produces one for every request,
-/// and so do [`FlowFile::spool_async`] and [`FlowFileBuilder::spool_async`].
+/// This is the default content of a [`FlowFile`]: a plain `FlowFile` is a
+/// `FlowFile<Spool>`. The axum extractor produces one for every request, and
+/// so do [`FlowFile::spool_async`] and [`FlowFileBuilder::spool_async`].
 /// Whatever produced it has already read the content to the end, so a
 /// `Spool` never waits on a network or on another task. Reading it yields the
 /// content from the current position, and it can be rewound and read again.
@@ -457,7 +458,7 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`Spool::from_reader_exact`].
-    pub async fn spool_async(self) -> io::Result<FlowFile<Spool>> {
+    pub async fn spool_async(self) -> io::Result<FlowFile> {
         self.spool_async_with(&SpoolConfig::new()).await
     }
 
@@ -467,7 +468,7 @@ impl<R: AsyncRead + Unpin> FlowFile<R> {
     /// # Errors
     ///
     /// As [`Spool::from_reader_exact`].
-    pub async fn spool_async_with(self, config: &SpoolConfig) -> io::Result<FlowFile<Spool>> {
+    pub async fn spool_async_with(self, config: &SpoolConfig) -> io::Result<FlowFile> {
         let (size, attributes, content) = self.into_parts();
         let spool = Spool::from_reader_exact(content, size, config).await?;
         Ok(FlowFile::from_raw_parts(size, attributes, spool))
@@ -495,7 +496,7 @@ impl FlowFileBuilder {
     /// # Errors
     ///
     /// As [`Spool::from_reader`].
-    pub async fn spool_async(self, content: impl AsyncRead + Unpin) -> io::Result<FlowFile<Spool>> {
+    pub async fn spool_async(self, content: impl AsyncRead + Unpin) -> io::Result<FlowFile> {
         self.spool_async_with(content, &SpoolConfig::new()).await
     }
 
@@ -509,7 +510,7 @@ impl FlowFileBuilder {
         self,
         content: impl AsyncRead + Unpin,
         config: &SpoolConfig,
-    ) -> io::Result<FlowFile<Spool>> {
+    ) -> io::Result<FlowFile> {
         let spool = Spool::from_reader(content, config).await?;
         let size = spool.len();
         Ok(self.reader(spool, size))

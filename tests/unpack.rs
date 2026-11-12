@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
 use axum::{Router, response::IntoResponse};
 use http_body_util::BodyExt;
-use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse, Spool};
+use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder, EntryType, Header};
@@ -67,7 +67,7 @@ fn archive_of(parent: FlowFile<impl AsyncRead + Unpin>) -> Archive<impl AsyncRea
 /// declared size before its bytes are read, so an entry whose content runs
 /// short can only abort the response. See [`unpack_lenient`] for the
 /// alternative.
-async fn unpack(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
+async fn unpack(parent: FlowFile) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = archive_of(parent);
 
@@ -118,7 +118,7 @@ async fn unpack(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
 /// while nothing has been committed for it yet, so it can be reported as an
 /// error flow file instead of poisoning the response. The cost is holding one
 /// entry in memory at a time, which the streaming [`unpack`] does not pay.
-async fn unpack_lenient(parent: FlowFile<Spool>) -> Result<FlowFilesResponse, Error> {
+async fn unpack_lenient(parent: FlowFile) -> Result<FlowFilesResponse, Error> {
     let mut parts = parent.fragments();
     let mut archive = archive_of(parent);
 

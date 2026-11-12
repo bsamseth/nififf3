@@ -11,7 +11,11 @@ item is touched; the sections below say how.
 
 ### Changed
 
-- The axum extractor is `FlowFile<Spool>`, and `Spool` extracts a whole body.
+- `FlowFile`'s content parameter defaults to `Spool`, so a handler reads
+  `async fn echo(flow_file: FlowFile) -> FlowFile`. The default exists only
+  with the `tokio` and `tempfile` features, which is where `Spool` does; a
+  build without them names the content type as before.
+- The axum extractor is `FlowFile`, and `Spool` extracts a whole body.
   Both read the request in full before the handler runs, into memory up to a
   threshold and into an anonymous temporary file above it. `FlowFileRequest`,
   `StrictFlowFileRequest`, `FlowFilesRequest`, `StrictFlowFilesRequest` and
@@ -25,7 +29,7 @@ item is touched; the sections below say how.
   it.
 - `FlowFile::spool_async` and the `SpooledContent` it produced are replaced by
   `Spool`, a plain value with no task behind it. `spool_async` now reads the
-  content in full and returns a `FlowFile<Spool>`. `FlowFileBuilder::
+  content in full and returns a `FlowFile`. `FlowFileBuilder::
   tempfile_async` is replaced by `FlowFileBuilder::spool_async`, which goes to
   memory or to disk by size. `SpoolConfig` sets the threshold and the
   directory, and an `Extension(SpoolConfig)` on the router applies it to the
@@ -71,6 +75,9 @@ item is touched; the sections below say how.
   client that writes its whole request before reading: it pins the stall for
   a handler that streams from the socket, shows the extractor completing
   against the same client, and runs 32 concurrent uploads at once.
+- `ResponseWriter` and `BlockingResponseWriter`, the writer types a
+  `FlowFilesResponse` producer receives, are exported so a producer can be a
+  named function.
 
 ### Fixed
 

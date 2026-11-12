@@ -12,12 +12,12 @@ use nififf3::{FlowFile, FlowFilesReaderAsync, MEDIA_TYPE, Spool, SpoolConfig};
 use tower::ServiceExt;
 
 /// The simplest handler there is: a flow file in, the same flow file out.
-async fn echo(flow_file: FlowFile<Spool>) -> FlowFile<Spool> {
+async fn echo(flow_file: FlowFile) -> FlowFile {
     flow_file
 }
 
 /// Where the content went, as the handler sees it.
-async fn where_is_it(flow_file: FlowFile<Spool>) -> String {
+async fn where_is_it(flow_file: FlowFile) -> String {
     let place = if flow_file.content().is_in_memory() {
         "memory"
     } else {
