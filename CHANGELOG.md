@@ -15,6 +15,11 @@ item is touched; the sections below say how.
   `async fn echo(flow_file: FlowFile) -> FlowFile`. The default exists only
   with the `tokio` and `tempfile` features, which is where `Spool` does; a
   build without them names the content type as before.
+- A flow file is an `IntoResponse` through the new `ResponseContent` trait,
+  implemented for `Vec<u8>`, `Spool`, `Content`, `tokio::fs::File`, `Cursor`,
+  `DuplexStream` and boxed readers, instead of a blanket over `AsyncRead`. An in-memory
+  `FlowFile<Vec<u8>>` is a response directly, with no `into_reader` first,
+  and any other reader is a response once boxed.
 - The axum extractor is `FlowFile`, and `Spool` extracts a whole body.
   Both read the request in full before the handler runs, into memory up to a
   threshold and into an anonymous temporary file above it. `FlowFileRequest`,
@@ -75,6 +80,8 @@ item is touched; the sections below say how.
   client that writes its whole request before reading: it pins the stall for
   a handler that streams from the socket, shows the extractor completing
   against the same client, and runs 32 concurrent uploads at once.
+- `FlowFile::set_attribute` and `remove_attribute`, for annotating a flow file
+  on its way through a handler without reaching for `attributes_mut`.
 - `ResponseWriter` and `BlockingResponseWriter`, the writer types a
   `FlowFilesResponse` producer receives, are exported so a producer can be a
   named function.

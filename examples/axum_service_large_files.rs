@@ -107,7 +107,7 @@ async fn split(parent: FlowFile) -> Result<FlowFilesResponse, (StatusCode, Strin
 /// size to declare until it has. `spool_async` reads the encoder to completion
 /// and takes the size from what it read, holding the output in memory or on
 /// disk by the same rule the extractor uses.
-async fn transform(parent: FlowFile) -> Result<impl IntoResponse, Error> {
+async fn transform(parent: FlowFile) -> Result<FlowFile, Error> {
     let builder = parent
         .derive()
         .attribute(attr::MIME_TYPE, "application/gzip")

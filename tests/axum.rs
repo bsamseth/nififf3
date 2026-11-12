@@ -8,12 +8,60 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Extension, Router};
 use http_body_util::BodyExt;
-use nififf3::{FlowFile, FlowFilesReaderAsync, MEDIA_TYPE, Spool, SpoolConfig};
+use nififf3::{FlowFile, FlowFilesReaderAsync, MEDIA_TYPE, Spool, SpoolConfig, attr};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tower::ServiceExt;
 
 /// The simplest handler there is: a flow file in, the same flow file out.
 async fn echo(flow_file: FlowFile) -> FlowFile {
     flow_file
+}
+
+/// Validate and annotate, passing the content through untouched.
+async fn admit(mut flow_file: FlowFile) -> Result<FlowFile, (StatusCode, String)> {
+    if flow_file.attribute(attr::MIME_TYPE) != Some("text/csv") {
+        return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "text/csv only".into()));
+    }
+    if flow_file.size() == 0 {
+        return Err((StatusCode::BAD_REQUEST, "nothing to admit".into()));
+    }
+    flow_file.set_attribute("admitted", "true");
+    Ok(flow_file)
+}
+
+/// The README's lead handler: stream the content line by line, answer with
+/// a new flow file built in memory.
+async fn summarize(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, (StatusCode, String)> {
+    if flow_file.attribute(attr::MIME_TYPE) != Some("text/csv") {
+        return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "text/csv only".into()));
+    }
+    let summary = flow_file.derive();
+    let failed = |err: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    let mut lines = BufReader::new(flow_file.into_content()).lines();
+    let (mut columns, mut rows) = (None, 0u64);
+    while let Some(line) = lines.next_line().await.map_err(failed)? {
+        let fields = line.split(',').count();
+        match columns {
+            None => columns = Some(fields),
+            Some(n) if n == fields => rows += 1,
+            Some(n) => {
+                let message = format!("row {} has {fields} fields, expected {n}", rows + 1);
+                return Err((StatusCode::BAD_REQUEST, message));
+            }
+        }
+    }
+    Ok(summary
+        .attribute(attr::MIME_TYPE, "text/plain")
+        .attribute(attr::RECORD_COUNT, rows.to_string())
+        .content(format!("{rows} rows, {} columns\n", columns.unwrap_or(0))))
+}
+
+/// A new flow file built in memory, which is a response as it is.
+async fn shout(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, nififf3::Error> {
+    let flow_file = flow_file.into_memory_async().await?;
+    Ok(flow_file
+        .derive()
+        .content(flow_file.content().to_ascii_uppercase()))
 }
 
 /// Where the content went, as the handler sees it.
@@ -40,6 +88,9 @@ async fn count_batch(body: Spool) -> Result<String, nififf3::Error> {
 fn app() -> Router {
     Router::new()
         .route("/echo", post(echo))
+        .route("/admit", post(admit))
+        .route("/summarize", post(summarize))
+        .route("/shout", post(shout))
         .route("/where", post(where_is_it))
         .route("/batch", post(count_batch))
 }
@@ -80,6 +131,93 @@ async fn a_flow_file_goes_in_and_comes_back_out() {
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), bytes.as_slice());
+}
+
+/// The README's lead handler, with the content on disk: the summary comes
+/// back as a new flow file, a ragged row is a 400 naming the row, and the
+/// wrong kind of flow file is a 415.
+#[tokio::test]
+async fn summarizing_streams_the_content_and_answers_with_a_new_flow_file() {
+    let app = app().layer(Extension(SpoolConfig::new().with_max_in_memory(16)));
+    let mut csv = String::from("id,name,amount\n");
+    csv.extend((0..1000).map(|i| format!("{i},item {i},{}.50\n", i * 3)));
+    let request = FlowFile::builder()
+        .attribute(attr::MIME_TYPE, "text/csv")
+        .attribute(attr::FILENAME, "items.csv")
+        .content(csv.clone())
+        .to_bytes();
+
+    let response = app
+        .clone()
+        .oneshot(send("/summarize", request))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], MEDIA_TYPE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let summary = FlowFile::from_bytes(&body).unwrap();
+    assert_eq!(summary.content_str().unwrap(), "1000 rows, 3 columns\n");
+    assert_eq!(summary[attr::RECORD_COUNT], "1000");
+    assert_eq!(summary[attr::MIME_TYPE], "text/plain");
+    assert_eq!(summary[attr::FILENAME], "items.csv");
+
+    csv.push_str("1001,ragged\n");
+    let ragged = FlowFile::builder()
+        .attribute(attr::MIME_TYPE, "text/csv")
+        .content(csv)
+        .to_bytes();
+    let response = app
+        .clone()
+        .oneshot(send("/summarize", ragged))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_text(response).await,
+        "row 1001 has 2 fields, expected 3"
+    );
+
+    let response = app
+        .oneshot(send("/summarize", sample_bytes()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body_text(response).await, "text/csv only");
+}
+
+/// A pass-through handler leaves disk-backed content untouched, and turns the
+/// wrong kind of flow file away with its own status.
+#[tokio::test]
+async fn validating_and_annotating_passes_the_content_through() {
+    let app = app().layer(Extension(SpoolConfig::new().with_max_in_memory(16)));
+    let content = vec![b'x'; 1024];
+    let csv = FlowFile::builder()
+        .attribute(attr::MIME_TYPE, "text/csv")
+        .content(content.clone())
+        .to_bytes();
+
+    let response = app.clone().oneshot(send("/admit", csv)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let flow_file = FlowFile::from_bytes(&body).unwrap();
+    assert_eq!(flow_file["admitted"], "true");
+    assert_eq!(flow_file[attr::MIME_TYPE], "text/csv");
+    assert_eq!(flow_file.content(), content.as_slice());
+
+    let response = app.oneshot(send("/admit", sample_bytes())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body_text(response).await, "text/csv only");
+}
+
+#[tokio::test]
+async fn an_in_memory_flow_file_is_a_response() {
+    let response = app().oneshot(send("/shout", sample_bytes())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], MEDIA_TYPE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let flow_file = FlowFile::from_bytes(&body).unwrap();
+    assert_eq!(flow_file.content(), b"HELLO");
+    assert_eq!(flow_file["filename"], "greeting.txt");
 }
 
 /// The threshold in the router's extension decides where content goes, and

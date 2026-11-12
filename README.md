@@ -13,30 +13,58 @@ Answering NiFi over HTTP is the shortest way to see it:
 
 ```rust
 # #[cfg(all(feature = "axum", feature = "uuid"))] {
-use axum::response::IntoResponse;
-use nififf3::{Error, FlowFile};
+use axum::http::StatusCode;
+use nififf3::{FlowFile, attr};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
-async fn shout(flow_file: FlowFile) -> Result<impl IntoResponse, Error> {
-    let flow_file = flow_file.into_memory_async().await?;
-    Ok(flow_file
-        .derive()
-        .attribute("shouted", "true")
-        .content(flow_file.content().to_ascii_uppercase())
-        .into_reader())
+/// Check the shape of a CSV file, line by line, and answer with a summary.
+async fn summarize(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, (StatusCode, String)> {
+    if flow_file.attribute(attr::MIME_TYPE) != Some("text/csv") {
+        return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "text/csv only".into()));
+    }
+    let summary = flow_file.derive();
+    let failed = |err: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    let mut lines = BufReader::new(flow_file.into_content()).lines();
+    let (mut columns, mut rows) = (None, 0u64);
+    while let Some(line) = lines.next_line().await.map_err(failed)? {
+        let fields = line.split(',').count();
+        match columns {
+            None => columns = Some(fields),
+            Some(n) if n == fields => rows += 1,
+            Some(n) => {
+                let message = format!("row {} has {fields} fields, expected {n}", rows + 1);
+                return Err((StatusCode::BAD_REQUEST, message));
+            }
+        }
+    }
+    Ok(summary
+        .attribute(attr::MIME_TYPE, "text/plain")
+        .attribute(attr::RECORD_COUNT, rows.to_string())
+        .content(format!("{rows} rows, {} columns\n", columns.unwrap_or(0))))
 }
 # }
 ```
 
-`FlowFile` is the extractor. It reads the whole request before the handler
-runs, into memory below a size and into a temporary file above it. `derive`
-carries the attributes over and mints a fresh `uuid`, as NiFi does for a new
-flow file. The answer is a flow file, which is a response in its own right.
+`FlowFile` is the extractor. The request is read in full before the handler
+runs, into memory below a size and into a temporary file above it, and the
+handler never has to know which: `into_content` hands over the content as the
+`AsyncRead` it is either way, and `lines` walks it one line at a time. A
+gigabyte of CSV costs this handler one line of memory. `derive` comes first
+because it copies the attributes, and after it the flow file is only its
+content. It starts the answer, a new flow file carrying those attributes and a
+fresh `uuid`, as NiFi does for a new flow file. The builder overrides the ones
+named after it, and the result, built in memory, is as much a response as the
+one that came in.
 
-A plain `FlowFile` is a `FlowFile<Spool>`: content read in full, in memory or
-in a temporary file by size. The type parameter only appears when the content
-is something else, such as a `Vec<u8>` built in memory or a reader that is
-still streaming.
-
+A plain `FlowFile` is a `FlowFile<Spool>`. The parameter only appears when the
+content is something else, such as the `Vec<u8>` this handler builds. The
+error is whatever axum accepts, and the statuses say whose fault it was: the
+client's for a file that is not CSV or does not hold together, the server's
+for a spool it could not read back. This crate's own `Error` is a response too,
+as a `400`, so a handler that only uses `?` on this crate's calls can return
+that. A handler that produces new content of a size it does not know in
+advance has `spool_async`, which puts the output through the same memory or
+disk choice as the input.
 ## Parsing
 
 Pick the entry point that matches where the bytes are:
@@ -114,9 +142,10 @@ ways to do that.
 
 `FlowFile` extracts one flow file, and `Spool` extracts a whole body, for a
 request holding several concatenated flow files. Both read the request in full
-before the handler runs. A flow file whose content is an `AsyncRead` is an
-`IntoResponse`, which a plain `FlowFile` is, and `FlowFilesResponse` streams
-many of them out for a handler that turns one flow file into several.
+before the handler runs. A flow file is an `IntoResponse` whether it holds a
+`Vec<u8>`, a `Spool`, a `Content` or a file, and `ResponseContent` lists the
+rest. `FlowFilesResponse` streams many of them out for a handler that turns one
+flow file into several.
 
 `FlowFileBody` is the escape hatch: an `AsyncRead` over the raw request body,
 for a handler that has a reason to parse while the request is still arriving

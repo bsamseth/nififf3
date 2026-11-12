@@ -19,7 +19,7 @@ use tokio_util::io::{ReaderStream, SyncIoBridge};
 
 use crate::spool::{self, Side};
 use crate::{
-    Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, MEDIA_TYPE, Spool, SpoolConfig,
+    Content, Error, FlowFile, FlowFilesWriter, FlowFilesWriterAsync, MEDIA_TYPE, Spool, SpoolConfig,
 };
 
 /// How large the chunks of a streamed response body are.
@@ -282,17 +282,23 @@ async fn drain(body: &mut FlowFileBody) -> io::Result<u64> {
 /// one, is rejected with a status before the handler runs. See [`Rejection`].
 ///
 /// ```no_run
-/// use axum::response::IntoResponse;
-/// use nififf3::{Error, FlowFile};
+/// use axum::http::StatusCode;
+/// use nififf3::{FlowFile, attr};
 ///
-/// async fn shout(flow_file: FlowFile) -> Result<impl IntoResponse, Error> {
-///     let flow_file = flow_file.into_memory_async().await?;
-///     Ok(flow_file
-///         .derive()
-///         .content(flow_file.content().to_ascii_uppercase())
-///         .into_reader())
+/// async fn admit(mut flow_file: FlowFile) -> Result<FlowFile, (StatusCode, String)> {
+///     if flow_file.attribute(attr::MIME_TYPE) != Some("text/csv") {
+///         return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "text/csv only".into()));
+///     }
+///     flow_file.set_attribute("admitted", "true");
+///     Ok(flow_file)
 /// }
 /// ```
+///
+/// The content is not read: it goes back out as it came, from memory or from
+/// disk. [`into_memory_async`](FlowFile::into_memory_async) is there for a
+/// handler that needs the bytes, and
+/// [`spool_async`](crate::FlowFileBuilder::spool_async) for one that produces
+/// new content of unknown size.
 ///
 /// # Why the whole request is read first
 ///
@@ -451,24 +457,102 @@ impl<S: Send + Sync> FromRequest<S> for Spool {
     }
 }
 
+/// Content a [`FlowFile`] can answer a request with.
+///
+/// Implemented for what a handler ends up holding: a `Vec<u8>` built in
+/// memory, a [`Spool`] from the extractor or from `spool_async`, a
+/// [`Content`] still being read from a request or a file, a
+/// [`tokio::fs::File`], a [`Cursor`](std::io::Cursor), the read end of a
+/// [`duplex`](tokio::io::duplex) pipe that a task feeds, and a boxed
+/// [`AsyncRead`]. Any other reader goes in a `Box::pin`:
+///
+/// ```
+/// use axum::response::IntoResponse;
+/// use nififf3::FlowFile;
+///
+/// let reader = tokio::io::empty(); // stands in for a reader of your own
+/// let flow_file = FlowFile::builder().reader(Box::pin(reader), 0);
+/// let response = flow_file.into_response();
+/// # let _ = response;
+/// ```
+///
+/// This is a trait of its own, rather than a bound on [`AsyncRead`], so that
+/// an in-memory flow file is a response without a wrapper. A blanket impl
+/// over `AsyncRead` would leave `Vec<u8>` out, because coherence forbids a
+/// second impl for a type that an upstream crate could make a reader later.
+pub trait ResponseContent: Send + 'static {
+    /// The content as an async reader, which the response streams from.
+    fn into_reader(self) -> impl AsyncRead + Send + 'static;
+}
+
+impl ResponseContent for Vec<u8> {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        std::io::Cursor::new(self)
+    }
+}
+
+impl ResponseContent for Spool {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + 'static> ResponseContent for Content<R> {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
+impl ResponseContent for tokio::fs::File {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
+impl<T: AsRef<[u8]> + Unpin + Send + 'static> ResponseContent for std::io::Cursor<T> {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
+impl ResponseContent for DuplexStream {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
+/// Covers `Box::pin(reader)` for any reader, whether or not it is `Unpin`.
+impl<P> ResponseContent for Pin<P>
+where
+    P: std::ops::DerefMut + Unpin + Send + 'static,
+    P::Target: AsyncRead,
+{
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
+impl ResponseContent for Box<dyn AsyncRead + Send + Unpin> {
+    fn into_reader(self) -> impl AsyncRead + Send + 'static {
+        self
+    }
+}
+
 /// Respond with the flow file in binary V3 format, streaming the content.
 ///
 /// Sets `Content-Type: application/flowfile-v3` and a `Content-Length`
 /// computed from the header and the declared content size. Exactly
-/// [`size`](FlowFile::size) bytes are read from the content reader.
+/// [`size`](FlowFile::size) bytes are read from the content.
 ///
-/// The bound is on the content, so this covers every reader-backed flow file,
-/// including a plain `FlowFile` straight from the extractor. It does not
-/// cover an in-memory `FlowFile<Vec<u8>>`, because `Vec<u8>` is not an
-/// [`AsyncRead`] and coherence forbids a second impl for it. Call
-/// [`into_reader`](FlowFile::into_reader) on one of those first:
+/// A plain `FlowFile` straight from the extractor is a response, and so is
+/// one built in memory. See [`ResponseContent`] for the full list.
 ///
 /// ```
 /// use axum::response::IntoResponse;
 /// use nififf3::FlowFile;
 ///
 /// let flow_file = FlowFile::builder().content(&b"hi"[..]);
-/// let response = flow_file.into_reader().into_response();
+/// let response = flow_file.into_response();
 /// # let _ = response;
 /// ```
 ///
@@ -479,15 +563,12 @@ impl<S: Send + Sync> FromRequest<S> for Spool {
 /// status. It fails the body instead, so the client sees an aborted response
 /// rather than a complete one carrying a flow file whose header declares more
 /// content than it holds. A reader that yields more than `size` is cut to it.
-impl<R> IntoResponse for FlowFile<R>
-where
-    R: AsyncRead + Send + 'static,
-{
+impl<R: ResponseContent> IntoResponse for FlowFile<R> {
     fn into_response(self) -> Response {
         let header_bytes = self.header_bytes();
         let total = header_bytes.len() as u64 + self.size;
         let (size, _attributes, content) = self.into_parts();
-        let reader = std::io::Cursor::new(header_bytes).chain(content.take(size));
+        let reader = std::io::Cursor::new(header_bytes).chain(content.into_reader().take(size));
         (
             [
                 (header::CONTENT_TYPE, MEDIA_TYPE.to_string()),

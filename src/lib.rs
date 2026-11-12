@@ -52,7 +52,8 @@ pub use futures_core::Stream;
 
 #[cfg(feature = "axum")]
 pub use axum_support::{
-    BlockingResponseWriter, BoxError, FlowFileBody, FlowFilesResponse, Rejection, ResponseWriter,
+    BlockingResponseWriter, BoxError, FlowFileBody, FlowFilesResponse, Rejection, ResponseContent,
+    ResponseWriter,
 };
 
 #[cfg(all(feature = "tokio", feature = "tempfile"))]
@@ -270,7 +271,38 @@ impl<R> FlowFile<R> {
         &self.attributes
     }
 
+    /// Set an attribute, replacing any value it had.
+    ///
+    /// Returns the previous value, if there was one. The content and the size
+    /// are untouched, so this is how a handler annotates a flow file on its
+    /// way through without reading it.
+    ///
+    /// ```
+    /// use nififf3::{FlowFile, attr};
+    ///
+    /// let mut flow_file = FlowFile::builder().content(&b"a,b\n"[..]);
+    /// assert_eq!(flow_file.set_attribute(attr::MIME_TYPE, "text/csv"), None);
+    /// assert_eq!(flow_file.set_attribute(attr::MIME_TYPE, "text/plain"), Some("text/csv".to_string()));
+    /// assert_eq!(flow_file.attribute(attr::MIME_TYPE), Some("text/plain"));
+    /// ```
+    pub fn set_attribute(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Option<String> {
+        self.attributes.insert(key.into(), value.into())
+    }
+
+    /// Remove an attribute, returning its value if it was set.
+    pub fn remove_attribute(&mut self, key: &str) -> Option<String> {
+        self.attributes.remove(key)
+    }
+
     /// Mutable access to the attributes of the flow file.
+    ///
+    /// [`set_attribute`](Self::set_attribute) and
+    /// [`remove_attribute`](Self::remove_attribute) cover the single-key
+    /// cases.
     pub fn attributes_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.attributes
     }
@@ -782,8 +814,9 @@ impl FlowFile<Vec<u8>> {
     /// Wrap the content in a [`std::io::Cursor`], which implements both
     /// `std::io::Read` and (with the `tokio` feature) `tokio::io::AsyncRead`.
     ///
-    /// Useful for handing an in-memory flow file to reader-based APIs such
-    /// as the axum response integration.
+    /// Useful for handing an in-memory flow file to reader-based APIs, such
+    /// as `write_to_async`. An axum response does not need it: an in-memory
+    /// flow file is already an `IntoResponse`.
     ///
     /// ```
     /// use nififf3::FlowFile;

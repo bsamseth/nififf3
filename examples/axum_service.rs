@@ -4,8 +4,8 @@
 //!
 //! - `POST /transform` takes one flow file in and sends one out. The
 //!   extractor is `FlowFile`, whose content is a `Spool` unless said
-//!   otherwise, and the answer is a flow file, which is itself an
-//!   `IntoResponse`.
+//!   otherwise, and the answer is a flow file built in memory, which is
+//!   itself an `IntoResponse`.
 //! - `POST /split` takes one flow file in and sends many out, through
 //!   `FlowFilesResponse`.
 //!
@@ -15,22 +15,21 @@
 //!
 //!     cargo run --features axum --example axum_service
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
-use axum::{Router, response::IntoResponse};
 use http_body_util::BodyExt;
 use nififf3::{Error, FlowFile, FlowFilesAsync, FlowFilesResponse};
 use tower::ServiceExt;
 
 /// One in, one out: the content is rewritten, the attributes carried over.
-async fn transform(flow_file: FlowFile) -> Result<impl IntoResponse, Error> {
+async fn transform(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, Error> {
     let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file
         .derive()
         .attribute("transformed", "uppercase")
-        .content(flow_file.content().to_ascii_uppercase())
-        .into_reader())
+        .content(flow_file.content().to_ascii_uppercase()))
 }
 
 /// One flow file in, many out: one per record.

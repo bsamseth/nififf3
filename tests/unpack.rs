@@ -153,8 +153,7 @@ async fn unpack_lenient(parent: FlowFile) -> Result<FlowFilesResponse, Error> {
                 None => writer.write_bytes(&part).await?,
                 Some(message) => {
                     let mut part = part;
-                    part.attributes_mut()
-                        .insert(ERROR_ATTRIBUTE.to_string(), message);
+                    part.set_attribute(ERROR_ATTRIBUTE, message);
                     writer.write_bytes(&part).await?;
                     break;
                 }
