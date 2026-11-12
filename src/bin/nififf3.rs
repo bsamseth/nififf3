@@ -116,10 +116,10 @@ fn attrs(reader: Box<dyn BufRead>) -> Result<()> {
 fn content(reader: Box<dyn BufRead>) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let mut flow_files = FlowFilesReader::new(reader);
-    while let Some(mut flow_file) = flow_files.next()? {
+    while let Some(flow_file) = flow_files.next()? {
         // The content reports a stream that ends early as an error, so a
         // plain copy is a verified copy.
-        io::copy(flow_file.content_mut(), &mut stdout)?;
+        io::copy(&mut flow_file.into_content(), &mut stdout)?;
     }
     Ok(())
 }

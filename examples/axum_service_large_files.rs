@@ -148,8 +148,8 @@ async fn merge(mut body: Spool) -> Result<impl IntoResponse, Error> {
     let (mut sink, source) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let mut parts = FlowFilesReaderAsync::new(body);
-        while let Ok(Some(mut part)) = parts.next().await {
-            if tokio::io::copy(part.content_mut(), &mut sink)
+        while let Ok(Some(part)) = parts.next().await {
+            if tokio::io::copy(&mut part.into_content(), &mut sink)
                 .await
                 .is_err()
             {

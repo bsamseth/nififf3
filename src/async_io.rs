@@ -935,9 +935,13 @@ mod tests {
 
         let mut flow_files = FlowFilesReaderAsync::new(bytes.as_slice());
         let mut seen = Vec::new();
-        while let Some(mut flow_file) = flow_files.next().await.unwrap() {
+        while let Some(flow_file) = flow_files.next().await.unwrap() {
             let mut byte = [0u8; 1];
-            flow_file.content_mut().read_exact(&mut byte).await.unwrap();
+            flow_file
+                .into_content()
+                .read_exact(&mut byte)
+                .await
+                .unwrap();
             seen.push(byte[0]);
         }
         assert_eq!(seen, [b'a', b'b']);

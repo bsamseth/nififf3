@@ -1155,9 +1155,9 @@ mod tests {
         bytes.truncate(bytes.len() - 2);
 
         let mut flow_files = FlowFilesReader::new(bytes.as_slice());
-        let mut flow_file = flow_files.next().unwrap().unwrap();
+        let flow_file = flow_files.next().unwrap().unwrap();
         let mut out = Vec::new();
-        let err = flow_file.content_mut().read_to_end(&mut out).unwrap_err();
+        let err = flow_file.into_content().read_to_end(&mut out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(out, b"hel");
     }
