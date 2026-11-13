@@ -9,6 +9,7 @@ use axum::routing::post;
 use axum::{Extension, Router};
 use http_body_util::BodyExt;
 use nififf3::{FlowFile, FlowFilesReaderAsync, MEDIA_TYPE, Spool, SpoolConfig, attr};
+#[cfg(feature = "uuid")]
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tower::ServiceExt;
 
@@ -31,6 +32,7 @@ async fn admit(mut flow_file: FlowFile) -> Result<FlowFile, (StatusCode, String)
 
 /// The README's lead handler: stream the content line by line, answer with
 /// a new flow file built in memory.
+#[cfg(feature = "uuid")]
 async fn summarize(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, (StatusCode, String)> {
     if flow_file.attribute(attr::MIME_TYPE) != Some("text/csv") {
         return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "text/csv only".into()));
@@ -57,6 +59,7 @@ async fn summarize(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, (StatusCode
 }
 
 /// A new flow file built in memory, which is a response as it is.
+#[cfg(feature = "uuid")]
 async fn shout(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, nififf3::Error> {
     let flow_file = flow_file.into_memory_async().await?;
     Ok(flow_file
@@ -86,13 +89,17 @@ async fn count_batch(body: Spool) -> Result<String, nififf3::Error> {
 }
 
 fn app() -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/echo", post(echo))
         .route("/admit", post(admit))
-        .route("/summarize", post(summarize))
-        .route("/shout", post(shout))
         .route("/where", post(where_is_it))
-        .route("/batch", post(count_batch))
+        .route("/batch", post(count_batch));
+    // `derive` mints a uuid, so the handlers that build new flow files need it.
+    #[cfg(feature = "uuid")]
+    let router = router
+        .route("/summarize", post(summarize))
+        .route("/shout", post(shout));
+    router
 }
 
 fn sample_bytes() -> Vec<u8> {
@@ -136,6 +143,7 @@ async fn a_flow_file_goes_in_and_comes_back_out() {
 /// The README's lead handler, with the content on disk: the summary comes
 /// back as a new flow file, a ragged row is a 400 naming the row, and the
 /// wrong kind of flow file is a 415.
+#[cfg(feature = "uuid")]
 #[tokio::test]
 async fn summarizing_streams_the_content_and_answers_with_a_new_flow_file() {
     let app = app().layer(Extension(SpoolConfig::new().with_max_in_memory(16)));
@@ -209,6 +217,7 @@ async fn validating_and_annotating_passes_the_content_through() {
     assert_eq!(body_text(response).await, "text/csv only");
 }
 
+#[cfg(feature = "uuid")]
 #[tokio::test]
 async fn an_in_memory_flow_file_is_a_response() {
     let response = app().oneshot(send("/shout", sample_bytes())).await.unwrap();

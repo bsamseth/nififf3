@@ -1,15 +1,22 @@
 # nififf3
 
-Read and write NiFi's FlowFile V3 format (`application/flowfile-v3`), and
-serve it over HTTP with axum. The output is wire-compatible with NiFi's
-`FlowFilePackagerV3`, and this reads whatever `FlowFileUnpackagerV3` reads.
+Read and write NiFi flow files, and build HTTP services that NiFi can call.
 
-A flow file is binary content together with a set of string key-value
-attributes. The central type is `FlowFile<R>`, where `R` is whatever holds the
-content: an in-memory `Vec<u8>`, a `Spool` that may be on disk, any
-`std::io::Read`, or any `tokio::io::AsyncRead`.
+NiFi can hand a flow file to an outside HTTP service and take the response
+back as a new flow file. The format it uses for that is FlowFile V3
+(`application/flowfile-v3`). This crate reads and writes that format, and,
+with the `axum` feature, turns it into request and response types for the
+[axum](https://docs.rs/axum) web framework. The bytes match what NiFi's
+`FlowFilePackagerV3` writes and `FlowFileUnpackagerV3` reads.
 
-Answering NiFi over HTTP is the shortest way to see it:
+A flow file is a piece of content, which is just bytes, together with a set of
+attributes, which are string key-value pairs like `filename` or `mime.type`.
+In this crate it is the type `FlowFile`.
+
+## A service in one function
+
+Here is a complete request handler. It takes a CSV file from NiFi, checks it
+line by line, and answers with a short summary.
 
 ```rust
 # #[cfg(all(feature = "axum", feature = "uuid"))] {
@@ -17,7 +24,6 @@ use axum::http::StatusCode;
 use nififf3::{FlowFile, attr};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Check the shape of a CSV file, line by line, and answer with a summary.
 async fn summarize(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, (StatusCode, String)> {
     if flow_file.attribute(attr::MIME_TYPE) != Some("text/csv") {
         return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "text/csv only".into()));
@@ -45,136 +51,208 @@ async fn summarize(flow_file: FlowFile) -> Result<FlowFile<Vec<u8>>, (StatusCode
 # }
 ```
 
-`FlowFile` is the extractor. The request is read in full before the handler
-runs, into memory below a size and into a temporary file above it, and the
-handler never has to know which: `into_content` hands over the content as the
-`AsyncRead` it is either way, and `lines` walks it one line at a time. A
-gigabyte of CSV costs this handler one line of memory. `derive` comes first
-because it copies the attributes, and after it the flow file is only its
-content. It starts the answer, a new flow file carrying those attributes and a
-fresh `uuid`, as NiFi does for a new flow file. The builder overrides the ones
-named after it, and the result, built in memory, is as much a response as the
-one that came in.
+In axum, a handler is an async function that runs for each request. The types
+of its arguments say what it wants from the request, and its return value
+becomes the response. Taking a `FlowFile` argument means: parse the request
+body as a flow file and give it to me. Returning a `FlowFile` means: send this
+flow file back.
 
-A plain `FlowFile` is a `FlowFile<Spool>`. The parameter only appears when the
-content is something else, such as the `Vec<u8>` this handler builds. The
-error is whatever axum accepts, and the statuses say whose fault it was: the
-client's for a file that is not CSV or does not hold together, the server's
-for a spool it could not read back. This crate's own `Error` is a response too,
-as a `400`, so a handler that only uses `?` on this crate's calls can return
-that. A handler that produces new content of a size it does not know in
-advance has `spool_async`, which puts the output through the same memory or
-disk choice as the input.
-## Parsing
+Before the handler runs, the whole request has been received. Small content
+is held in memory. Large content is written to a temporary file. The handler
+does not need to know which, because the content reads the same way either
+way. `into_content` takes the content out as a reader, and `lines` goes
+through it one line at a time. A gigabyte of CSV costs this handler the memory
+of one line.
 
-Pick the entry point that matches where the bytes are:
+`derive` starts a new flow file that carries over the attributes of the old
+one and gets a fresh `uuid`, which is what NiFi does when a processor produces
+a new flow file. Setting an attribute on it again replaces the carried value.
+`content` finishes the new flow file with the bytes you give it. Those are
+held in memory, which is fine for a summary. `derive` comes before the content
+is read because it needs to look at the flow file, and `into_content` uses the
+flow file up.
 
-- `FlowFile::from_bytes` and `from_vec` take a buffer holding exactly one flow
-  file, and check the declared size against what is there.
-- `FlowFile::from_reader` reads one whole flow file from a reader.
-- `FlowFile::parse` reads only the header, and leaves the content as a
-  `Content<R>`: a reader limited to the declared size, which reports a stream
-  that ends early as an error rather than as the end.
-- `FlowFiles` iterates over concatenated flow files, reading each content into
-  memory. `FlowFilesReader` does the same but streams each content.
+The error type is axum's usual pair of a status code and a message. The
+handler picks statuses that say whose fault it was: a `415` when the file is
+not CSV, a `400` when a row has the wrong number of fields, a `500` when the
+server could not read its own temporary file. NiFi sees these as a failed
+request and routes the original flow file accordingly.
 
-Each has an async twin under the `tokio` feature.
+## Running it
+
+A handler goes on a router, which maps paths to handlers, and the router goes
+on a server:
+
+```rust,no_run
+# #[cfg(feature = "axum")]
+use axum::{Router, routing::post};
+# #[cfg(feature = "axum")]
+# async fn summarize() {}
+# #[cfg(feature = "axum")]
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let app = Router::new().route("/summarize", post(summarize));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await
+}
+# #[cfg(not(feature = "axum"))] fn main() {}
+```
+
+On the NiFi side, `PackageFlowFile`, or `MergeContent` with the FlowFile
+Stream v3 format, wraps a flow file in this format. `InvokeHTTP` posts it to
+`http://your-host:3000/summarize`, and `UnpackContent` turns the response
+back into a flow file.
+
+Two settings matter once real files start arriving:
+
+- **Request size.** Axum refuses request bodies over 2 MiB unless told
+  otherwise. `DefaultBodyLimit::max` raises that for the whole router.
+- **Where content goes.** By default content up to 4 MiB stays in memory and
+  anything larger goes to a temporary file in the system's temp directory.
+  `SpoolConfig` changes the threshold and the directory. Add it to the router
+  as an `Extension`, which is axum's way of handing a value to every handler.
+
+```rust,no_run
+# #[cfg(feature = "axum")] {
+use axum::{Extension, Router, extract::DefaultBodyLimit, routing::post};
+use nififf3::SpoolConfig;
+# async fn summarize() {}
+
+let app: Router = Router::new()
+    .route("/summarize", post(summarize))
+    .layer(DefaultBodyLimit::max(10 << 30))
+    .layer(Extension(
+        SpoolConfig::new()
+            .with_max_in_memory(16 << 20)
+            .with_directory("/var/tmp/flowfiles"),
+    ));
+# let _ = app;
+# }
+```
+
+`examples/axum_service_large_files.rs` is a whole service set up this way,
+which you can run and send files to.
+
+## Why the request is read first
+
+NiFi's HTTP client sends the complete request before it starts reading the
+response. If a handler began streaming its response while it was still reading
+the request from the network, the two would get stuck as soon as the response
+grew past what the operating system buffers: NiFi would be waiting to finish
+sending, and the handler would be waiting for NiFi to read. Reading the whole
+request before the handler runs makes that impossible, whatever the handler
+does. `tests/nifi_client.rs` shows the stall happening over a real socket,
+and shows that the `FlowFile` argument avoids it.
+
+If you have a reason to read a request while it is still arriving, and you
+know your client reads responses concurrently, `FlowFileBody` gives you the
+raw request body as a reader. That is the only way to get into the stall, so
+treat it as an advanced option.
+
+## Other shapes of handler
+
+**Many flow files in.** NiFi can send several flow files in one request, one
+after another. Take a `Spool` argument instead of a `FlowFile` to get the
+whole body, and read flow files out of it with `FlowFilesReaderAsync`.
+
+**Many flow files out.** A handler that splits one flow file into several
+returns a `FlowFilesResponse`. You give it a function that writes flow files
+to a writer, and the response streams them to NiFi as they are written.
+`fragments` numbers them with the attributes NiFi's `MergeContent` processor
+needs to put them back together.
+
+**New content of unknown size.** A handler that produces content it cannot
+size in advance, such as a compressed version of the input, can hand a reader
+to `spool_async`. The output is kept in memory or written to a temporary file
+by the same rule as the input, and the result is a `FlowFile` ready to return.
+
+**Content in memory.** `into_memory_async` reads a flow file's content into a
+`Vec<u8>`. Use it when you need all the bytes at once and know they will fit.
+
+`examples/axum_service.rs` has a one-in-one-out and a one-in-many-out handler.
+`examples/axum_service_large_files.rs` has a split, a compressing transform
+built with `spool_async`, and a merge that takes many flow files in.
+
+## Flow files without HTTP
+
+The same types work on their own, for reading and writing flow files in
+programs that are not services.
+
+To create a flow file, add attributes and then supply the content:
 
 ```rust
 use nififf3::FlowFile;
 
-let bytes = FlowFile::builder()
+let flow_file = FlowFile::builder()
     .attribute("filename", "greeting.txt")
-    .content(&b"Hello, NiFi!"[..])
-    .to_bytes();
+    .content(&b"Hello, NiFi!"[..]);
 
+let bytes = flow_file.to_bytes();
+```
+
+`to_bytes` gives you the serialized flow file. `write_to` writes it to any
+`std::io::Write`, and `write_to_async` to any `tokio::io::AsyncWrite`.
+
+To read one back:
+
+```rust
+use nififf3::FlowFile;
+
+# let bytes = FlowFile::builder().attribute("filename", "greeting.txt").content(&b"Hello, NiFi!"[..]).to_bytes();
 let flow_file = FlowFile::from_bytes(&bytes)?;
 assert_eq!(flow_file["filename"], "greeting.txt");
 assert_eq!(flow_file.content_str()?, "Hello, NiFi!");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Indexing with `[]` panics when an attribute is not set, as indexing a
-`HashMap` does. `attribute` returns an `Option` for when it may be missing,
-and `parse_attribute` reads and parses in one call.
+Indexing with `[]` panics when an attribute is not set, like indexing a
+`HashMap`. `attribute` returns an `Option` instead, and `parse_attribute`
+reads and parses in one step, for attributes that hold numbers.
+`set_attribute` and `remove_attribute` change attributes in place.
 
-Parsing trusts its input, in the sense that nothing caps how many attributes a
-header may declare. It does not trust it with memory: no buffer is ever sized
-from a declared length, so a corrupt header costs an allocation proportional to
-the bytes that actually arrive.
+There are a few ways to read, depending on where the bytes are:
 
-## Creating
+- `FlowFile::from_bytes` reads one flow file from a buffer that holds exactly
+  one.
+- `FlowFile::from_reader` reads one whole flow file from any reader.
+- `FlowFile::parse` reads only the header and leaves the content to be read
+  later, as a reader that knows how long it should be. If the bytes run out
+  early, reading it is an error rather than a quiet end.
+- `FlowFiles` goes through a reader holding several flow files one after
+  another, loading each one's content. `FlowFilesReader` does the same but
+  lets you stream each content instead.
 
-Add attributes, then supply the content, which finishes the build:
+Each of these has an async version with `_async` on the end, under the
+`tokio` feature.
 
-```rust
-use nififf3::FlowFile;
+The content has to be sized before it is written, because the format puts the
+length before the bytes. `content` takes the size from the bytes you give it.
+When you have a reader instead, `buffered` reads it into memory, `tempfile`
+writes it to disk, `spool_async` picks between the two by size, and `reader`
+takes a size you already know and streams the rest.
 
-let flow_file = FlowFile::builder()
-    .attribute("filename", "data.bin")
-    .content(vec![1, 2, 3]);
-
-assert_eq!(flow_file.size(), 3);
-let bytes = flow_file.to_bytes();
-```
-
-The format stores the content length before the content, so the size has to be
-known before anything can be written. `content` takes it from the bytes you
-hand over, and `empty` finishes a flow file that is only attributes. When the
-length is not known ahead of time, `buffered` reads the content into memory,
-`tempfile` and `spooled` put it on disk, and `spool_async` picks between the
-two by size. `reader` takes a size you supply and streams the rest.
-
-`to_bytes` returns a `Vec<u8>`, `write_to` streams to a writer, and
-`FlowFilesWriter` writes several back to back. `serialized_len` says how many
-bytes any of them will produce, before they produce it.
-
-## Splitting and merging
-
-`derive` starts a builder carrying another flow file's attributes. `fragments`
-splits one flow file into many, numbering the parts with NiFi's fragment
-attributes so that `MergeContent` can put them back together, and
-`defragment` undoes that at the far end. A bundle has to declare how many flow
-files it holds or the merge never completes, and `Fragments` describes the two
-ways to do that.
-
-## Axum integration
-
-`FlowFile` extracts one flow file, and `Spool` extracts a whole body, for a
-request holding several concatenated flow files. Both read the request in full
-before the handler runs. A flow file is an `IntoResponse` whether it holds a
-`Vec<u8>`, a `Spool`, a `Content` or a file, and `ResponseContent` lists the
-rest. `FlowFilesResponse` streams many of them out for a handler that turns one
-flow file into several.
-
-`FlowFileBody` is the escape hatch: an `AsyncRead` over the raw request body,
-for a handler that has a reason to parse while the request is still arriving
-and knows its client will read concurrently.
-
-Reading the request first is what makes the service safe against NiFi's HTTP
-client, which sends its whole request before it reads any of the response. A
-handler that streamed its answer while still reading the request off the
-socket would stall as soon as the answer outgrew the socket buffers, with each
-side waiting for the other. `tests/nifi_client.rs` demonstrates that stall over
-a real socket, and shows the extractor completing against the same client.
-
-Two settings to know about. Axum's `DefaultBodyLimit` rejects anything over 2
-MiB unless the router raises it. And `SpoolConfig`, added to the router as an
-`Extension`, sets how large a request may be before it goes to disk, and where
-on disk. `examples/axum_service_large_files.rs` is a service with both set.
+Parsing does not limit how many attributes a header may declare, or how large
+the content may be. It does protect memory: no buffer is ever allocated from a
+length in the header, so a corrupt header can only cost as much memory as
+bytes actually arrive.
 
 ## Examples
 
-`examples/` holds runnable programs, each self-contained and asserting its own
+`examples/` holds runnable programs. Each is self-contained and checks its own
 output. Run one with `cargo run --example <name>`, adding `--features` as the
-example's header says. `transform`, `split` and `merge` cover the three shapes
-in memory, with `_async` twins. `axum_service` puts them behind HTTP, and
-`axum_service_large_files` does the same for content too large to buffer.
+example's header comment says.
 
-## CLI
+- `transform`, `split` and `merge` show the three basic shapes in memory, with
+  `_async` versions.
+- `axum_service` puts them behind HTTP, driven in-process so it runs without
+  opening a port.
+- `axum_service_large_files` is a real server on a local port, set up for
+  content too large to hold in memory.
+
+## Command line
 
 `cargo install nififf3 --features cli` installs a `nififf3` binary that
-converts between flow files and JSON:
+converts between flow files and JSON, for looking at files by hand:
 
 ```console
 $ echo -n hello | nififf3 create filename=greeting.txt > greeting.ff3
@@ -183,51 +261,49 @@ $ nififf3 to-json greeting.ff3
 ```
 
 The subcommands are `to-json`, `from-json`, `attrs`, `content` and `create`.
-Each reads stdin when given no path, and processes flow files one at a time.
+Each reads stdin when given no path, and handles files holding several flow
+files one at a time.
 
 ## Feature flags
 
-The sync parsing and serialization API is always available.
+Reading and writing flow files with `std::io` is always available. The rest
+is opt-in:
 
-- `uuid`: `derive` and `fragments`, which mint identifiers. On by default.
-- `tracing`: events and spans from inside the crate. On by default. With
-  `default-features = false` a parse-and-serialize build depends only on
-  `thiserror`.
-- `tokio`: async parsing and serialization over `AsyncRead` and `AsyncWrite`.
-- `tempfile`: spool content to disk. With `tokio` as well, `Spool` and
-  `SpoolConfig`.
+- `uuid`: `derive` and `fragments`, which generate identifiers. On by default.
+- `tracing`: logging through the `tracing` crate. On by default. Turning both
+  defaults off leaves a build that depends only on `thiserror`.
+- `tokio`: async reading and writing.
+- `tempfile`: content on disk. With `tokio` as well, `Spool` and `SpoolConfig`.
 - `stream`: `FlowFilesAsync::into_stream`. Implies `tokio`.
-- `axum`: request extractors and response types. Implies `tokio`, `tempfile`
-  and `stream`.
-- `serde`: `Serialize` and `Deserialize` with the content base64 encoded.
+- `axum`: the request and response types. Implies `tokio`, `tempfile` and
+  `stream`.
+- `serde`: `Serialize` and `Deserialize`, with the content base64 encoded.
 - `cli`: the `nififf3` binary. Implies `serde`.
 
-## Tracing
+## Logging
 
-Under the `tracing` feature the crate emits spans and events for the work it
-does. Nothing is emitted unless your program installs a subscriber, and with
-the feature off the calls are compiled out. `tracing-subscriber` with its
-`EnvFilter` is what reads `RUST_LOG`, so `RUST_LOG=nififf3=debug` needs that in
-your own dependencies.
+With the `tracing` feature, the crate reports what it does through the
+`tracing` crate. Nothing is printed unless your program sets up a subscriber.
+The usual one is `tracing-subscriber`, whose `EnvFilter` reads `RUST_LOG`, so
+`RUST_LOG=nififf3=debug` works once that is in your dependencies.
 
-Spans carry the same three fields wherever they are known, so an interleaved
-log can be followed back to one flow file: `uuid`, `filename` when the flow
-file has one, and `size`.
+Every message about a flow file carries its `uuid`, its `filename` when it has
+one, and its `size`, so a busy log can be followed back to one file.
 
-- `error` is a failure on the server's side: a spool that could not be written.
-- `warn` is what your own `Result`s cannot report: a write that poisoned a
-  writer, a response body that broke after the status line went out, a request
-  rejected before your handler ran.
-- `info` is one line per extracted request, saying whether its content went to
+- `error`: something went wrong on the server's side, such as a temporary
+  file that could not be written.
+- `warn`: something your own `Result`s could not tell you, such as a response
+  that failed after its status was already sent, or a request rejected before
+  your handler ran.
+- `info`: one line per request received, saying whether its content went to
   memory or to disk.
-- `debug` is one line per flow file parsed, written or spooled, and one per
-  response body completed.
-- `trace` follows the content itself, including skipping past what a reader
-  left behind.
+- `debug`: one line per flow file read, written or spooled, and one per
+  response finished.
+- `trace`: every step of the content being read.
 
 ## Wire format
 
-As written by NiFi's `FlowFilePackagerV3`:
+For reference, this is what NiFi's `FlowFilePackagerV3` writes:
 
 ```text
 "NiFiFF3"          7-byte magic header
@@ -237,12 +313,13 @@ content size       8-byte big-endian integer
 content            <content size> bytes
 ```
 
-A field length is 2 bytes big-endian. A value of `0xFFFF` or above is written
-as the marker `0xFF 0xFF` followed by the value as 4 bytes big-endian.
-Attributes are written in sorted key order, so the output is deterministic.
-NiFi accepts any order.
+A field length is 2 bytes, big-endian. A value of `0xFFFF` or more is written
+as the marker `0xFF 0xFF` followed by the value in 4 bytes, big-endian.
+Attributes are written in sorted key order, so the same flow file always
+serializes to the same bytes. NiFi accepts any order.
 
-Two things to know. The extended field length encodes a `u32`, but NiFi reads
-it into a Java `int`, so an attribute of 2 GiB or more is writable here and
-unreadable there. And a header may repeat a key, which parses into a map, so
-re-serializing emits a shorter header than the one that was read.
+Two details worth knowing. The 4-byte length can express values NiFi cannot
+read, since NiFi reads it into a signed 32-bit integer, so an attribute of
+2 GiB or more can be written here but not read there. And a header may repeat
+a key, which parses into a map keeping the last value, so writing it back out
+produces a shorter header than was read.
